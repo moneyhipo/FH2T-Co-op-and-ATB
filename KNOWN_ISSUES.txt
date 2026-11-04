@@ -1,0 +1,78 @@
+Status: BETA. Bugs or unexpected behavior may occur. Back up your saves before playing.
+3-4 player sessions are supported but untested (only 2-player games have been played so far).
+
+Before you play:
+- Host and guests need the exact same mod version.
+- IP play: the host must open TCP port 27600 (router port forwarding, allow Game.exe in the
+  Windows firewall). Steam invites (F7) need neither.
+- fh_steam_helper/FHSteamHelper.exe (Steam invites) is not code-signed; SmartScreen or an
+  antivirus may warn about it. IP play works without it.
+- Every player needs a different name (Steam name; Windows user name for IP play).
+- F8 (beta convenience): save screen anywhere on the map. In co-op only the host saves.
+
+Co-op rules:
+- Up to 4 players. The host's PC runs the world; if the host quits, the session ends.
+- Companions cannot join anyone's party in co-op.
+- Each player has their own Hexen board. Every 2 soul stones a player crafts give 1 to each other player.
+- Beds: the players on that map vote and lie down together; players elsewhere join by using
+  any bed. When every living player is in bed, all dream and the day advances once.
+  Whoever waits in bed can get up with X.
+- Losing a fight puts you down for 300 seconds (5 minutes); others can help you up.
+- Story and boss fights exist once in the world. Whoever starts one fights it; others can join.
+  Losing turns that scene back to before it started.
+- Some deaths are final. Dead players walk around as ghosts (Z: ping). The host too: the game
+  goes on while any player is alive.
+- Eye of Rher (hardest difficulty): each player has their own timer.
+  A player it takes leaves a moonscorched form there; beating it counts as beating that character.
+  The forms chase you like field monsters, so you can get away from every one of them
+  (in the original some cannot be escaped).
+- Players who do not respond do not hold the others forever (timeouts, then defaults).
+
+Known bugs:
+- A guest's screen can sometimes stay black after map changes, loading or the Hexen board.
+  Reconnecting fixes it. Please send both players' logs if it happens.
+- The screen may stay dark or grayscale at the hard-mode train exit. If it persists after leaving the train, please send both players' logs.
+- Scenes a guest started alone on another map that move the player wait until that guest
+  comes back to the host's map.
+- When the host enters or leaves the map a guest is exploring, the guest's screen can jump
+  for a moment and the guest may be pulled back a step or two.
+- A ghost guest on the host's map cannot use some doors.
+- Loading a save during the tutorial can freeze a guest's game.
+- Armor or accessories a guest picks up may also appear for the host (reported once, not
+  reproduced yet). Please send both players' logs if you see it.
+- The endings (A, B and C) were reworked in 0.5.x but have not been played through in co-op yet.
+
+----
+상태: 베타. 버그가 있을 수 있습니다. 플레이 전에 세이브를 백업하세요.
+3~4인 플레이는 되지만 아직 테스트하지 않았습니다(2인만 해 봄).
+
+플레이 전에:
+- 호스트와 게스트의 모드 버전이 똑같아야 합니다.
+- IP 접속: 호스트는 TCP 포트 27600을 열어야 합니다(공유기 포트포워딩, 방화벽에서 Game.exe 허용). Steam 초대(F7)는 필요 없습니다.
+- fh_steam_helper/FHSteamHelper.exe(Steam 초대용)는 코드 서명이 없어 백신이 경고할 수 있습니다. 없어도 IP 접속은 됩니다.
+- 플레이어마다 이름이 달라야 합니다(Steam 이름, IP 접속은 Windows 사용자 이름).
+- F8(베타 편의 기능): 맵 어디서나 저장 화면. 코옵에서는 호스트만 저장합니다.
+
+코옵 규칙:
+- 최대 4명. 호스트 PC가 세계를 돌리고, 호스트가 나가면 세션이 끝납니다.
+- 코옵에서는 동료 영입이 안 됩니다.
+- 헥센판은 플레이어마다 따로. 영혼석을 2개 만들 때마다 다른 사람에게 1개씩 갑니다.
+- 잠: 그 맵 사람끼리 OK하고 함께 눕습니다. 다른 맵 사람은 아무 침대에나 누우면 합류합니다.
+  살아 있는 모두가 누우면 다 같이 꿈을 꾸고 날짜는 한 번 넘어갑니다. 누워서 기다리는 사람은 X로 일어납니다.
+- 전투에서 지면 300초(5분) 쓰러짐. 다른 사람이 일으켜 줄 수 있습니다.
+- 이야기·보스 전투는 세계에 하나. 시작한 사람이 싸우고 다른 사람은 난입할 수 있습니다. 지면 그 장면이 시작 전으로 돌아갑니다.
+- 어떤 죽음은 되돌릴 수 없습니다. 죽은 사람은 유령으로 돌아다닙니다(Z: 신호). 호스트도 같아서, 살아 있는 사람이 있으면 게임은 계속됩니다.
+- 레르의 눈(최고 난이도): 타이머가 사람마다 따로 돕니다.
+  눈에 당한 플레이어는 그 자리에 미쳐 버린 모습으로 남고, 그것을 쓰러뜨리면 그 캐릭터를 쓰러뜨린 것으로 칩니다.
+  그 모습들은 필드 몹처럼 쫓아오므로 모두 따돌릴 수 있습니다(원작에는 도망칠 수 없는 것도 있음).
+- 응답 없는 사람이 다른 사람을 영원히 붙잡지 않습니다(시간이 지나면 기본값).
+
+알려진 버그:
+- 맵 이동·불러오기·헥센판 뒤 게스트 화면이 가끔 검게 남음. 재접속하면 풀립니다. 생기면 양쪽 로그를 보내 주세요.
+- 하드 모드 열차 출구에서 화면이 어둡거나 흑백으로 남을 수 있습니다. 열차를 나온 뒤에도 계속되면 양쪽 로그를 보내 주세요.
+- 게스트가 혼자 다른 맵에서 시작한, 플레이어를 이동시키는 장면은 그 게스트가 호스트 맵에 올 때까지 미뤄짐.
+- 게스트가 혼자 돌던 맵에 호스트가 들어오거나 나갈 때 게스트 화면이 잠깐 튀고, 게스트가 한두 칸 뒤로 끌려갈 수 있습니다.
+- 호스트 맵에 있는 유령 게스트는 일부 문을 쓸 수 없습니다.
+- 튜토리얼 중에 세이브를 불러오면 게스트 게임이 멈출 수 있습니다.
+- 게스트가 주운 갑옷·장신구가 호스트에게도 생길 수 있습니다(제보 1건, 아직 재현 안 됨). 보이면 양쪽 로그를 보내 주세요.
+- 엔딩(A·B·C)은 0.5.x에서 손봤지만 아직 코옵으로 끝까지 해 보지 않았습니다.
