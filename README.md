@@ -18,11 +18,11 @@ The game itself is not included. You need your own copy of Fear & Hunger 2: Term
 
 ## Download
 
-Get the zip from [Releases](https://github.com/moneyhipo/FH2T-Co-op-and-ATB/releases):
+Get `FH2_Coop_<version>.zip` from [Releases](https://github.com/moneyhipo/FH2T-Co-op-and-ATB/releases).
 
-- `FH2_Coop_<version>_with_SteamHelper_<version>.zip`: mod + Steam helper (recommended)
-- `FH2_Coop_<version>.zip`: mod only (IP play)
-- `FH2_Coop_SteamHelper_<version>.zip`: Steam helper only
+Steam invites (F7) also need the Steam helper, a separate download with its source code:
+[FHSteamHelper-source-review](https://github.com/moneyhipo/FHSteamHelper-source-review/releases).
+Without it, players join by IP.
 
 ## Install
 
