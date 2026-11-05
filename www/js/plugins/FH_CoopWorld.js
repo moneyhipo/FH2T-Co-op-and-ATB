@@ -2,7 +2,7 @@
 // FH_CoopWorld.js
 //=============================================================================
 /*:
- * @plugindesc v0.5.13 Co-op field play: guests run events, own inventories,
+ * @plugindesc v0.6.0 Co-op field play: guests run events, own inventories,
  * trading, time votes, host-only saves, guns, chasing enemies. Below FH_Coop.
  * @author FH2 Co-op Mod
  *
@@ -1839,6 +1839,126 @@ $.routeUsesPlayer = function(route) {
         $.routeCache.set(route, hit);
     }
     return hit;
+};
+
+// A chasing monster's path search on a map of many events (user 2026-11-04:
+// Map058's Inquisitor stuttered the game; the original does it too). YEP
+// chase searches a path (findDirectionTo, VE_DiagonalMovement's: 8 ways) on
+// every step; each tile it tries asks for the events on it, and that read all
+// 922 events of Map058. The player's own tile is never passable to it, so the
+// search fills its whole range: about 100 ms a step. Nothing moves during a
+// search: the events on each tile are read once for it (the same answer).
+// The search itself kept its open and closed tiles in arrays (indexOf on
+// every neighbour): VE_DiagonalMovement's own search, the same steps and
+// answers, with its tiles kept by number instead ($.veFindDirectionTo; only
+// when that plugin's search is the one in the game).
+$.pathEvents = null; // y * width + x -> events there (during a search only)
+
+$.veFindDirectionTo = function(goalX, goalY) {
+    var searchLimit = this.searchLimit();
+    var mapWidth = $gameMap.width();
+    var nodeList = [], open = {}, closed = {};
+    var start = {}, best = start;
+    if (this.x === goalX && this.y === goalY) return 0;
+    start.parent = null;
+    start.x = this.x;
+    start.y = this.y;
+    start.g = 0;
+    start.f = $gameMap.distance(start.x, start.y, goalX, goalY);
+    nodeList.push(start);
+    open[start.y * mapWidth + start.x] = start;
+    var list = [2, 4, 6, 8, 1, 3, 7, 9];
+    while (nodeList.length > 0) {
+        var bestIndex = 0;
+        for (var i = 0; i < nodeList.length; i++) {
+            if (nodeList[i].f < nodeList[bestIndex].f) bestIndex = i;
+        }
+        var current = nodeList[bestIndex];
+        var x1 = current.x, y1 = current.y, pos1 = y1 * mapWidth + x1, g1 = current.g;
+        nodeList.splice(bestIndex, 1);
+        delete open[pos1];
+        closed[pos1] = true;
+        if (current.x === goalX && current.y === goalY) {
+            best = current;
+            break;
+        }
+        if (g1 >= searchLimit) continue;
+        for (var j = 0; j < list.length; j++) {
+            var direction = list[j], x2, y2;
+            if (direction % 2 === 0) {
+                x2 = $gameMap.roundXWithDirection(x1, direction);
+                y2 = $gameMap.roundYWithDirection(y1, direction);
+            } else {
+                x2 = $gameMap.roundXWithDirection(x1, (direction === 1 || direction === 7) ? 4 : 6);
+                y2 = $gameMap.roundYWithDirection(y1, (direction === 1 || direction === 3) ? 2 : 8);
+            }
+            var pos2 = y2 * mapWidth + x2;
+            if (closed[pos2]) continue;
+            if (!this.canPassFindDirection(x1, y1, direction)) continue;
+            var g2 = g1 + ((direction % 2 === 0) ? 1 : 1.4);
+            var neighbor = open[pos2];
+            if (!neighbor || g2 < neighbor.g) {
+                if (!neighbor) {
+                    neighbor = {};
+                    nodeList.push(neighbor);
+                    open[pos2] = neighbor;
+                }
+                neighbor.parent = current;
+                neighbor.x = x2;
+                neighbor.y = y2;
+                neighbor.g = g2;
+                neighbor.f = g2 + $gameMap.distance(x2, y2, goalX, goalY);
+                if (!best || neighbor.f - neighbor.g < best.f - best.g) best = neighbor;
+            }
+        }
+    }
+    var node = best;
+    while (node.parent && node.parent !== start) node = node.parent;
+    var deltaX1 = $gameMap.deltaX(node.x, start.x);
+    var deltaY1 = $gameMap.deltaY(node.y, start.y);
+    if (deltaX1 !== 0 && deltaY1 !== 0) {
+        if (deltaX1 < 0 && deltaY1 > 0) return 1;
+        if (deltaX1 > 0 && deltaY1 > 0) return 3;
+        if (deltaX1 < 0 && deltaY1 < 0) return 7;
+        if (deltaX1 > 0 && deltaY1 < 0) return 9;
+    }
+    if (deltaY1 > 0) return 2;
+    if (deltaX1 < 0) return 4;
+    if (deltaX1 > 0) return 6;
+    if (deltaY1 < 0) return 8;
+    var deltaX2 = this.deltaXFrom(goalX);
+    var deltaY2 = this.deltaYFrom(goalY);
+    if (Math.abs(deltaX2) > Math.abs(deltaY2)) return deltaX2 > 0 ? 4 : 6;
+    if (deltaY2 !== 0) return deltaY2 > 0 ? 8 : 2;
+    return 0;
+};
+
+var _findDirectionToFast = Game_Character.prototype.findDirectionTo;
+$.findDirectionToBase = _findDirectionToFast; // (the game's own: tests compare)
+// (VE_DiagonalMovement's search: it tries 8 ways and keeps its closed tiles in closedList)
+$.veSearchInGame = /closedList/.test(String(_findDirectionToFast)) && /canPassFindDirection/.test(String(_findDirectionToFast));
+Game_Character.prototype.findDirectionTo = function(goalX, goalY) {
+    var search = $.veSearchInGame ? $.veFindDirectionTo : _findDirectionToFast;
+    if ($.pathEvents) return search.apply(this, arguments);
+    var at = {}, w = $gameMap.width();
+    $gameMap.events().forEach(function(ev) {
+        var k = ev._y * w + ev._x;
+        (at[k] = at[k] || []).push(ev);
+    });
+    $.pathEvents = at;
+    try {
+        return search.apply(this, arguments);
+    } finally {
+        $.pathEvents = null;
+    }
+};
+
+var _eventsXyNtFast = Game_Map.prototype.eventsXyNt;
+Game_Map.prototype.eventsXyNt = function(x, y) {
+    var at = $.pathEvents;
+    if (!at) return _eventsXyNtFast.apply(this, arguments);
+    var here = at[y * this.width() + x];
+    return here ? here.filter(function(ev) { return ev.posNt(x, y); }) : [];
 };
 
 // YEP_EventChasePlayer's "See Player" is on for every event (plugin

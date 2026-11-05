@@ -2,7 +2,7 @@
 // FH_CoopBattle.js
 //=============================================================================
 /*:
- * @plugindesc v0.5.13 Co-op battles: battles run on the PC of whoever started
+ * @plugindesc v0.6.0 Co-op battles: battles run on the PC of whoever started
  * them, other players can join, downed players, betrayal duel. Below
  * FH_CoopWorld.
  * @author FH2 Co-op Mod
@@ -1784,8 +1784,41 @@ $.battleStateData = function() {
                 a.storedBP ? a.storedBP() : 0, // Boost Points (the eye icons, Olivia_OctoBattle)
                 a.battlerName(), a.faceName(), a.faceIndex()]; // limb loss and beheading change them (CE240-245)
         }),
-        t: $gameTroop.turnCount()
+        t: $gameTroop.turnCount(),
+        sc: $.battleScreenData()
     };
+};
+
+// The fight PC's screen tone and brightness, for the joiners' views: a
+// joiner takes no map states during a fight (below, "Guest: local battle"),
+// so it kept the tone it had when it joined - play test 2026-11-05: Karin's
+// meeting tints the screen black and back, a guest joined halfway and fought
+// the whole battle darkened. Battle events' tints come along the same way.
+$.battleScreenData = function() {
+    var sc = $gameScreen;
+    return sc ? sc.tone().map(Math.round).concat([Math.round(sc.brightness())]) : null;
+};
+
+$.applyBattleScreen = function(d) {
+    var sc = $gameScreen;
+    if (!sc || !Array.isArray(d) || d.length < 5) return;
+    var tone = [0, 1, 2, 3].map(function(i) { return Number(d[i]) || 0; });
+    if (!$.sameList(sc._toneDuration > 0 ? sc._toneTarget : sc._tone.map(Math.round), tone)) sc.startTint(tone, 6);
+    if (Math.round(sc._brightness) !== d[4]) {
+        sc._brightness = d[4];
+        sc._fadeOutDuration = 0;
+        sc._fadeInDuration = 0;
+    }
+};
+
+// A joiner's own screen back after the fight: a thin guest gets the host's
+// with the resync after it; a PC with its own map (the host, a roaming
+// guest) had its own before the owner's came in.
+$.puppetScreenBack = function(p) {
+    var s = p && p.scr0, sc = $gameScreen;
+    if (!s || !sc || $.isThin()) return;
+    sc.startTint(s.t.slice(), 0);
+    sc._brightness = s.b;
 };
 
 $.battleParticipants = function() {
@@ -1905,10 +1938,37 @@ $.PERF_FX.forEach(function(entry) {
         base.apply(this, arguments);
         if ($.authBattle && $.battleViewers().length && $gameParty.inBattle() && !$.puppet && !$.fxEcho) {
             var ref = $.battlerRef(this);
-            $.battleBroadcast({ t: 'bFx', k: 'perf', f: name, s: ref[0], i: ref[1] });
+            var msg = { t: 'bFx', k: 'perf', f: name, s: ref[0], i: ref[1] };
+            if (name === 'performDamage') msg.act = $.perfActionRef();
+            $.battleBroadcast(msg);
         }
     };
 });
+
+// The action that hit, for the joiners' performDamage: another mod there
+// (Bloodier battles, mod 293) reads BattleManager._action to draw the wound
+// (slash, gunshot, burn...); a joiner's copy runs no actions, so without this
+// every wound on their screens was a blunt dent. [subject kind, index or
+// actor id, 1 skill / 0 item, item id] or null.
+$.perfActionRef = function() {
+    var act = BattleManager._action;
+    var subject = act && act.subject && act.subject();
+    var item = act && act.item && act.item();
+    if (!subject || !item) return null;
+    var ref = $.battlerRef(subject);
+    return [ref[0], ref[1], act.isSkill() ? 1 : 0, item.id];
+};
+
+// subjectOf(kind, i): the subject on this PC (a duel turns the sides round).
+$.perfAction = function(d, subjectOf) {
+    if (!Array.isArray(d)) return null;
+    var subject = subjectOf ? subjectOf(d[0], d[1]) :
+        d[0] === 'e' ? $gameTroop.members()[d[1]] : $gameActors.actor(d[1]);
+    if (!subject) return null;
+    var act = new Game_Action(subject);
+    if (d[2]) act.setSkill(d[3]); else act.setItem(d[3]);
+    return act.item() ? act : null;
+};
 
 // A character's own action on the joiners' screens: the swing (thrust,
 // skill, item) and its weapon picture (play test 2026-10-31: Marina's attack
@@ -1935,9 +1995,128 @@ Game_Battler.prototype.startWeaponAnimation = function(weaponImageId) {
     }
 };
 
+// Immersive enemy sprites (Nexus mod 292, when installed) times its sway by
+// Graphics.frameCount, which counts drawn frames: on a 164 Hz screen it ran
+// 2.7 times as fast as made for 60 (play test 2026-11-05: "too much, the
+// parts wobble on their own"). While its two motion functions run, the count
+// is real time at 60 a second. (Ours load after it: plugins.js order.)
+$.TICKS_PER_MS = 0.06;
+$.at60fps = function(base) {
+    var wrapped = function() {
+        var real = Graphics.frameCount;
+        Graphics.frameCount = Math.floor($.clockMs() * $.TICKS_PER_MS);
+        try {
+            return base.apply(this, arguments);
+        } finally {
+            Graphics.frameCount = real;
+        }
+    };
+    wrapped._fh60 = true;
+    return wrapped;
+};
+[[Sprite_Enemy, 'updateFluidWavyMotion'], [Sprite_Actor, 'updateActorFluidWavyMotion']].forEach(function(entry) {
+    var base = entry[0].prototype[entry[1]];
+    if (typeof base === 'function' && !base._fh60) entry[0].prototype[entry[1]] = $.at60fps(base);
+});
+
+// Immersive Attacks (Nexus mod 282) pushes whoever takes HP damage from any
+// Game_Action.apply, and asks the battler's screenX when it finds no sprite:
+// outside a battle scene VE_BasicModule reads a spriteset that is not there
+// and throws - this mod's skills on other players on the map (FH_CoopWorld
+// useFieldSkillOn) would have stopped the game. Only in the battle scene;
+// an error in it costs the push, not the fight.
+var _triggerRecoil = Game_Battler.prototype.triggerRecoil;
+if (typeof _triggerRecoil === 'function') {
+    Game_Battler.prototype.triggerRecoil = function() {
+        var scene = SceneManager._scene;
+        if (!(scene instanceof Scene_Battle) || !scene._spriteset) return;
+        try {
+            _triggerRecoil.apply(this, arguments);
+        } catch (e) {
+            $.dlog('Immersive Attacks: push skipped -', e && e.message);
+        }
+    };
+}
+
 // a joiner's copy (no broadcast from here: $.puppet)
-$.playPerf = function(target, name) {
-    if ($.PERF_NAMES[name] && typeof target[name] === 'function') target[name]();
+// (act: the hit's action from $.perfAction, set as BattleManager._action
+// while it plays)
+$.playPerf = function(target, name, act) {
+    if (!$.PERF_NAMES[name] || typeof target[name] !== 'function') return;
+    if (!act || name !== 'performDamage') {
+        target[name]();
+        return;
+    }
+    // (the subject too: Immersive Attacks, mod 282, pushes the one hit away
+    // from it)
+    var before = BattleManager._action, subject = BattleManager._subject;
+    BattleManager._action = act;
+    BattleManager._subject = act.subject();
+    try {
+        target[name]();
+    } finally {
+        BattleManager._action = before;
+        BattleManager._subject = subject;
+    }
+};
+
+// A character stepping forward for its action and back (YEP's action
+// sequences: spriteStepForward / spriteReturnHome) on the joiners' screens
+// too: their copies run no actions, so it stood still there. With Immersive
+// Attacks (Nexus mod 282) installed the step is a dash to the enemy it hits
+// (user request 2026-11-05); a joiner plays that mod's own step with the same
+// action and target. Party order differs between PCs: each PC moves its own
+// sprite from its own place.
+$.stepMessage = function(actor) {
+    var bm = BattleManager, t = (bm._targets || [])[0] || (bm._allTargets || [])[0];
+    return { t: 'bFx', k: 'step', s: 'a', i: actor.actorId(), act: $.perfActionRef(),
+        tg: t && t.isEnemy && t.isEnemy() ? $gameTroop.members().indexOf(t) : -1 };
+};
+
+$.stepShared = function() {
+    return !!$.authBattle && $.battleViewers().length > 0 && $gameParty.inBattle() && !$.puppet && !$.fxEcho;
+};
+
+var _spriteStepForward = Game_Actor.prototype.spriteStepForward;
+if (typeof _spriteStepForward === 'function') {
+    Game_Actor.prototype.spriteStepForward = function() {
+        _spriteStepForward.apply(this, arguments);
+        if ($.stepShared()) $.battleBroadcast($.stepMessage(this));
+    };
+}
+
+var _spriteReturnHome = Game_Actor.prototype.spriteReturnHome;
+if (typeof _spriteReturnHome === 'function') {
+    Game_Actor.prototype.spriteReturnHome = function() {
+        // (called for every member at a victory, an input start...: only one
+        // away from its place)
+        var sprite = this.battler && this.battler();
+        var away = !!sprite && typeof sprite.inHomePosition === 'function' && !sprite.inHomePosition();
+        _spriteReturnHome.apply(this, arguments);
+        if (away && $.stepShared()) $.battleBroadcast({ t: 'bFx', k: 'home', s: 'a', i: this.actorId() });
+    };
+}
+
+// a joiner's copy: as acting, with that action and target, for the step only
+$.playStep = function(actor, msg) {
+    if (typeof actor.spriteStepForward !== 'function') return;
+    var bm = BattleManager, foe = $gameTroop.members()[msg.tg];
+    var saved = { action: bm._action, targets: bm._targets, state: actor._actionState };
+    bm._action = $.perfAction(msg.act);
+    bm._targets = foe ? [foe] : [];
+    actor._actionState = 'acting';
+    try {
+        actor.spriteStepForward();
+    } finally {
+        bm._action = saved.action;
+        bm._targets = saved.targets;
+        actor._actionState = saved.state;
+    }
+};
+
+$.playHome = function(actor) {
+    var sprite = actor.battler && actor.battler();
+    if (sprite && typeof sprite.stepBack === 'function') sprite.stepBack();
 };
 
 $.battleStreamFrame = 0;
@@ -2325,7 +2504,8 @@ $.puppet = null; // { bid, owner, saveActors, myActorId, input }
 $.guestHandlers.bView = function(msg) {
     var myId = $.isHost() ? $.hostActorId() : $.myActorId;
     $.puppet = { bid: msg.bid, owner: msg.owner, saveActors: $gameParty._actors.slice(),
-        myActorId: myId, dialogQueue: [], dialogAdvances: {} };
+        myActorId: myId, dialogQueue: [], dialogAdvances: {},
+        scr0: { t: $gameScreen.tone().slice(), b: $gameScreen._brightness } };
     msg.actors.forEach(function(entry) {
         $gameActors._data[entry.id] = $.parseActor(entry.json);
     });
@@ -2363,6 +2543,7 @@ $.applyPuppetState = function(st) {
     if (!st) return;
     if ($.puppet) $.puppet.lastState = st;
     if (st.t !== undefined) $gameTroop._turnCount = st.t;
+    if (st.sc) $.applyBattleScreen(st.sc);
     var enemies = $gameTroop.members();
     (st.e || []).forEach(function(d, i) {
         var e = enemies[i];
@@ -2450,13 +2631,19 @@ $.guestHandlers.bFx = function(msg) {
         if (e) _performCollapse.call(e);
         break;
     case 'perf':
-        if (target) $.playPerf(target, msg.f);
+        if (target) $.playPerf(target, msg.f, $.perfAction(msg.act));
         break;
     case 'motion':
         if (target && $.ACTION_MOTIONS[msg.m]) target[msg.f === 'forceMotion' ? 'forceMotion' : 'requestMotion'](msg.m);
         break;
     case 'weapon':
         if (target) target.startWeaponAnimation(msg.w);
+        break;
+    case 'step':
+        if (target) $.playStep(target, msg);
+        break;
+    case 'home':
+        if (target) $.playHome(target);
         break;
     case 'gab':
         $.battleGab(msg.text, true);
@@ -2684,6 +2871,7 @@ $.guestHandlers.bEnd = function(msg) {
     }
     var save = $.puppet.saveActors;
     $.puppet = null;
+    $.puppetScreenBack(p);
     $gameParty._actors = save;
     BattleManager._phase = null;
     if ($gamePlayer) $gamePlayer.refresh(); // the leader may have been the fight's
@@ -8142,7 +8330,9 @@ $.playDuelFx = function(msg) {
             }
             break;
         case 'perf':
-            if (target) $.playPerf(target, msg.f);
+            if (target) $.playPerf(target, msg.f, $.perfAction(msg.act, function(kind) {
+                return kind === 'e' ? $.duelMe() : kind === 'a' ? pb.ctl : null;
+            }));
             break;
         case 'gab':
             $.battleGab(msg.text, true);
@@ -8261,8 +8451,10 @@ $.guestHandlers.pvpEnd = function(msg) {
 // trade or revive; enemies neither see nor chase it, and it does not vote.
 // Doors are the exception. A simple unconditional transfer is taken directly
 // without running its page. A door with choices, locks or an opening sequence
-// runs its original event on a live map, so the original interaction works.
-// A dead guest on a still copy still takes only simple transfers.
+// runs its original event on a live map, so the original interaction works
+// (a dead guest on the host's map: the host runs it for it, FH_CoopRoam
+// $.ghostRunFor). A dead guest on a still copy still takes only simple
+// transfers.
 // The fog circle (GALV_VisibilityRange) and the player light (Terrax) are
 // drawn around the player: they follow the ghost by themselves.
 // No jumping to players (user decision 2026-10-19: removed; ghosts walk).
@@ -8659,6 +8851,13 @@ $.ghostTryDoor = function(x, y, triggers, normal) {
         // (as anyone: its choices, its checks, its opening, its own move)
         if (!t && !$.spec && $.ghostMovePage(ev, page) && !$gameMap.isEventRunning() &&
                 (normal === undefined || ev.isNormalPriority() === normal)) {
+            // a guest on the host's map runs no events (thin): the host runs
+            // it for this ghost (FH_CoopRoam $.ghostRunFor)
+            if ($.isThin()) {
+                used = true;
+                $.ghostAskHost(ev, x, y, triggers, normal);
+                return true;
+            }
             ev._fhGhostDoor = true;
             ev.start();
             if (ev._starting) {
@@ -8697,6 +8896,44 @@ $.ghostTryDoor = function(x, y, triggers, normal) {
         return true;
     });
     return used;
+};
+
+// A ghost guest on the host's map asks the host to run a door's original
+// event for it (user decision 2026-11-05: before, Z there did nothing - its
+// own PC set the event starting and never ran it). As a living thin guest's
+// 'act', with the event: the host takes it from a ghost for that door only.
+$.ghostActFrame = -1;
+$.ghostAskHost = function(ev, x, y, triggers, normal) {
+    $.ghostActFrame = Graphics.frameCount; // (no ping on this Z)
+    if (!$.conn || !$.myActorId || $.pm || $.myEventRunning) return;
+    var key = [x, y, triggers.join(), normal, 'ghost'].join(',');
+    if (key === $.lastActKey && Graphics.frameCount - $.lastActFrame <= 20) return;
+    $.lastActKey = key;
+    $.lastActFrame = Graphics.frameCount;
+    $.conn.send({ t: 'act', m: $gameMap.mapId(), x: x, y: y, tr: triggers, n: normal, g: ev.eventId() });
+    $.dlog('ghost door: the host runs it', 'map', $gameMap.mapId(), 'ev' + ev.eventId(), 'p' + ev._pageIndex);
+};
+
+// The host ran this ghost's door up to its move to another map
+// (FH_CoopRoam $.ghostRunFor): there as by any door of its own. A screen its
+// event faded out comes back on the next map (the rest of the event, its
+// fade in, is the map's it left).
+$.ghostFadeBack = false;
+$.guestHandlers.ghostGo = function(msg) {
+    if (!msg || !$.isGhostMe() || !$gamePlayer || $gamePlayer.isTransferring()) return;
+    var black = $gameScreen.brightness() < 255;
+    $.ghostGo({ m: msg.m, x: msg.x, y: msg.y, d: msg.d, f: black ? 0 : msg.f || 0, door: true }, 'door the host ran');
+    if (black && $gamePlayer.isTransferring()) $.ghostFadeBack = true;
+};
+
+var _performTransferGhostFade = Game_Player.prototype.performTransfer;
+Game_Player.prototype.performTransfer = function() {
+    var back = this === $gamePlayer && $.ghostFadeBack && this.isTransferring();
+    _performTransferGhostFade.call(this);
+    if (back) {
+        $.ghostFadeBack = false;
+        $gameScreen.clearFade();
+    }
 };
 
 // The ghost goes to a spot (a door's, a player's).
@@ -8796,6 +9033,7 @@ var _triggerButtonActionGhost = Game_Player.prototype.triggerButtonAction;
 Game_Player.prototype.triggerButtonAction = function() {
     var used = _triggerButtonActionGhost.call(this);
     if (used || !this._fhGhost || !Input.isTriggered('ok') || this.isTransferring()) return used;
+    if ($.ghostActFrame === Graphics.frameCount) return true; // (a door it asked the host to run)
     $.sendGhostPing();
     return true;
 };
@@ -9082,8 +9320,13 @@ $.hostHandlers.watchPing = function(conn, msg) {
     $.deliverWatchPing(conn.guestId, msg.to, msg.k);
 };
 
-// Guests' interactions on the host: never from a ghost.
-$.actHooks.unshift(function(conn) { return $.isDead(conn.guestId); });
+// Guests' interactions on the host: never from a ghost, but a move-related
+// door it asks for (FH_CoopRoam $.ghostActFor).
+$.actHooks.unshift(function(conn, msg) {
+    if (!$.isDead(conn.guestId)) return false;
+    if (msg && msg.g && $.ghostActFor) $.ghostActFor(conn, msg);
+    return true;
+});
 
 // The hint (always on while a ghost) -----------------------------------------
 
@@ -9301,7 +9544,25 @@ $.DOOM_TEXT = {
     mold: 'became part of the sleeping house',
     burn: 'burned to death',
     mine: 'stepped on a mine',
-    snap: 'had their neck snapped'
+    snap: 'had their neck snapped',
+    infection: 'died of an infected wound'
+};
+// An infected arm or leg (states 55 / 56) untreated: CE192 Infection_SYSTEM
+// (each room change, CE104) counts it per character (V230-V251) and at 7
+// says "You died because of your infected wound." and calls CE47 GameOver.
+// That game over was a co-op down, and up again the count went past 7 - the
+// infection never killed (user 2026-11-05: "infection is a death"). CE47 is
+// the plain game over of everything else too: only when CE192 calls it.
+$.INFECTION_CE = 192;
+$.GAME_OVER_CE = 47;
+var _setupChildInfection = Game_Interpreter.prototype.setupChild;
+Game_Interpreter.prototype.setupChild = function(list, eventId) {
+    _setupChildInfection.call(this, list, eventId);
+    var ce = $dataCommonEvents[$.GAME_OVER_CE], inf = $dataCommonEvents[$.INFECTION_CE];
+    if ($.role && ce && inf && this._childInterpreter && (list === ce.list || $.sameListShape(ce.list, list)) &&
+            (this._list === inf.list || $.sameListShape(inf.list, this._list))) {
+        this._childInterpreter._fhDoomCause = 'infection';
+    }
 };
 // The white mold apartment's beds (Map071 EV194/195/199/200, Map075): "Rest"
 // sets V1013 apartment_bed_activate, and the autorun pages counting on it end
@@ -9500,6 +9761,7 @@ $.doomOf353 = function(interp) {
     }
     var doom = $.doomOfList(interp._list);
     if (doom) return doom;
+    if (interp._fhDoomCause && $.DOOM_TEXT[interp._fhDoomCause]) return interp._fhDoomCause;
     if ($.isMoldBedList(interp._list)) return 'mold';
     if ($.isFlameBurnList(interp._list)) return 'burn';
     if ($.isMineList(interp._list)) return 'mine';

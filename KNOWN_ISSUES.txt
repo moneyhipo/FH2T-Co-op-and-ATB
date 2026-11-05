@@ -12,7 +12,7 @@ Before you play:
 
 Co-op rules:
 - Up to 4 players. The host's PC runs the world; if the host quits, the session ends.
-- Companions cannot join anyone's party in co-op.
+- Companions do not walk with anyone in co-op: a recruited companion goes to wait on the train or at PRHVL Bop.
 - Each player has their own Hexen board. Every 2 soul stones a player crafts give 1 to each other player.
 - Beds: the players on that map vote and lie down together; players elsewhere join by using
   any bed. When every living player is in bed, all dream and the day advances once.

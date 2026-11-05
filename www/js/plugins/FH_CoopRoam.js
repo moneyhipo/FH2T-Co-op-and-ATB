@@ -2,7 +2,7 @@
 // FH_CoopRoam.js
 //=============================================================================
 /*:
- * @plugindesc v0.5.13 Co-op: every player explores on their own. A guest on a
+ * @plugindesc v0.6.0 Co-op: every player explores on their own. A guest on a
  * map without the host runs that map on its own PC. Below FH_CoopBattle.
  * @author FH2 Co-op Mod
  *
@@ -663,8 +663,8 @@ var _markCauseHanded = $.markCause;
 $.markCause = function(key) {
     _markCauseHanded(key);
     if ($.causeSkip || !$.role || !$.runsWorld() || !$gameMap || !$.pressRunning()) return;
-    $gameMap.events().forEach(function(ev) {
-        if (ev._fhHandedPage === undefined || ev._fhHandedPage !== ev._pageIndex) return;
+    $gameMap._events.forEach(function(ev) { // (not events(): a new array at every switch write)
+        if (!ev || ev._fhHandedPage === undefined || ev._fhHandedPage !== ev._pageIndex) return;
         if ($.pageCauseKeys(ev).indexOf(key) < 0) return;
         delete ev._fhHandedPage;
         // (an autorun again, for the one who pressed)
@@ -3404,6 +3404,25 @@ Game_Interpreter.prototype.command117 = function() {
     return _command117Golem.call(this);
 };
 
+// CE484 Hesitation_battle (every contestant troop's BATTLE START page, Troop
+// 95-111): a contestant in the party who is not the chosen character (its
+// SELECT off) is a companion, gets Hesitation (state 180: skips its turns
+// until hit, 99%) and says it will not fight one of its own. In co-op the
+// fight's PC has only its own player's SELECT on, so another player who
+// joined the fight read as a companion and stood there (play test
+// 2026-11-05: Daan in the host's fight with Karin, states [180], no turn
+// for 20 s). Companions cannot join in co-op, so every contestant in a co-op
+// party is a player: not run in a session.
+$.HESITATION_CE = 484;
+var _command117Hesitation = Game_Interpreter.prototype.command117;
+Game_Interpreter.prototype.command117 = function() {
+    if (this._params[0] === $.HESITATION_CE && $.role && $.sessionActive()) {
+        $.dlog('CE484 Hesitation skipped: the contestants in this party are players');
+        return true;
+    }
+    return _command117Hesitation.call(this);
+};
+
 // Change Party for the golem: past the co-op "no companions" rules.
 var _command129Golem = Game_Interpreter.prototype.command129;
 Game_Interpreter.prototype.command129 = function() {
@@ -4337,16 +4356,19 @@ $.soulGained = function(id, causeId, mapId) {
     $.dlog('soul of', name, 'goes to', $.playerLabel(causeId), mapId === $.HEXEN_MAP ? '(its board)' : '');
     var others = takers.filter(function(p) { return p.id !== causeId; });
     if (mapId === $.HEXEN_MAP || !others.length) return;
+    $.soulWait[id] = { at: $.clockMs(), asked: true, cause: causeId };
     $.sendTo(causeId, { t: 'soulAsk', sw: id, name: name,
-        to: others.map(function(p) { return { id: p.id, label: $.playerLabel(p.id) }; }) });
+        to: others.map(function(p) { return { id: p.id, label: $.playerLabel(p.id), a: p.a }; }) });
 };
 
 $.SOUL_ASK_TEXT = 'The soul of %1 is yours.';
 $.guestHandlers.soulAsk = function(msg) {
     var to = msg.to || [];
     var options = ['Absorb'].concat(to.map(function(p) { return 'Give to ' + p.label; }));
+    if (!$.isHost()) $.soulAsked(msg.sw);
     $.showPickBox($.SOUL_ASK_TEXT.replace('%1', msg.name), options, function(i) {
         var pick = { t: 'soulGive', sw: msg.sw, to: i > 0 && to[i - 1] ? to[i - 1].id : null };
+        if (!$.isHost()) $.soulAnswered(msg.sw, i > 0 && to[i - 1] ? to[i - 1].a : $.myActorId);
         if ($.isHost()) $.soulGive('host', pick);
         else if ($.conn) $.conn.send(pick);
     }, 0);
@@ -4435,6 +4457,103 @@ var _sendAssignRoster = $.sendAssign;
 $.sendAssign = function(conn, actorId) {
     _sendAssignRoster(conn, actorId);
     if ($.broadcastRoster) $.broadcastRoster();
+};
+
+// The original's "You absorbed the <kind> soul." right after the kill
+// (Map130 EV104: SW498 Karin's soul on, an animation, then the line; the
+// same in every contestant's death, 160-odd lines): in co-op the soul
+// is not absorbed yet - its player picks Absorb or Give (above), and that
+// line came anyway, on every screen on the map, also for a player who gave
+// it away (play test 2026-11-05: O'saa gave Karin's soul to Daan, both
+// screens said "You absorbed"). The event now waits at that message until the
+// pick is made (at most SOUL_WAIT_MS), and the line names who took it:
+// "Daan absorbed the Endless soul." With no pick (nobody else to give it
+// to) the line stays as it is.
+// Kept on the PC whose interpreter runs the kill: the host (its own events,
+// a thin guest's), or a roaming guest (its own map: the host's question
+// comes back to it after its world change).
+$.SOUL_WAIT_MS = 60000;
+$.SOUL_ASK_COMING_MS = 3000; // a roaming guest: the host's question on its way
+$.SOUL_LINE_RE = /^You absorbed the (.*soul)/i;
+$.soulWait = {}; // switch -> { at, asked, cause (host), done: actor id }
+$.lastSoulOn = null; // { sw, at }: the soul switch an event here just turned on
+
+$.soulAsked = function(sw) {
+    var rec = $.soulWait[sw] || ($.soulWait[sw] = { at: $.clockMs() });
+    rec.asked = true;
+    rec.at = $.clockMs();
+    delete rec.done; // (a pick before a load)
+};
+
+$.soulAnswered = function(sw, actorId) {
+    var rec = $.soulWait[sw];
+    if (rec) rec.done = actorId || 0;
+};
+
+// Whose the soul is now: an actor id, 'wait' while its pick is open, or null
+// (no pick: the line as it is).
+$.soulLineOwner = function(sw) {
+    var rec = $.soulWait[sw], now = $.clockMs();
+    if (!rec) return null;
+    if (rec.done !== undefined) return rec.done || null;
+    if (!rec.asked) return now - rec.at < $.SOUL_ASK_COMING_MS ? 'wait' : null;
+    var gone = $.isHost() && rec.cause && !$.soulTakers().some(function(p) { return p.id === rec.cause; });
+    if (gone || now - rec.at >= $.SOUL_WAIT_MS) return $.isHost() ? $.soulOwnerMap()[sw] || null : null;
+    return 'wait';
+};
+
+// Host: the pick made (Absorb or Give).
+var _soulGiveLine = $.soulGive;
+$.soulGive = function(fromId, msg) {
+    _soulGiveLine(fromId, msg);
+    var rec = msg && $.soulWait[msg.sw];
+    if (rec && rec.cause === fromId) rec.done = $.soulOwnerMap()[msg.sw] || 0;
+};
+
+// The soul switch an event on this PC turned on (a roaming guest: a question
+// comes only when another living player could take it, not on the board).
+var _swSetSoulLine = Game_Switches.prototype.setValue;
+Game_Switches.prototype.setValue = function(id, value) {
+    var gain = this === $gameSwitches && !!$.SOUL_ACTOR[id] && !!value && !!$.role && $.sessionActive() &&
+        !_switchValueSoul.call(this, id);
+    _swSetSoulLine.call(this, id, value);
+    if (!gain) return;
+    $.lastSoulOn = { sw: id, at: $.clockMs() };
+    if (!$.isHost() && $gameMap && $gameMap.mapId() !== $.HEXEN_MAP) {
+        var others = ($.roster || []).some(function(p) { return p.a && !p.dead && p.a !== $.myActorId; });
+        if (others) $.soulWait[id] = { at: $.clockMs() }; // (anew: a pick before a load)
+        else delete $.soulWait[id];
+    }
+};
+
+// The message with that line: wait for the pick, then the taker's name.
+var _command101SoulLine = Game_Interpreter.prototype.command101;
+Game_Interpreter.prototype.command101 = function() {
+    var last = $.lastSoulOn, list = this._list, i = this._index + 1;
+    if (!last || !$.role || $.clockMs() - last.at > $.SOUL_WAIT_MS + 30000) return _command101SoulLine.apply(this, arguments);
+    var hit = false;
+    for (; list[i] && list[i].code === 401; i++) if ($.SOUL_LINE_RE.test(list[i].parameters[0])) hit = true;
+    if (!hit) return _command101SoulLine.apply(this, arguments);
+    var owner = $.soulLineOwner(last.sw);
+    if (owner === 'wait') return false;
+    $.lastSoulOn = null;
+    var data = owner && $dataActors[owner];
+    if (!data) return _command101SoulLine.apply(this, arguments);
+    $.soulLineName = data.name;
+    try {
+        return _command101SoulLine.apply(this, arguments);
+    } finally {
+        $.soulLineName = null;
+    }
+};
+
+$.soulLineName = null;
+var _messageAddSoulLine = Game_Message.prototype.add;
+Game_Message.prototype.add = function(text) {
+    if ($.soulLineName && typeof text === 'string' && $.SOUL_LINE_RE.test(text)) {
+        text = text.replace(/^You absorbed/i, $.soulLineName + ' absorbed');
+    }
+    _messageAddSoulLine.call(this, text);
 };
 
 
@@ -9287,8 +9406,10 @@ $.guestHandlers.snap = function(msg) {
 // a co-op game, so nothing turns SW1292 on and the host's world never goes to
 // the moonscorched scene. Stage 6: that player dies for good ('moonscorch',
 // FH_CoopBattle "Deaths for good") after a short local flash, a ghost; the
-// host keeps the world running. Where it died its moonscorched form stands as
-// an event of that map for everyone (saved in the host's save, coop data
+// host keeps the world running. Its PC alone then plays that character's own
+// moonscorched scene (map 141 / Daan's 132) over its screen ("The
+// moonscorched scene, on the dying player's screen only" below). Where it
+// died its moonscorched form stands as an event of that map for everyone (saved in the host's save, coop data
 // 'rher'), chasing like the original field monsters; touching it is a fight
 // with that form's troop that others can join. Killed: its body stays (the
 // form's own dead sprite) and the dead player's bag and equipment go to the
@@ -9788,6 +9909,7 @@ $.rherMoonscorched = function() {
         return;
     }
     $.rherSceneFx(actorId === $.RHER_DAAN);
+    $.rherStageBegin(actorId); // (its own scene on this screen, after the white)
     if ($.isHost()) {
         $.rherDoom('host', spot);
         return;
@@ -9843,6 +9965,363 @@ var _addCorpseRher = $.addCorpse;
 $.addCorpse = function(actorId, m, x, y) {
     if ($.rherNoBody && actorId === $.rherNoBody) return;
     _addCorpseRher(actorId, m, x, y);
+};
+
+// The moonscorched scene, on the dying player's screen only ------------------
+// (user request 2026-11-05: each character's own scene again, seen by that
+// player alone). The original: CE536 (the white, a wait of 150), then map 141
+// "transform" - no tiles, the parallax white_background; each character's
+// transform event (EV5 Marcoh, EV7-12 Levi, Karin, O'saa, Olivia, Abella,
+// Marina), its frames pages on its SELECT switch and V1069; the autorun EV6
+// moves that one to the middle and steps V1069 with the noise and the
+// screams, then a game over. Daan: map 132, EV3's SW1292 branch (no tiles
+// either, no words: Pocketcat comes up, the mask's frames on SW4888-4898,
+// the black), a game over. Here the death, the ghost
+// and the form come at once as before (the others see the form appear); this
+// PC then plays that map's scene over its own screen as a stage of its own:
+// that map's data read here, its events drawn as sprites above the map, the
+// scene's list run by an interpreter whose switches, variables, self
+// switches, event moves, tint and screen noise are the stage's - never the
+// world's (the world's switches go to everyone; a thin guest's screen tone is
+// the host's). Its words are this PC's own (event 0: nobody's message to
+// share). Its game over is its end; the ghost walks on where it fell. The
+// player does not move, open the menu or watch a fight meanwhile.
+$.RHER_STAGE_WAIT = 150;                              // CE536: the white, then the move
+$.RHER_STAGE_TINT_IN = 70;                            // CE536: the tint back on the next map
+$.RHER_STAGE_FADE = 30;                               // its end: back to the ghost's map
+$.RHER_STAGE_SCENE = { 141: 6, 132: 3 };              // map -> the event whose first page is the scene
+$.RHER_STAGE_SPOT = { 141: [8, 6], 132: [8, 9] };     // CE536's move: the camera's centre
+$.rherStage = null;
+
+$.rherStageBegin = function(actorId) {
+    var mapId = actorId === $.RHER_DAAN ? $.MOONSCORCH_DAAN_MAP : $.MOONSCORCH_MAP;
+    var data = $.bodyMapData(mapId);
+    var sceneEv = $.RHER_STAGE_SCENE[mapId];
+    var page = data && data.events[sceneEv] && data.events[sceneEv].pages[0];
+    if (!page) {
+        $.dlog('Eye of Rher: no scene data of map', mapId);
+        return;
+    }
+    var sw = {};
+    Object.keys($.SELECT_ACTOR).forEach(function(id) {
+        if ($.SELECT_ACTOR[id] === actorId) sw[id] = true;
+    });
+    sw[$.MOONSCORCHED_SWITCH] = true; // (Daan's scene: its SW1292 branch)
+    var spot = $.RHER_STAGE_SPOT[mapId];
+    var tilesX = Math.round(Graphics.width / 48), tilesY = Math.round(Graphics.height / 48);
+    $.rherStage = {
+        actorId: actorId, map: mapId, data: data, sceneEv: sceneEv, list: page.list, wait: $.RHER_STAGE_WAIT,
+        sw: sw, v: {}, ss: {}, chars: {}, interp: null,
+        disp: { x: Math.max(0, Math.min(data.width - tilesX, spot[0] - Math.floor(tilesX / 2))),
+            y: Math.max(0, Math.min(data.height - tilesY, spot[1] - Math.floor(tilesY / 2))) },
+        tone: [255, 255, 255, 0], toneTarget: [0, 0, 0, 0], toneDur: $.RHER_STAGE_TINT_IN,
+        fx: $.rherStageFx(), over: false, fade: 0, layer: null
+    };
+    $.dlog('Eye of Rher: the moonscorched scene of map', mapId, 'for actor', actorId);
+};
+
+// The stage's screen effects (Olivia_HorrorEffects "Screen" in its list):
+// its layer follows this source, not $gameScreen.
+$.rherStageFx = function() {
+    var gs = Game_System.prototype;
+    return { _horrorFilters: {}, clearHorrorEffects: function() { this._horrorFilters = {}; },
+        createHorrorEffect: gs.createHorrorEffect, removeHorrorEffect: gs.removeHorrorEffect,
+        setHorrorEffectToValue: gs.setHorrorEffectToValue };
+};
+
+// Its page's conditions with the stage's switches and variables.
+$.rherStageMeets = function(s, evId, c) {
+    if (c.switch1Valid && !s.sw[c.switch1Id]) return false;
+    if (c.switch2Valid && !s.sw[c.switch2Id]) return false;
+    if (c.variableValid && (s.v[c.variableId] || 0) < c.variableValue) return false;
+    if (c.selfSwitchValid && !s.ss[evId + ',' + c.selfSwitchCh]) return false;
+    if (c.itemValid) return false;
+    if (c.actorValid && c.actorId !== s.actorId) return false;
+    return true;
+};
+
+// An event of the scene's map: drawn where the scene's camera is, its page
+// the last one the stage meets (as a map event's, without the map).
+$.RherStageChar = function() { this.initialize.apply(this, arguments); };
+$.RherStageChar.prototype = Object.create(Game_Character.prototype);
+$.RherStageChar.prototype.constructor = $.RherStageChar;
+$.RherStageChar.prototype.initialize = function(data) {
+    Game_Character.prototype.initialize.call(this);
+    this._fhStageData = data;
+    this._pageIndex = -2;
+    this._originalPattern = 1;
+    this.locate(data.x, data.y);
+};
+$.RherStageChar.prototype.refreshBushDepth = function() { this._bushDepth = 0; };
+$.RherStageChar.prototype.scrolledX = function() { return this._realX - ($.rherStage ? $.rherStage.disp.x : 0); };
+$.RherStageChar.prototype.scrolledY = function() { return this._realY - ($.rherStage ? $.rherStage.disp.y : 0); };
+$.RherStageChar.prototype.isOriginalPattern = function() { return this.pattern() === this._originalPattern; };
+$.RherStageChar.prototype.resetPattern = function() { this.setPattern(this._originalPattern); };
+$.RherStageChar.prototype.refreshPage = function(s) {
+    var data = this._fhStageData, index = -1;
+    for (var i = data.pages.length - 1; i >= 0; i--) {
+        if ($.rherStageMeets(s, data.id, data.pages[i].conditions)) {
+            index = i;
+            break;
+        }
+    }
+    if (index === this._pageIndex) return;
+    this._pageIndex = index;
+    var page = data.pages[index];
+    if (!page) {
+        this.setImage('', 0);
+        return;
+    }
+    var img = page.image;
+    if (img.tileId > 0) this.setTileImage(img.tileId);
+    else this.setImage(img.characterName, img.characterIndex);
+    this.setDirectionFix(false);
+    this.setDirection(img.direction);
+    this.setDirectionFix(page.directionFix);
+    this._originalPattern = img.pattern;
+    this.setPattern(img.pattern);
+    this.setWalkAnime(page.walkAnime);
+    this.setStepAnime(page.stepAnime);
+    this.setPriorityType(page.priorityType);
+};
+
+// The scene's list, on the stage.
+$.RherStageInterp = function() { this.initialize.apply(this, arguments); };
+$.RherStageInterp.prototype = Object.create(Game_Interpreter.prototype);
+$.RherStageInterp.prototype.constructor = $.RherStageInterp;
+var GI = Game_Interpreter.prototype, SI = $.RherStageInterp.prototype;
+SI.character = function(param) {
+    var s = $.rherStage;
+    if (!s || param < 0) return null; // (the player: hidden behind the stage)
+    return s.chars[param === 0 ? s.sceneEv : param] || null;
+};
+SI.command111 = function() {
+    var s = $.rherStage, p = this._params, result;
+    if (!s) return true;
+    if (p[0] === 0) {
+        result = !!s.sw[p[1]] === (p[2] === 0);
+    } else if (p[0] === 1) {
+        var a = s.v[p[1]] || 0, b = p[2] === 0 ? p[3] : s.v[p[3]] || 0;
+        result = [a === b, a >= b, a <= b, a > b, a < b, a !== b][p[4]];
+    } else if (p[0] === 2) {
+        result = !!s.ss[s.sceneEv + ',' + p[1]] === (p[2] === 0);
+    } else {
+        return GI.command111.call(this);
+    }
+    this._branch[this._indent] = !!result;
+    if (!result) this.skipBranch();
+    return true;
+};
+SI.command121 = function() {
+    var s = $.rherStage, p = this._params;
+    for (var id = p[0]; s && id <= p[1]; id++) s.sw[id] = p[2] === 0;
+    return true;
+};
+SI.command122 = function() {
+    var s = $.rherStage, p = this._params, value = 0;
+    if (!s) return true;
+    if (p[3] === 0) value = p[4];
+    else if (p[3] === 1) value = s.v[p[4]] || 0;
+    else if (p[3] === 2) value = p[4] + Math.randomInt(p[5] - p[4] + 1);
+    for (var id = p[0]; id <= p[1]; id++) {
+        var old = s.v[id] || 0;
+        s.v[id] = [value, old + value, old - value, old * value, value ? Math.floor(old / value) : 0,
+            value ? old % value : 0][p[2]] || 0;
+    }
+    return true;
+};
+SI.command123 = function() {
+    var s = $.rherStage;
+    if (s) s.ss[s.sceneEv + ',' + this._params[0]] = this._params[1] === 0;
+    return true;
+};
+SI.command223 = function() {
+    var s = $.rherStage, p = this._params;
+    if (s) {
+        s.toneTarget = p[0].slice();
+        s.toneDur = p[1];
+        if (!p[1]) s.tone = p[0].slice();
+    }
+    if (p[2]) this.wait(p[1]);
+    return true;
+};
+SI.command353 = function() { // the game over: its end
+    if ($.rherStage) $.rherStage.over = true;
+    this._index = this._list.length;
+    return true;
+};
+// Nothing of the player, the world or the map it is not on: the player's
+// look (211), menu (135), a common event (117: CE104 the room change), a move
+// (201), the screen's own fades, flash and shake (221, 222, 224, 225; its tint
+// is the stage's, 223 above), the save, the title.
+[117, 135, 201, 211, 221, 222, 224, 225, 352, 354].forEach(function(code) {
+    SI['command' + code] = function() { return true; };
+});
+// Its words are this PC's alone (a sub-host shares its messages by $.msgShared).
+SI.command101 = function() {
+    if (!$gameMessage.isBusy()) {
+        $.msgShared = false;
+        $.msgOwner = null;
+    }
+    return GI.command101.call(this);
+};
+SI.getPluginCommandHorrorEffectsTarget = function(args) {
+    var text = String(args.shift() || '');
+    return /(?:Screen|Map)/i.test(text) && $.rherStage ? $.rherStage.fx : null;
+};
+
+$.rherStageUpdate = function() {
+    var s = $.rherStage;
+    if (!s) return;
+    if (s.wait > 0) {
+        s.wait--;
+        return;
+    }
+    if (!s.interp) {
+        s.data.events.forEach(function(ev) {
+            if (ev) s.chars[ev.id] = new $.RherStageChar(ev);
+        });
+        s.interp = new $.RherStageInterp();
+        s.interp._fhRherStage = true;
+        s.interp.setup(s.list, 0);
+    }
+    if (!s.over) {
+        try {
+            s.interp.update();
+        } catch (e) {
+            $.dlog('ERROR Eye of Rher scene', e.stack || String(e));
+            s.over = true;
+        }
+        if (!s.interp.isRunning()) s.over = true;
+    }
+    Object.keys(s.chars).forEach(function(id) {
+        s.chars[id].refreshPage(s);
+        s.chars[id].update();
+    });
+    if (s.toneDur > 0) {
+        var d = s.toneDur--;
+        s.tone = s.tone.map(function(t, i) { return (t * (d - 1) + s.toneTarget[i]) / d; });
+    }
+    if (s.over) s.fade++;
+    $.rherStageDraw(s);
+    if (s.fade >= $.RHER_STAGE_FADE) $.rherStageStop('is over');
+};
+
+// Above the map (its tint, lighting, fog and pictures), under the windows.
+$.rherStageDraw = function(s) {
+    var scene = SceneManager._scene;
+    if (s.noDraw) {
+        if (s.layer && s.layer.parent) s.layer.parent.removeChild(s.layer);
+        s.layer = null;
+        return;
+    }
+    if (!(scene instanceof Scene_Map) || !scene._windowLayer || typeof ScreenSprite === 'undefined') return;
+    try {
+        if (!s.layer || s.layer.parent !== scene) {
+            if (s.layer && s.layer.parent) s.layer.parent.removeChild(s.layer);
+            var layer = new Sprite();
+            layer._horrorFiltersSource = s.fx;
+            // (its sprites update in the scene's own loop: another plugin's
+            // hook failing on a character that is no map event ends the
+            // scene, never the game; taken off on the next frame)
+            layer.update = function() {
+                try {
+                    Sprite.prototype.update.call(this);
+                } catch (e) {
+                    $.dlog('ERROR Eye of Rher scene sprites', e.stack || String(e));
+                    s.noDraw = true;
+                    s.over = true;
+                }
+            };
+            var back = new ScreenSprite();
+            back.setBlack();
+            layer.addChild(back);
+            if (s.data.parallaxName) layer.addChild(new Sprite(ImageManager.loadParallax(s.data.parallaxName)));
+            Object.keys(s.chars).forEach(function(id) { layer.addChild(new Sprite_Character(s.chars[id])); });
+            s.white = new ScreenSprite();
+            s.white.setWhite();
+            s.black = new ScreenSprite();
+            s.black.setBlack();
+            layer.addChild(s.white);
+            layer.addChild(s.black);
+            scene.addChildAt(layer, scene.children.indexOf(scene._windowLayer));
+            s.layer = layer;
+        }
+        var avg = (s.tone[0] + s.tone[1] + s.tone[2]) / 3;
+        s.white.opacity = Math.max(0, Math.min(255, avg));
+        s.black.opacity = Math.max(0, Math.min(255, -avg));
+        s.layer.opacity = s.over ? Math.round(255 * Math.max(0, 1 - s.fade / $.RHER_STAGE_FADE)) : 255;
+    } catch (e) {
+        $.dlog('ERROR Eye of Rher scene layer', e.stack || String(e));
+        if (s.layer && s.layer.parent) s.layer.parent.removeChild(s.layer);
+        s.layer = null;
+        s.noDraw = true; // (not again every frame: the scene ends)
+        s.over = true;
+    }
+};
+
+$.rherStageStop = function(why) {
+    var s = $.rherStage;
+    if (!s) return;
+    $.rherStage = null;
+    if (s.layer && s.layer.parent) s.layer.parent.removeChild(s.layer);
+    $.dlog('Eye of Rher: the moonscorched scene', why);
+};
+
+var _sceneMapUpdateRherStage = Scene_Map.prototype.update;
+Scene_Map.prototype.update = function() {
+    _sceneMapUpdateRherStage.call(this);
+    if (!$.rherStage) return;
+    try {
+        $.rherStageUpdate();
+    } catch (e) {
+        $.dlog('ERROR Eye of Rher scene', e.stack || String(e));
+        $.rherStageStop('stopped');
+    }
+};
+
+var _canMoveRherStage = Game_Player.prototype.canMove;
+Game_Player.prototype.canMove = function() {
+    if ($.rherStage && this === $gamePlayer) return false;
+    return _canMoveRherStage.call(this);
+};
+
+var _isMenuEnabledRherStage = Scene_Map.prototype.isMenuEnabled;
+Scene_Map.prototype.isMenuEnabled = function() {
+    return !$.rherStage && _isMenuEnabledRherStage.call(this);
+};
+
+var _askWatchFightRherStage = $.askWatchFight;
+$.askWatchFight = function() {
+    if ($.rherStage) return;
+    _askWatchFightRherStage();
+};
+
+var _watchHintTextRherStage = $.watchHintText;
+$.watchHintText = function() {
+    return $.rherStage ? '' : _watchHintTextRherStage();
+};
+
+// A load, the title, a new game, leaving: no scene of the game before.
+var _onLoadSuccessRherStage = Scene_Load.prototype.onLoadSuccess;
+Scene_Load.prototype.onLoadSuccess = function() {
+    $.rherStageStop('dropped (a save loaded)');
+    _onLoadSuccessRherStage.call(this);
+};
+var _leaveAsGuestRherStage = $.leaveAsGuest;
+$.leaveAsGuest = function(message) {
+    $.rherStageStop('dropped (left)');
+    _leaveAsGuestRherStage(message);
+};
+var _setupNewGameRherStage = DataManager.setupNewGame;
+DataManager.setupNewGame = function() {
+    $.rherStageStop('dropped (a new game)');
+    _setupNewGameRherStage.call(this);
+};
+var _sceneTitleStartRherStage = Scene_Title.prototype.start;
+Scene_Title.prototype.start = function() {
+    $.rherStageStop('dropped (the title)');
+    _sceneTitleStartRherStage.call(this);
 };
 
 // The forms: map events of their own, in the host's save ---------------------
@@ -15734,11 +16213,12 @@ $.priestStartScenes = function() {
         }
         var conn = $.clientById(id);
         if (!conn) return false;
-        if (conn.roam || !$.guestOnMap(conn)) {
+        if (conn.roam || conn.roamPending) {
             var h = conn.lastPos && conn.lastPos.m;
             conn.send({ t: 'priestScene', map: h || 0 });
             return false;
         }
+        if (!$.guestOnMap(conn)) return true; // (on its way here: the host runs it once it is)
         if ($.owned[id] || $.isBusy(conn)) return true;
         var legs = $.priestLegsOf();
         if (legs) $.runOwned(conn, legs.list, legs.ev);
@@ -16154,6 +16634,21 @@ $.soulGive = function(fromId, msg) {
     $.samarieBonus(to && to.id !== fromId ? to.id : fromId);
 };
 
+// Its question never answered (SOUL_WAIT_MS): the soul stayed with the one who
+// took it (soulGained), and so does the bonus.
+$.samarieTimeout = function() {
+    var rec = $.soulWait[$.SAMARIE_SOUL];
+    if (!rec || !rec.cause || rec.done !== undefined || $.clockMs() - rec.at < $.SOUL_WAIT_MS) return;
+    var owner = $.soulOwnerMap()[$.SAMARIE_SOUL];
+    rec.done = owner || 0;
+    var p = $.soulTakers().filter(function(t) { return t.a === owner; })[0];
+    $.dlog("Samarie's soul: its question went unanswered -", p ? $.playerLabel(p.id) + ' keeps it' : 'its taker is gone');
+    if (p) $.samarieBonus(p.id);
+};
+$.worldExtras.push(function() {
+    if ($.isHost() && Graphics.frameCount % 60 === 0) $.samarieTimeout();
+});
+
 //=============================================================================
 // The church's confessional: each player's own confession (user 2026-11-04)
 //=============================================================================
@@ -16291,14 +16786,47 @@ $.minimapOn = function() {
     return !!(window.Imported && Imported.TM_Minimap && window.FH && FH.Minimap && FH.Minimap.seen);
 };
 
-// ---- (1) the HUD below its canvas
+// ---- (6) in the game image (a test build, user 2026-11-04: "it stutters a
+// little"). Its own setting Screen Corner false: its window is a game window
+// in the image's top right instead of a second canvas over the game's. A bit
+// smaller there (160 instead of 200: about a fifth of the image's width, a
+// quarter of its height, user "분모 +1"). Only when the release main.js says
+// so (FH_COOP_MINIMAP_IN_GAME): the plugins are the same in both builds (one
+// hash), so the two can play together. Its loader (TM_ModLoader) sets its
+// settings before it loads, after these plugins: changed there.
+$.MM_IN_GAME_SIZE = 160;
 
+$.mmInGame = function() {
+    return typeof FH_COOP_MINIMAP_IN_GAME !== 'undefined' && !!FH_COOP_MINIMAP_IN_GAME;
+};
+
+$.mmInGameParams = function() {
+    var p = $.mmInGame() && PluginManager._parameters && PluginManager._parameters.tm_minimap;
+    if (!p) return;
+    p['Screen Corner'] = 'false';
+    p['Size'] = String($.MM_IN_GAME_SIZE);
+};
+
+var _setParametersMinimap = PluginManager.setParameters;
+PluginManager.setParameters = function(name, parameters) {
+    _setParametersMinimap.apply(this, arguments);
+    if (String(name).toLowerCase() === 'tm_minimap') $.mmInGameParams();
+};
+$.mmInGameParams(); // (already set: its loader ran before these plugins)
+
+// ---- (1) the HUD below its canvas (or its window in the game image)
+
+$.MM_HUD_FRAMES = 15; // (its place: not a layout read at every frame)
 $.mmPlaceHud = function() {
     var el = document.getElementById('fhcoop-hud');
     if (!el) return;
     var cv = $.minimapOn() ? FH.Minimap.screen : null;
     var top = $.MM_HUD_GAP;
-    if (cv && cv.style.display !== 'none') top = Math.round(cv.getBoundingClientRect().bottom) + $.MM_HUD_GAP;
+    var win = $.minimapOn() && !FH.Minimap.inCorner && SceneManager._scene && SceneManager._scene._fhMinimap;
+    if (win && win.visible && el.style.display !== 'none' && Graphics._canvas) {
+        var rect = Graphics._canvas.getBoundingClientRect(), scale = rect.height ? rect.height / Graphics.height : 1;
+        top = Math.round(rect.top + (win.y + win.height) * scale) + $.MM_HUD_GAP;
+    } else if (cv && cv.style.display !== 'none') top = Math.round(cv.getBoundingClientRect().bottom) + $.MM_HUD_GAP;
     var want = top + 'px';
     if (el.style.top !== want) el.style.top = want;
 };
@@ -16306,7 +16834,7 @@ $.mmPlaceHud = function() {
 var _sceneBaseUpdateMinimap = Scene_Base.prototype.update;
 Scene_Base.prototype.update = function() {
     _sceneBaseUpdateMinimap.call(this);
-    if ($.role && window.Imported && Imported.TM_Minimap) $.mmPlaceHud();
+    if ($.role && window.Imported && Imported.TM_Minimap && Graphics.frameCount % $.MM_HUD_FRAMES === 0) $.mmPlaceHud();
 };
 
 // ---- (2) one explored map for everyone
@@ -16330,30 +16858,67 @@ $.mmMerge = function(all, id, bits) {
     return changed;
 };
 
-// this map's minimap paints what it now knows
-$.mmRepaint = function(id) {
+// this map's minimap paints what it now knows: the cells new in it (old: its
+// bits before, none = a new map: every explored cell)
+$.mmRepaint = function(id, old) {
     var win = SceneManager._scene && SceneManager._scene._fhMinimap;
-    if (win && win._mapId === Number(id)) win._mapId = 0; // (its setupMap paints every explored cell)
+    if (!win || win._mapId !== Number(id) || !$gameMap || $gameMap.mapId() !== Number(id)) return;
+    var bits = $gameSystem._fhMapSeen[id], w = $gameMap.width(), n = w * $gameMap.height();
+    if (!old || !win._full || typeof win.paintCell !== 'function') {
+        win._mapId = 0; // (its setupMap paints every explored cell)
+        return;
+    }
+    for (var i = 0; i < bits.length; i++) {
+        var fresh = bits[i] & ~(old[i] | 0);
+        if (!fresh) continue;
+        for (var b = 0; b < 32; b++) {
+            var c = i * 32 + b;
+            if (c < n && (fresh >>> b) & 1) win.paintCell(c % w, Math.floor(c / w));
+        }
+    }
 };
+
+// Maps whose bits changed since mmChanged looked (all: every map, a new world)
+$.mmDirty = {};
+$.mmAllDirty = true;
 
 $.mmTake = function(maps) {
     var all = $gameSystem && ($gameSystem._fhMapSeen = $gameSystem._fhMapSeen || {});
     if (!all || !maps) return;
     Object.keys(maps).forEach(function(id) {
-        var before = all[id] ? JSON.stringify(all[id]) : '';
-        var mine = before !== ($.mmSent[id] || ''); // (explored here, not sent yet)
+        var old = all[id] ? all[id].slice() : null;
+        var mine = (old ? JSON.stringify(old) : '') !== ($.mmSent[id] || ''); // (explored here, not sent yet)
         if (!$.mmMerge(all, id, maps[id])) return;
+        $.mmDirty[id] = true;
         // a guest does not send the host's own back; the host passes every
         // player's on to the others (marked sent, a new map went to nobody)
         if (!mine && !$.isHost()) $.mmSent[id] = JSON.stringify(all[id]);
-        $.mmRepaint(id);
+        $.mmRepaint(id, old);
     });
+};
+
+// what this PC's own minimap explored (TM_Minimap's reveal: the map it is on)
+$.mmWatchReveal = function() {
+    var mm = window.FH && FH.Minimap;
+    if (!mm || typeof mm.reveal !== 'function' || mm.reveal._fhDirty) return;
+    var orig = mm.reveal;
+    mm.reveal = function() {
+        var fresh = orig.apply(this, arguments);
+        if (fresh && fresh.length && $gameMap) $.mmDirty[$gameMap.mapId()] = true;
+        return fresh;
+    };
+    mm.reveal._fhDirty = true;
 };
 
 $.mmChanged = function() {
     var all = $gameSystem && $gameSystem._fhMapSeen, out = null;
     if (!all) return null;
-    Object.keys(all).forEach(function(id) {
+    if ($.mmSystem !== $gameSystem) $.mmAllDirty = true; // (a new game, a load, a snapshot)
+    $.mmSystem = $gameSystem;
+    var ids = $.mmAllDirty ? Object.keys(all) : Object.keys($.mmDirty).filter(function(id) { return !!all[id]; });
+    $.mmAllDirty = false;
+    $.mmDirty = {};
+    ids.forEach(function(id) {
         var key = JSON.stringify(all[id]);
         if (key === $.mmSent[id]) return;
         $.mmSent[id] = key;
@@ -16411,9 +16976,10 @@ var _sceneMapUpdateMinimap = Scene_Map.prototype.update;
 Scene_Map.prototype.update = function() {
     _sceneMapUpdateMinimap.call(this);
     if ($.minimapOn() && !FH.Minimap._fhKorean) $.mmPatchKorean();
+    if ($.minimapOn()) $.mmWatchReveal();
+    if ($.minimapOn()) $.mmPatchWindow(this._fhMinimap);
     if (!$.role || !$.sessionActive() || !(window.Imported && Imported.TM_Minimap)) return;
     $.mmSync();
-    $.mmPatchWindow(this._fhMinimap);
 };
 
 $.hostHandlers.mmSeen = function(conn, msg) {
@@ -16451,18 +17017,104 @@ var _resetRoamsMinimap = $.resetRoams;
 $.resetRoams = function() {
     _resetRoamsMinimap();
     $.mmSent = {}; // (a load: everything goes again)
+    $.mmAllDirty = true;
 };
 
 // ---- (3) the other players on this map
 
+// (also (5) below: alone too, its redraw is wrapped once, the dots inside)
 $.mmPatchWindow = function(win) {
     var proto = win && Object.getPrototypeOf(win);
     if (!proto || proto._fhCoopPlayers || typeof proto.redraw !== 'function') return;
     proto._fhCoopPlayers = true;
+    $.mmMarkCache();
+    $.mmPatchScreen();
     var _redraw = proto.redraw;
     proto.redraw = function() {
+        var key = $.mmDrawKey(this);
+        if (key === this._fhDrawn) return; // (nothing it shows changed: its drawing stays)
+        this._fhDrawGen = ++$.mmDrawCount;
         _redraw.call(this);
+        this._fhDrawn = key; // (after it: a failed drawing is tried again)
         if ($.role && $.sessionActive()) $.mmDrawPlayers(this);
+    };
+    ['paintCell', 'setupMap'].forEach(function(name) {
+        var orig = proto[name];
+        if (typeof orig !== 'function') return;
+        proto[name] = function() {
+            this._fhGen = (this._fhGen || 0) + 1; // (its map image changed)
+            return orig.apply(this, arguments);
+        };
+    });
+};
+
+// ---- (5) only draw when something changed (user 2026-11-04: a laptop
+// running a host and a guest with it spun its fan hard). Every frame (60 a
+// second, standing still too) it cleared and drew its whole window, read the
+// texts of every seen door's page again for its mark, and drew its canvas
+// over the game's again (setting its size and measuring the game's canvas).
+// Now a door's mark is read once per page; the window draws again only when
+// what it shows changed (its map image, the player's place or blink, the
+// marks, the other players' dots); its canvas only after a new drawing or a
+// new window size.
+
+$.mmDrawCount = 0; // (every drawing a new number: a new window never matches an old canvas)
+
+$.mmMarkCache = function() {
+    var mm = FH.Minimap;
+    if (mm._fhMarkCache || typeof mm.markerOf !== 'function') return;
+    mm._fhMarkCache = true;
+    var base = mm.markerOf, known = new WeakMap(); // page list -> its mark (its texts do not change)
+    mm.markerOf = function(ev) {
+        if (!ev || ev._erased) return null;
+        var page = ev.page(), list = page && page.list;
+        if (!list) return base.call(this, ev);
+        var kind = known.get(list);
+        if (kind === undefined) {
+            kind = base.call(this, ev) || null;
+            known.set(list, kind);
+        }
+        return kind;
+    };
+};
+
+// what its window shows, as text: the same text = the same picture (places
+// to half a pixel of its window: it draws on whole pixels)
+$.mmDrawKey = function(win) {
+    var mm = FH.Minimap, s = win._cell || 1;
+    var at = function(v) { return Math.round(v * s * 2); };
+    var key = [win._mapId, win._fhGen || 0, win._cell, win._full ? win._full.width + 'x' + win._full.height : '',
+        at($gamePlayer._realX), at($gamePlayer._realY), (win._blink || 0) < 28 ? 1 : 0];
+    if (typeof mm.isSeen === 'function' && typeof mm.seen === 'function' && typeof mm.markerOf === 'function') {
+        var arr = mm.seen();
+        $gameMap.events().forEach(function(ev) {
+            if (!mm.isSeen(arr, ev.x, ev.y)) return;
+            var kind = mm.markerOf(ev);
+            if (kind) key.push(ev.x + ',' + ev.y + kind);
+        });
+    }
+    if ($.role && $.sessionActive()) {
+        Object.keys($.remotes || {}).forEach(function(id) {
+            var r = $.remotes[id];
+            if (r && !r._transparent && r._placed) key.push(id + ':' + at(r._realX) + ',' + at(r._realY));
+        });
+    }
+    return key.join('|');
+};
+
+$.mmPatchScreen = function() {
+    var mm = FH.Minimap;
+    if (mm._fhScreenOnce || typeof mm.drawScreen !== 'function') return;
+    mm._fhScreenOnce = true;
+    var _drawScreen = mm.drawScreen;
+    mm.drawScreen = function(contents) {
+        var win = SceneManager._scene && SceneManager._scene._fhMinimap;
+        var stamp = win && win._fhDrawGen ? win._fhDrawGen + '|' + (Graphics._realScale || 1) + '|' +
+            window.innerWidth + 'x' + window.innerHeight : null;
+        var cv = mm.screen;
+        if (stamp && cv && cv.style.display !== 'none' && cv._fhStamp === stamp) return;
+        _drawScreen.call(this, contents);
+        if (mm.screen) mm.screen._fhStamp = stamp;
     };
 };
 
@@ -16482,6 +17134,602 @@ $.mmDrawPlayers = function(win) {
         b.fillRect(qx - 1, qy - 1, pm + 2, pm + 2, '#000000');
         b.fillRect(qx, qy, pm, pm, $.MM_PLAYER_COLOR);
     });
+};
+
+//=============================================================================
+// A ghost guest's door on the host's map (user decision 2026-11-05)
+//=============================================================================
+// A ghost uses every move-related interaction as anyone (FH_CoopBattle
+// $.ghostMovePage: a lock, a choice, a ladder, an elevator, a door that opens
+// in steps). That ran on the PC running the map: the dead host's, a roaming
+// ghost's. A ghost guest on the host's map is a thin client and runs no
+// events: Z there did nothing but on simple doors. Now the host runs that
+// event for it as it runs a living guest's ($.runOwned), with the ghost's
+// rules: an answer with a fight greyed out, the autorun pages its door turns
+// on are its own too (a living guest's go through startEventFor, which turns
+// a dead one down - those pages moved the host), and its move to another map
+// is a ghost's (a still copy, $.ghostGo), not a map of its own to run.
+
+$.ghostRunFor = function(conn, ev, triggers, normal) {
+    if (!conn || !conn.actorId || !$.isDead(conn.guestId) || !$.guestOnMap(conn) ||
+            conn.roam || conn.roamPending || conn.subOf || $.isBusy(conn)) {
+        return false;
+    }
+    if (ev._erased || ev._fhOwner || ev._locked || ev._starting || $.hostRunHolds(ev) || $.ghostDoorBarred(ev)) {
+        return false;
+    }
+    var found = $.guestPage(conn, ev);
+    if (!found) return false;
+    var page = found.page;
+    if (triggers && triggers.indexOf(page.trigger) < 0) return false;
+    if (normal !== undefined && normal !== null && (page.priorityType === 1) !== normal) return false;
+    // (not a sleep, not a fight outside a choice's answers: $.ghostMovePage)
+    if (!$.ghostMovePage(ev, page) || $.pageNeedsConsent(page.list)) return false;
+    $.runOwned(conn, page.list, ev);
+    $.dlog('ghost door of', conn.name, ': the host runs ev' + ev.eventId(), 'p' + found.index);
+    return true;
+};
+
+// Its 'act' (FH_CoopBattle $.ghostAskHost): the event it pressed or stepped on.
+$.ghostActFor = function(conn, msg) {
+    var id = Number(msg.g);
+    $gameMap.eventsXy(msg.x, msg.y).some(function(ev) {
+        return ev.eventId() === id && $.ghostRunFor(conn, ev, msg.tr, msg.n);
+    });
+};
+
+// An autorun page its door turned on (the next step of a gate, an elevator's
+// ride): its own, as its door was. (The newest write decides, as in
+// FH_CoopWorld "Autorun pages a guest turned on"; outside every context.)
+var _gameEventStartGhostGuest = Game_Event.prototype.start;
+Game_Event.prototype.start = function() {
+    if ($.isHost() && this._trigger === 3 && !this._fhOwner && !$.ctx && !$gamePlayer._fhRemoteId &&
+            this._fhHandedPage !== this._pageIndex) {
+        var slot = $gameMap._events[this.eventId()];
+        var cause = !slot || slot === this ? $.pageCause(this) : null;
+        var conn = cause && cause.id !== 'host' ? $.clientById(cause.id) : null;
+        if (conn && $.isDead(conn.guestId) && $.guestOnMap(conn) && $.ghostMovePage(this, this.page())) {
+            // its door is still finishing: this page waits for it
+            if ($.isBusy(conn) || $.hostRunHolds(this)) {
+                cause.at = $.clockMs();
+                cause.n = ++$.causeSeq;
+                return;
+            }
+            if ($.ghostRunFor(conn, this, [3])) return;
+        }
+    }
+    _gameEventStartGhostGuest.call(this);
+};
+
+// Its move to another map: a ghost's way there (its PC shows that map as a
+// still copy and runs no events). The rest of the event is the map's it
+// left: it ends here. On the host's map (a ladder, a door within the map)
+// it moves as any guest does.
+$.ghostGone = {}; // host: guest id -> its spot { m, x, y, d, f }
+var _fhGuestTransferGhost = Game_Interpreter.prototype.fhGuestTransfer;
+Game_Interpreter.prototype.fhGuestTransfer = function() {
+    var id = this._fhOwner;
+    if (!id || !$.isDead(id) || !$.clientById(id) || $gameMessage.isBusy()) return _fhGuestTransferGhost.call(this);
+    var spot = $.transferSpot(this);
+    if (spot.m === $gameMap.mapId() || ($.DREAM_MAPS && $.DREAM_MAPS[spot.m])) return _fhGuestTransferGhost.call(this);
+    spot.f = this._params[5] || 0;
+    $.ghostGone[id] = spot;
+    this.setWaitMode('fhHanded'); // (until it is let go below)
+    return false;
+};
+
+// Let go as a hand-off is (FH_CoopRoam "A guest's transfer to another map"):
+// an autorun page that took it stays its own until someone presses it again
+// (the Kaiser room door: the next one through goes too), the door's steps go
+// off.
+var _updateOwnedGhost = $.updateOwned;
+$.updateOwned = function() {
+    _updateOwnedGhost();
+    Object.keys($.ghostGone).forEach(function(id) {
+        var spot = $.ghostGone[id];
+        delete $.ghostGone[id];
+        var entry = $.owned[id];
+        var conn = $.clientById(id);
+        if (!entry || !conn) return;
+        if (entry.ev && entry.ev._trigger === 3) {
+            entry.ev._fhHandedPage = entry.ev._pageIndex;
+            $.awaitOthersTransfer(entry.ev);
+        }
+        if (!$gameMap._interpreter.isRunning()) {
+            $.clearDoorSteps();
+            $gameMap.requestRefresh();
+        }
+        $.finishOwned(id);
+        conn.send({ t: 'ghostGo', m: spot.m, x: spot.x, y: spot.y, d: spot.d, f: spot.f });
+        $.dlog('ghost door of', conn.name, ': to map', spot.m, spot.x, spot.y);
+    });
+};
+
+// Its choice: an answer with a fight greyed out, as on the dead host's own
+// map (FH_CoopBattle $.fightAnswers; that one greys them in setupChoices,
+// which a guest's event never calls - its choices go to its screen).
+var _fhRemoteMessageGhost = Game_Interpreter.prototype.fhRemoteMessage;
+Game_Interpreter.prototype.fhRemoteMessage = function(withText) {
+    if (this._fhOwner && $.ctx && this._list && $.isDead(this._fhOwner)) {
+        var at = this._index;
+        if (withText) {
+            at++;
+            while (this._list[at] && this._list[at].code === 401) at++;
+        }
+        var cmd = this._list[at];
+        if (cmd && cmd.code === 102) {
+            var mods = $.choiceModsOf();
+            $.fightAnswers(this._list, at).forEach(function(n) { mods.dis[n] = true; });
+        }
+    }
+    return _fhRemoteMessageGhost.call(this, withText);
+};
+
+//=============================================================================
+// Companions in co-op: a recruit goes to wait on the train or at the club
+//=============================================================================
+// User decision 2026-11-05 (docs/진행상황.md): a companion walking along with
+// the players is hard to do in co-op, and a plain "your party is full" left
+// the recruit talks unused. The original has the place for a companion who is
+// not in the party: brought onto the train (Map014 EV74, touched at the
+// door) or into PRHVL Bop (Map067 EV85), each one "sits down" there and waits
+// (its own *_waiting_train / *_waiting_club switches, Olivia's train
+// V2301, Marcoh's train only "already left"; Daan's club is the bar). So in
+// co-op a recruit talk runs as in the original (its party-size question
+// answered "room"), the party add is left out (FH_CoopWorld), and once the
+// talk is over that character's part of one of those two drop-off events
+// runs, at random, quietly (its switches and variables, not its words), as
+// if the party had walked in there with them. The player who talked is told
+// where they went.
+// - Only the eight contestants who can be players (not ghouls, Black Kalev,
+//   the golem), not a character a player plays, not on the start screens.
+// - Not the temporary joins: Daan in the shack (Map049 EV36, he leaves at the
+//   Lake / Old Town exits: S3190 travelling_with_doctor) and Marina in the
+//   Mayor's manor (Map020 EV76 / EV256, she leaves after some rooms: S469
+//   marina_joined_manor) - a recruit that writes one of those stays "full",
+//   as before (wiki: Daan, Marina are recruited for good later).
+// - A drop-off part that does not get to its party remove (Karin's club
+//   before the journal is shown, Abella's and Karin's club before the
+//   headquarters...) is tried first without writing anything; the other
+//   place is taken then, and with neither the talk stays "full".
+// - A companion waiting at one of them: its talk's "Want to tag along?" is
+//   greyed out and an answer is added - "Wait for me at the club." on the
+//   train, "Wait for me on the train." at the club (user, same day). It runs
+//   the tag-along answer (the original's words and its waiting switch off)
+//   and sends it to the other place.
+// - Where the world runs: the host, a roaming guest on its own map (its world
+//   writes go to the host as always). Not a guest's own tutorial.
+$.DROP_RECRUITS = [1, 3, 4, 5, 6, 13, 14, 15];
+$.DROP_START_MAPS = [10, 35, 155];
+$.DROP_TEMP_FLAGS = [3190, 469];
+$.DROP_PLACES = {
+    train: { map: 14, ev: 74, words: 'on the train', ask: '"Wait for me on the train."' },
+    club: { map: 67, ev: 85, words: 'at the club', ask: '"Wait for me at the club."' }
+};
+// where each one waits now: its switches (and Olivia's V2301); else the map.
+// The club is read first: Marcoh's train has no switch of its own - he stands
+// outside the train again (Map004 EV226, in the evening inside: Map014 EV148)
+// once recruited (S3663 marcoh_recruited_once) and not at the club.
+$.DROP_WAIT = {
+    club: { s: { 1: [3702], 3: [3656], 4: [1747], 5: [2654], 6: [4005], 13: [3441], 14: [3603], 15: [3432] }, v: {}, maps: [67, 105] },
+    train: { s: { 1: [2241, 3707], 3: [3665], 4: [3418, 3573], 5: [2650], 6: [4008], 13: [3663], 14: [3608] }, v: { 15: 2301 }, maps: [14] }
+};
+$.dropOffs = [];     // [{ actor, runner, mapId, eventId, interp, at, place }]
+$.dropForce = {};    // actor -> the place its next drop-off goes to (the added answer)
+$.dropLists = {};    // 'place/actor' -> its part of the drop-off event
+
+$.dropOffOn = function() {
+    if (!$.role || !$.companionsBlocked || !$.companionsBlocked() || ($.isGuest() && $.solo)) return false;
+    if (!$.isHost() && !($.isRoaming && $.isRoaming())) return false;
+    return !!$gameMap && $.DROP_START_MAPS.indexOf($gameMap.mapId()) < 0;
+};
+
+$.dropIsPlayer = function(actorId) {
+    if (actorId === $.myActorId) return true;
+    if (($.clients || []).some(function(c) { return c.actorId === actorId; })) return true;
+    try {
+        return $.takenActors().indexOf(actorId) >= 0;
+    } catch (e) {
+        return false;
+    }
+};
+
+$.dropRecruit = function(actorId) {
+    return $.DROP_RECRUITS.indexOf(actorId) >= 0 && !$.dropIsPlayer(actorId);
+};
+
+// The block after list[at] (deeper than its indent): its contestant adds, and
+// whether it is a temporary join.
+$.dropAddsIn = function(list, at) {
+    var out = { actors: [], temp: false }, indent = list[at].indent;
+    for (var i = at + 1; i < list.length && list[i].indent > indent; i++) {
+        var c = list[i];
+        if (c.code === 129 && c.parameters[1] === 0 && $.dropRecruit(c.parameters[0]) &&
+                out.actors.indexOf(c.parameters[0]) < 0) out.actors.push(c.parameters[0]);
+        if (c.code === 121 && c.parameters[2] === 0 && $.DROP_TEMP_FLAGS.some(function(s) {
+            return s >= c.parameters[0] && s <= c.parameters[1];
+        })) out.temp = true;
+    }
+    return out;
+};
+
+// A temporary join at list[i] (a 129): one of its flags goes on in the rest
+// of that block.
+$.dropTempAt = function(list, i) {
+    var indent = list[i].indent;
+    for (var j = i + 1; j < list.length && list[j].indent >= indent; j++) {
+        var c = list[j];
+        if (c.code === 121 && c.parameters[2] === 0 && $.DROP_TEMP_FLAGS.some(function(s) {
+            return s >= c.parameters[0] && s <= c.parameters[1];
+        })) return true;
+    }
+    return false;
+};
+
+// That character's part of a drop-off event: the top-level statements that
+// ask whether it is in the party.
+$.dropOffList = function(actorId, place) {
+    var key = place + '/' + actorId;
+    if ($.dropLists[key] !== undefined) return $.dropLists[key];
+    var spec = $.DROP_PLACES[place], data = spec && $.bodyMapData(spec.map);
+    var ev = data && data.events && data.events[spec.ev];
+    var list = ev && ev.pages[0] && ev.pages[0].list, out = [];
+    if (list) {
+        var stmt = [];
+        var flush = function() {
+            if (stmt.some(function(c) {
+                return c.code === 111 && c.parameters[0] === 4 && c.parameters[1] === actorId && c.parameters[2] === 0;
+            })) out = out.concat(stmt);
+            stmt = [];
+        };
+        list.forEach(function(c) {
+            if (c.indent === 0 && c.code !== 411 && c.code !== 412) flush();
+            if (c.code !== 108 && c.code !== 408 && !(c.indent === 0 && c.code === 0)) stmt.push(c);
+        });
+        flush();
+    }
+    $.dropLists[key] = out.length ? out.concat([{ code: 0, indent: 0, parameters: [] }]) : null;
+    return $.dropLists[key];
+};
+
+// Runs a drop-off part quietly: no words, tints, waits, sounds, lights or
+// common events; the facing check at the door is met; a Set Event Location
+// only on that map. dry: switches and variables are read and written in a
+// copy - only whether it gets to its party remove.
+function Game_FHDropInterp(actorId, place, dry) {
+    Game_Interpreter.call(this, 0);
+    this._fhDrop = { actor: actorId, map: $.DROP_PLACES[place].map, removed: false, dry: !!dry, s: {}, v: {} };
+}
+Game_FHDropInterp.prototype = Object.create(Game_Interpreter.prototype);
+Game_FHDropInterp.prototype.constructor = Game_FHDropInterp;
+$.Game_FHDropInterp = Game_FHDropInterp;
+$.DROP_QUIET = [101, 102, 117, 223, 224, 225, 230, 231, 232, 233, 234, 235, 241, 242, 245, 246, 249, 250, 251, 356, 401, 355, 655];
+
+Game_FHDropInterp.prototype.dropSw = function(id) {
+    var d = this._fhDrop;
+    return d.dry && d.s[id] !== undefined ? d.s[id] : $gameSwitches.value(id);
+};
+
+Game_FHDropInterp.prototype.dropVar = function(id) {
+    var d = this._fhDrop;
+    return d.dry && d.v[id] !== undefined ? d.v[id] : $gameVariables.value(id);
+};
+
+Game_FHDropInterp.prototype.executeCommand = function() {
+    var c = this.currentCommand();
+    if (!c) {
+        this.terminate();
+        return false;
+    }
+    var p = c.parameters, d = this._fhDrop;
+    this._params = p;
+    this._indent = c.indent;
+    if ($.DROP_QUIET.indexOf(c.code) >= 0 || (c.code === 203 && $gameMap.mapId() !== d.map)) {
+        this._index++;
+        return true;
+    }
+    if (c.code === 129) {
+        if (p[0] === d.actor && p[1] !== 0) d.removed = true;
+        this._index++;
+        return true;
+    }
+    if (c.code === 111 && (p[0] === 6 || (d.dry && (p[0] === 0 || p[0] === 1)))) {
+        var r = true;
+        if (p[0] === 0) r = this.dropSw(p[1]) === (p[2] === 0);
+        if (p[0] === 1) {
+            var a = this.dropVar(p[1]), b = p[2] === 0 ? p[3] : this.dropVar(p[3]);
+            r = [a === b, a >= b, a <= b, a > b, a < b, a !== b][p[4]];
+        }
+        this._branch[this._indent] = r;
+        if (!r) this.skipBranch();
+        this._index++;
+        return true;
+    }
+    if (d.dry && c.code === 121) {
+        for (var s = p[0]; s <= p[1]; s++) d.s[s] = p[2] === 0;
+        this._index++;
+        return true;
+    }
+    if (d.dry && c.code === 122) {
+        var val = p[3] === 0 ? p[4] : p[3] === 1 ? this.dropVar(p[4]) : 0;
+        for (var v = p[0]; v <= p[1]; v++) {
+            var cur = this.dropVar(v);
+            d.v[v] = [val, cur + val, cur - val, cur * val, val ? Math.floor(cur / val) : cur, val ? cur % val : cur][p[2]];
+        }
+        this._index++;
+        return true;
+    }
+    if (d.dry && (c.code === 123 || c.code === 203)) {
+        this._index++;
+        return true;
+    }
+    return Game_Interpreter.prototype.executeCommand.call(this);
+};
+
+// true: that place took it (its party remove ran)
+$.dropOffRun = function(actorId, place, dry) {
+    var list = $.dropOffList(actorId, place);
+    if (!list) return false;
+    var it = new Game_FHDropInterp(actorId, place, dry);
+    var party = $gameParty._actors;
+    it.setup(list, 0);
+    $gameParty._actors = [actorId]; // (its part asks "in the party?")
+    try {
+        for (var n = 0; n < 4000 && it.isRunning(); n++) {
+            if (!it.executeCommand()) break;
+        }
+    } catch (e) {
+        $.dlog('ERROR drop-off of actor', actorId, place, String(e));
+        it._fhDrop.removed = false;
+    } finally {
+        $gameParty._actors = party;
+    }
+    if (!dry && $gameMap) $gameMap.requestRefresh();
+    return it._fhDrop.removed;
+};
+
+// The places that would take it now: the asked one, else both at random.
+$.dropPlacesFor = function(actorId, only) {
+    var order = only ? [only] : (Math.random() < 0.5 ? ['train', 'club'] : ['club', 'train']);
+    return order.filter(function(place) { return $.dropOffRun(actorId, place, true); });
+};
+
+// Where it waits now: 'train', 'club' or ''.
+$.dropWhere = function(actorId) {
+    var found = '';
+    ['club', 'train'].forEach(function(place) {
+        var w = $.DROP_WAIT[place];
+        if (found) return;
+        if ((w.s[actorId] || []).some(function(s) { return $gameSwitches.value(s); })) found = place;
+        else if (w.v[actorId] && $gameVariables.value(w.v[actorId]) > 0) found = place;
+    });
+    if (!found && $gameMap) {
+        ['train', 'club'].forEach(function(place) {
+            if (!found && $.DROP_WAIT[place].maps.indexOf($gameMap.mapId()) >= 0) found = place;
+        });
+    }
+    return found;
+};
+
+// The party-size question of a recruit: "room" when every character it adds
+// has a place to go (not for a temporary join).
+var _command111Drop = Game_Interpreter.prototype.command111;
+Game_Interpreter.prototype.command111 = function() {
+    var p = this._params;
+    if (p[0] === 1 && p[1] === $.PARTY_SIZE_VAR && $.partyRoomCheck(this._list, this._index) === 'room' && $.dropOffOn()) {
+        var adds = $.dropAddsIn(this._list, this._index);
+        if (adds.actors.length && !adds.temp && adds.actors.every(function(a) {
+            return $.dropPlacesFor(a, $.dropForce[a] || '').length > 0;
+        })) {
+            this._branch[this._indent] = true;
+            $.dlog('companion check answered "room" (they go to wait on the train or at the club)', 'map', this._mapId,
+                'event', this._eventId, 'line', this._index, 'actors', adds.actors.join(','));
+            return true;
+        }
+    }
+    return _command111Drop.call(this);
+};
+
+// The party add: noted, done when the talk is over.
+$.dropOffAdd = function(interp, actorId) {
+    if (interp._list && $.dropTempAt(interp._list, interp._index)) return false;
+    var place = $.dropForce[actorId] || '';
+    delete $.dropForce[actorId];
+    $.dropOffs.push({ actor: actorId, runner: $.minionRunner(interp), mapId: interp._mapId || $gameMap.mapId(),
+        eventId: interp._eventId, interp: interp, at: Graphics.frameCount, place: place });
+    $.dlog('companion', actorId, 'joins: to wait', place || 'on the train or at the club', 'after the talk');
+    return true;
+};
+
+var _command129Drop = Game_Interpreter.prototype.command129;
+Game_Interpreter.prototype.command129 = function() {
+    var p = this._params;
+    if (p[1] === 0 && $.dropRecruit(p[0]) && $.dropOffOn() && $.dropOffAdd(this, p[0])) return true;
+    return _command129Drop.call(this);
+};
+
+// (a guest's event on the host skips Change Party: IGNORE_FOR_GUEST)
+var _executeCommandDrop = Game_Interpreter.prototype.executeCommand;
+Game_Interpreter.prototype.executeCommand = function() {
+    var command = this._fhOwner && $.runsWorld() && !(this instanceof Game_FHDropInterp) ? this.currentCommand() : null;
+    if (command && command.code === 129 && command.parameters[1] === 0 && $.dropRecruit(command.parameters[0]) &&
+            $.dropOffOn()) {
+        this._params = command.parameters;
+        this._indent = command.indent;
+        $.dropOffAdd(this, command.parameters[0]);
+        this._index++;
+        return true;
+    }
+    return _executeCommandDrop.call(this);
+};
+
+// Its talk still runs: an interpreter of that event on this PC.
+$.dropBusy = function(d) {
+    if (Graphics.frameCount - d.at < 2) return true;
+    if (Graphics.frameCount - d.at > 60 * 60 * 5) return false; // (5 minutes: it is over)
+    if (d.interp && d.interp.isRunning()) return true;
+    if (!d.eventId) return false;
+    if ($gameMap.mapId() === d.mapId) {
+        var mi = $gameMap._interpreter;
+        if (mi && mi.isRunning() && mi.eventId() === d.eventId) return true;
+        var ev = $gameMap.event(d.eventId);
+        if (ev && ev._interpreter && ev._interpreter.isRunning()) return true;
+    }
+    var owned = $.owned || {};
+    return Object.keys(owned).some(function(k) {
+        var o = owned[k];
+        return !!o && !!o.interp && o.interp.isRunning() && o.interp._eventId === d.eventId;
+    });
+};
+
+$.dropOffDo = function(d) {
+    var places = $.dropPlacesFor(d.actor, d.place);
+    if (!places.length && d.place) places = $.dropPlacesFor(d.actor, '');
+    var place = places[0];
+    if (!place || !$.dropOffRun(d.actor, place, false)) {
+        $.dlog('ERROR companion', d.actor, 'has no place to wait (train / club)');
+        return;
+    }
+    var actor = $gameActors.actor(d.actor);
+    $.dlog('companion', d.actor, 'went to wait', place, '(told', d.runner + ')');
+    $.minionTell(d.runner, (actor ? actor.name() : 'They') + ' went to wait ' + $.DROP_PLACES[place].words + '.');
+};
+
+$.dropOffUpdate = function() {
+    if (!$.dropOffs.length) return;
+    var due = $.dropOffs.filter(function(d) { return !$.dropBusy(d); });
+    if (!due.length) return;
+    $.dropOffs = $.dropOffs.filter(function(d) { return due.indexOf(d) < 0; });
+    due.forEach($.dropOffDo);
+};
+
+$.worldExtras.push(function() { if ($.isHost()) $.dropOffUpdate(); });
+$.guestExtras.push(function() { if ($.isRoaming && $.isRoaming()) $.dropOffUpdate(); });
+
+// (a load, a new game, leaving: $.freshGameState below - not at every
+// extractSaveContents: a guest's snapshot or roam start keeps its drop-offs)
+
+// ---- the waiting companion's talk
+
+// The tag-along answer of a choice whose add is a companion waiting on the
+// train or at the club: { answer, actor, other, text, extra } or null.
+$.dropTalk = function(list, at) {
+    if (!list || !list[at] || list[at].code !== 102 || !$.dropOffOn()) return null;
+    var indent = list[at].indent, found = null;
+    for (var i = at + 1; i < list.length && !found; i++) {
+        var c = list[i];
+        if (c.indent < indent || (c.indent === indent && c.code !== 402 && c.code !== 403)) break;
+        if (c.indent !== indent || c.code !== 402) continue;
+        var adds = $.dropAddsIn(list, i);
+        if (adds.actors.length && !adds.temp) found = { answer: c.parameters[0], actor: adds.actors[0] };
+    }
+    if (!found) return null;
+    var now = $.dropWhere(found.actor);
+    if (!now) return null; // (not waiting anywhere: a first recruit goes at random)
+    found.other = now === 'train' ? 'club' : 'train';
+    found.text = $.DROP_PLACES[found.other].ask;
+    found.extra = list[at].parameters[0].length;
+    found.canGo = $.dropPlacesFor(found.actor, found.other).length > 0;
+    return found;
+};
+
+var _setupChoicesDrop = Game_Interpreter.prototype.setupChoices;
+Game_Interpreter.prototype.setupChoices = function(params) {
+    var talk = this._fhOwner ? null : $.dropTalk(this._list, this._index);
+    _setupChoicesDrop.call(this, params);
+    if (!talk || !$gameMessage.isChoice()) return;
+    if ($gameMessage.disableChoice) $gameMessage.disableChoice(talk.answer, true);
+    if (!talk.canGo) return;
+    var extra = $gameMessage._choices.length;
+    $gameMessage._choices.push(talk.text);
+    var cb = $gameMessage._choiceCallback;
+    $gameMessage.setChoiceCallback(function(n) {
+        if (n === extra) {
+            $.dropForce[talk.actor] = talk.other;
+            n = talk.answer;
+        }
+        if (cb) cb(n);
+    });
+};
+
+// a guest's event: its choice goes to its screen (the added answer too)
+var _fhRemoteMessageDrop = Game_Interpreter.prototype.fhRemoteMessage;
+Game_Interpreter.prototype.fhRemoteMessage = function(withText) {
+    this._fhDropTalk = null; // (a talk before: its answer was another question's)
+    var at = this._index;
+    if (withText) {
+        at++;
+        while (this._list[at] && this._list[at].code === 401) at++;
+    }
+    var cmd = this._list && this._list[at];
+    var talk = this._fhOwner && $.ctx && cmd && cmd.code === 102 ? $.dropTalk(this._list, at) : null;
+    if (!talk) return _fhRemoteMessageDrop.call(this, withText);
+    $.choiceModsOf().dis[talk.answer] = true;
+    if (!talk.canGo) return _fhRemoteMessageDrop.call(this, withText);
+    var orig = cmd.parameters, copy = orig.slice();
+    copy[0] = orig[0].concat([talk.text]);
+    cmd.parameters = copy;
+    if (!withText) this._params = copy;
+    this._fhDropTalk = { extra: orig[0].length, answer: talk.answer, actor: talk.actor, other: talk.other };
+    try {
+        return _fhRemoteMessageDrop.call(this, withText);
+    } finally {
+        cmd.parameters = orig;
+        if (!withText) this._params = orig;
+    }
+};
+
+var _pmsgDoneDrop = $.hostHandlers.pmsgDone;
+$.hostHandlers.pmsgDone = function(conn, msg) {
+    var interp = $.findWaiting(conn.guestId, msg.id), dt = interp && interp._fhDropTalk;
+    if (dt) {
+        interp._fhDropTalk = null;
+        if (Number(msg.choice) === dt.extra) {
+            $.dropForce[dt.actor] = dt.other;
+            msg = Object.assign({}, msg, { choice: dt.answer });
+        }
+    }
+    return _pmsgDoneDrop(conn, msg);
+};
+
+//=============================================================================
+// A new game, a load, leaving: nothing of the game before (review 0.6.0)
+//=============================================================================
+// Kept by this PC across games, none of it in the save: a drop-off of the
+// game before ran in the next one, an execution, a priest's scene, a floor
+// sleep, a soul's question waited there.
+$.freshGameState = function(why) {
+    $.dropOffs = [];
+    $.dropForce = {};
+    $.snapPending = null;
+    $.snapRun = 0;
+    $.priestLost = null;
+    $.priestHolds = {};
+    $.priestQueue = [];
+    $.priestSceneMap = 0;
+    $.priestCross = null;
+    $.floorSleep = null;
+    $.arrivedOn = 0;
+    $.soulWait = {};
+    $.lastSoulOn = null;
+    $.dlog("this PC's state of the game before dropped (" + why + ')');
+};
+
+var _setupNewGameFresh = DataManager.setupNewGame;
+DataManager.setupNewGame = function() {
+    _setupNewGameFresh.call(this);
+    $.freshGameState('a new game');
+};
+var _onLoadSuccessFresh = Scene_Load.prototype.onLoadSuccess;
+Scene_Load.prototype.onLoadSuccess = function() {
+    $.freshGameState('a save loaded');
+    _onLoadSuccessFresh.call(this);
+};
+var _leaveAsGuestFresh = $.leaveAsGuest;
+$.leaveAsGuest = function(message) {
+    $.freshGameState('left');
+    $.tutorialStartSnap = null; // (its host's tutorial: not the next host's)
+    _leaveAsGuestFresh(message);
 };
 
 })(FH.Coop);

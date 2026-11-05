@@ -2,7 +2,7 @@
 // FH_CoopSteam.js
 //=============================================================================
 /*:
- * @plugindesc v0.5.13 Co-op over Steam: F7 invites friends through the
+ * @plugindesc v0.6.0 Co-op over Steam: F7 invites friends through the
  * FHSteamHelper program, snapshots are compressed. Below FH_CoopBattle.
  * @author FH2 Co-op Mod
  *

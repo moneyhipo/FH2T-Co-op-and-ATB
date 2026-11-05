@@ -2,7 +2,7 @@
 // FH_Coop.js
 //=============================================================================
 /*:
- * @plugindesc v0.5.13 Co-op core: session (IP, F6), guest join, snapshots,
+ * @plugindesc v0.6.0 Co-op core: session (IP, F6), guest join, snapshots,
  * shared map view with player avatars. Place below FH_ATB.
  * @author FH2 Co-op Mod
  *
@@ -494,7 +494,7 @@ $.startHost = function() {
 // Host and guest must run the same mod code: the release label (main.js of
 // a release sets FH_COOP_VERSION; install.bat copies are '<MOD_RELEASE> dev')
 // and a hash of the mod plugin files, which is what is compared.
-$.MOD_RELEASE = '0.5.13';
+$.MOD_RELEASE = '0.6.0';
 $.modVersion = (typeof FH_COOP_VERSION !== 'undefined' && FH_COOP_VERSION) || $.MOD_RELEASE + ' dev';
 $.modHash = (function() {
     try {
@@ -1850,10 +1850,12 @@ $.takenNpcFor = null; // the events array the last full check was for
 $.takenNpcPrep = function() {
     var hostId = $.hostActorId();
     var keys = [];
+    $.takenSelects = [];
     $.clients.forEach(function(c) {
         if (!c.actorId || c.actorId === hostId) return;
         var name = $dataActors[c.actorId].characterName.replace(/^[!$%]+/, '');
         keys.push(name.replace(/\d+$/, ''));
+        if ($.SELECT_OF_ACTOR[c.actorId]) $.takenSelects.push($.SELECT_OF_ACTOR[c.actorId]);
     });
     if (keys.length === 0) {
         $.takenNpcFor = null; // (events that change meanwhile are checked when it is back)
@@ -1870,15 +1872,96 @@ $.takenNpcPrep = function() {
 
 // (a player's own body is that character's look: FH_CoopRoam "Bodies as events")
 $.hideTakenNpc = function(ev, re) {
-    if (ev._erased || !ev.characterName() || !re.test(ev.characterName())) return;
+    if (ev._erased || !ev.characterName()) return;
+    if (!re.test(ev.characterName()) && !$.selectGoneNpc(ev)) return;
     var data = ev.event();
     if (data && data._fhBody) return;
     ev.erase();
 };
 
+// Where all the contestants stand together (Path1 after the train, the train
+// cabins) some of them are drawn from sheets of several people
+// ($characters1-3, $botanist1: Abella "redhair" $characters2, Daan "doctor"
+// $characters3...), which the name test above misses (play test 2026-11-05:
+// a guest played Abella, her NPC stood at Path1). The original takes the
+// chosen character's NPC away with a page on its SELECT switch with nothing
+// on it (redhair: [SW244] empty). Such an event goes when, with a guest's
+// SELECT taken as on, its page would be an empty one that needs that switch -
+// unless its picture shows up on another event then (Daan's pick moves
+// people about: Henryk's event is empty, his picture stands in Karin's).
+// Only on those maps and only people (elsewhere such pages also take away
+// monsters and door tiles in that character's story).
+$.SELECT_NPC_MAPS = [4, 14];
+$.takenSelects = [];
+
+$.pageNeedsSwitch = function(page, sw) {
+    var c = page.conditions;
+    return (c.switch1Valid && c.switch1Id === sw) || (c.switch2Valid && c.switch2Id === sw);
+};
+
+// The page index the event would take with switch sw on (-1: none).
+$.pageWithSwitchOn = function(ev, sw) {
+    var pages = ev.event().pages;
+    for (var i = pages.length - 1; i >= 0; i--) {
+        var page = pages[i];
+        if ($.pageNeedsSwitch(page, sw)) {
+            var c = Object.assign({}, page.conditions);
+            if (c.switch1Valid && c.switch1Id === sw) c.switch1Valid = false;
+            if (c.switch2Valid && c.switch2Id === sw) c.switch2Valid = false;
+            page = Object.assign({}, page, { conditions: c });
+        }
+        if (ev.meetsConditions(page)) return i;
+    }
+    return -1;
+};
+
+$.npcCellKey = function(image) {
+    var name = image.characterName;
+    // a "$" sheet is one picture of 3 x 4 poses (here: of several people)
+    return /^[!]*\$/.test(name) ? name + ':' + image.direction + ':' + image.pattern : name + ':' + image.characterIndex;
+};
+
+$.isPersonImage = function(image) {
+    return !!image && !!image.characterName && !image.tileId && image.characterName.charAt(0) !== '!';
+};
+
+// cell key -> true: the pictures events show with switch sw on, where that
+// switch changes their page (made once per full check of the map).
+$.selectMovedCache = null; // { events, map: { sw: { key: true } } }
+$.selectMovedCells = function(sw) {
+    var cache = $.selectMovedCache;
+    if (!cache || cache.events !== $gameMap._events) cache = $.selectMovedCache = { events: $gameMap._events, map: {} };
+    if (cache.map[sw]) return cache.map[sw];
+    var cells = cache.map[sw] = {};
+    $gameMap.events().forEach(function(ev) {
+        var data = ev.event();
+        if (!data || !data.pages) return;
+        var i = $.pageWithSwitchOn(ev, sw);
+        if (i < 0 || i === ev._pageIndex || !$.pageNeedsSwitch(data.pages[i], sw)) return;
+        if ($.isPersonImage(data.pages[i].image)) cells[$.npcCellKey(data.pages[i].image)] = true;
+    });
+    return cells;
+};
+
+$.selectGoneNpc = function(ev) {
+    if (!$.takenSelects.length || $.SELECT_NPC_MAPS.indexOf($gameMap.mapId()) < 0) return false;
+    var data = ev.event();
+    var now = data && data.pages && data.pages[ev._pageIndex];
+    if (!now || !$.isPersonImage(now.image)) return false;
+    var key = $.npcCellKey(now.image);
+    return $.takenSelects.some(function(sw) {
+        var i = $.pageWithSwitchOn(ev, sw);
+        if (i < 0 || i === ev._pageIndex) return false;
+        var page = data.pages[i];
+        if (page.image.characterName || page.image.tileId || !$.pageNeedsSwitch(page, sw)) return false;
+        return !$.selectMovedCells(sw)[key];
+    });
+};
+
 $.hideTakenNpcs = function() {
     var re = $.takenNpcPrep();
     if (!re) return;
+    $.selectMovedCache = null;
     $gameMap.events().forEach(function(ev) { $.hideTakenNpc(ev, re); });
     $.takenNpcFor = $gameMap._events;
 };
@@ -1949,6 +2032,7 @@ $.lastEventN = 0; // events in $.lastEventKeys
 $.syncEvents = function(hideNpcs) {
     var re = hideNpcs ? $.takenNpcPrep() : null;
     var checkAll = !!re && $.takenNpcFor !== $gameMap._events;
+    if (checkAll) $.selectMovedCache = null;
     var last = $.lastEventKeys, list = $.eventsOf($gameMap._events), changed = [], n = 0, added = 0;
     for (var i = 0; i < list.length; i++) {
         var ev = list[i];
@@ -3350,6 +3434,7 @@ $.hostTutorialStart = null; // host: { run, data }
 
 $.tutorialStartData = function() {
     var s = $.hostTutorialStart;
+    if (s && $.tutorialOver()) s = $.hostTutorialStart = null; // (no guest needs it now)
     return s && s.run === $.playRun() ? s.data : null;
 };
 
@@ -3373,6 +3458,7 @@ $.sendAssign = function(conn, actorId) {
 $.resetTrainExit = function() {
     $.hostAtExit = false;
     $.exitHold = null;
+    $.hostTutorialStart = null; // (the world before's start)
 };
 var _setupNewGameTrainExit = DataManager.setupNewGame;
 DataManager.setupNewGame = function() {
