@@ -36,8 +36,6 @@ Known bugs:
   comes back to the host's map.
 - When the host enters or leaves the map a guest is exploring, the guest's screen can jump
   for a moment and the guest may be pulled back a step or two.
-- A ghost guest on the host's map cannot use some doors.
-- Loading a save during the tutorial can freeze a guest's game.
 - Armor or accessories a guest picks up may also appear for the host (reported once, not
   reproduced yet). Please send both players' logs if you see it.
 - The endings (A, B and C) were reworked in 0.5.x but have not been played through in co-op yet.

@@ -9450,7 +9450,8 @@ $.RHER_DAAN = 4;
 // on the temple square (Map111 EV616-625, the contestants' bodies).
 //   Levi   -> Weeping scope    troop 125, Map090 EV61 p0 (the fast chaser),     dead Map111 EV616 p4
 //   Marina -> Cocoon           troop 128, Map081 EV276 p0,                     dead Map111 EV625 p4
-//   Daan   -> Pocketcat (NPC)  (troops 123/124 not used), hands over his keys
+//   Daan   -> Pocketcat (NPC)  (troops 123/124 not used), hands over his keys;
+//             it stands as the museum's Pocketcat (Daan) (Map084 EV108, $.rherCatPage)
 //   Abella -> Chaugnar         troop 20,  Map024 EV55 p0,                      dead Map111 EV623 p4
 //   O'saa  -> Mastermind       troop 126, Map080 EV82 p0,                      dead Map111 EV618 p4
 //   Marcoh -> Giant            troop 122, Map076 EV151 p0,                     dead Map111 EV621 p4
@@ -10473,9 +10474,14 @@ $.rherEventData = function(rec) {
     var form = $.rherForm(rec.a);
     var pages;
     if (rec.kind === 'npc') {
+        // the museum's Pocketcat (Daan) as it is (it stands; play test
+        // 2026-11-06: "가만히 서 있어야 하는데 움직인다")
+        var cat = $.rherCatPage();
         pages = [
-            $.rherPage({ look: form.live, list: [$.rherCmd(355, ['FH.Coop.rherCatTalk(this);']), $.rherCmd(0, [])],
-                moveType: 1, speed: form.speed, freq: 3, trigger: 0 }),
+            $.rherPage({ look: [cat.image.characterName, cat.image.characterIndex, cat.image.direction, cat.image.pattern],
+                list: [$.rherCmd(355, ['FH.Coop.rherCatTalk(this);']), $.rherCmd(0, [])],
+                moveType: 0, speed: cat.moveSpeed, freq: cat.moveFrequency, trigger: 0, dirFix: cat.directionFix,
+                walk: cat.walkAnime, step: cat.stepAnime, prio: cat.priorityType }),
             // gone (it handed over the keys)
             $.rherPage({ look: ['', 0, 2, 0], list: [$.rherCmd(0, [])], ss: true, prio: 0, trigger: 0 })
         ];
@@ -10491,6 +10497,20 @@ $.rherEventData = function(rec) {
         ];
     }
     return { id: rec.id, name: 'FH_rher_' + rec.n, note: '', meta: {}, x: rec.x, y: rec.y, pages: pages, _fhRher: rec.n };
+};
+
+// The original's moonscorched Daan in the museum, before the Guernica
+// (Map084 EV108 "pocketdaan" p0: $pocketcat 0 facing down, fixed in place,
+// its direction fixed; not EV9, the Pocketcat who sells books). Other data
+// without it: the same settings.
+$.RHER_CAT_NPC = { map: 84, ev: 108 };
+$.RHER_CAT_PAGE = { image: { characterName: '$pocketcat', characterIndex: 0, direction: 2, pattern: 1 },
+    moveSpeed: 3, moveFrequency: 5, directionFix: true, walkAnime: true, stepAnime: false, priorityType: 1 };
+$.rherCatPage = function() {
+    var m = $.bodyMapData ? $.bodyMapData($.RHER_CAT_NPC.map) : null;
+    var ev = m && m.events && m.events[$.RHER_CAT_NPC.ev];
+    var p = ev && ev.pages && ev.pages[0];
+    return p && p.image && /pocketcat/i.test(p.image.characterName) && p.moveType === 0 ? p : $.RHER_CAT_PAGE;
 };
 
 // Mastermind's overworld Hurting, as the original yellow mage's (data: Map080
@@ -17690,6 +17710,118 @@ $.hostHandlers.pmsgDone = function(conn, msg) {
         }
     }
     return _pmsgDoneDrop(conn, msg);
+};
+
+//=============================================================================
+// No limbs left: "You are unable to move..." (play test 2026-11-06)
+//=============================================================================
+// Original (data): CE40 Speed Status_check (parallel) turns SW41 disabled on
+// when the chosen character has lost its second arm and its second leg (its
+// <name>_arm2 / _leg2 switches, $.LIMB_SWITCHES [1] / [3]); nothing turns it
+// off. Every map has an autorun "disabled" (Map004 EV6 ...) on SW41: "You are
+// unable to move..." - "Quit breathing" (CE47 GameOver) / "Hold on!" (the
+// page ends and starts again: the player never moves again).
+// Co-op (play test: a thin guest with no limbs left walked about - it runs
+// no CE40, its speed was ours): SW41 is each player's own (CTX_OWN_SWITCHES).
+// The host turns a thin guest's on from its limbs and runs that map's page
+// as the guest's event, again after each "Hold on!"; its PC does not move
+// meanwhile. The host's own (its CE40) and a roaming guest's (its own map)
+// run as in the original. Never a scene for everyone (the page is that
+// player's alone). "Quit breathing" is a death for good (user 2026-11-06:
+// up again it would be held again). Not for a ghost or a downed player.
+$.DISABLED_SWITCH = 41;
+$.DISABLED_RETRY = 30; // frames between "Hold on!" and the question again
+
+$.isDisabledPage = function(page) {
+    var c = page && page.conditions;
+    return !!c && page.trigger === 3 && ((c.switch1Valid && c.switch1Id === $.DISABLED_SWITCH) ||
+        (c.switch2Valid && c.switch2Id === $.DISABLED_SWITCH));
+};
+
+// This map's "disabled" page: { ev, page } or null
+$.disabledPageHere = function() {
+    var found = null;
+    (($dataMap && $dataMap.events) || []).some(function(ev) {
+        if (!ev || !ev.pages) return false;
+        return ev.pages.some(function(p) {
+            if (!$.isDisabledPage(p)) return false;
+            found = { id: ev.id, page: p };
+            return true;
+        });
+    });
+    return found;
+};
+
+$.isDisabledList = function(list) {
+    if (!list || !$dataMap || !$dataMap.events) return false;
+    return $dataMap.events.some(function(ev) {
+        return !!ev && ev.pages.some(function(p) {
+            return $.isDisabledPage(p) && (p.list === list || ($.sameListShape && $.sameListShape(p.list, list)));
+        });
+    });
+};
+
+// An actor with no arm and no leg left (CE40's test)
+$.limbless = function(actorId) {
+    var sw = ($.LIMB_SWITCHES || {})[actorId];
+    return !!sw && $gameSwitches.value(sw[1]) && $gameSwitches.value(sw[3]);
+};
+
+// "Quit breathing": the game over this page calls
+$.DOOM_TEXT.disabled = 'quit breathing';
+var _setupChildDisabled = Game_Interpreter.prototype.setupChild;
+Game_Interpreter.prototype.setupChild = function(list, eventId) {
+    _setupChildDisabled.call(this, list, eventId);
+    var ce = $dataCommonEvents[$.GAME_OVER_CE];
+    if ($.role && ce && this._childInterpreter && (list === ce.list || $.sameListShape(ce.list, list)) &&
+            $.isDisabledList(this._list)) {
+        this._childInterpreter._fhDoomCause = 'disabled';
+    }
+};
+
+// That player's alone: never shared with the others on the map
+var _isFHCoopSharedDisabled = Game_Interpreter.prototype.isFHCoopShared;
+Game_Interpreter.prototype.isFHCoopShared = function() {
+    var ev = this._eventId > 0 && $gameMap ? $gameMap.event(this._eventId) : null;
+    if (ev && $.isDisabledPage(ev.page())) return false;
+    return _isFHCoopSharedDisabled.call(this);
+};
+
+// The host's own page: not while it is a ghost or down
+var _checkEventTriggerAutoDisabled = Game_Event.prototype.checkEventTriggerAuto;
+Game_Event.prototype.checkEventTriggerAuto = function() {
+    if ($.role && $.isDisabledPage(this.page()) && ($.isDownMe() || $gamePlayer._fhGhost)) return;
+    _checkEventTriggerAutoDisabled.call(this);
+};
+
+// Host: a thin guest with no limbs left
+$.disabledGuests = function() {
+    if (!$.isHost() || $.ctx || !$gameMap || Graphics.frameCount % 10 !== 0) return;
+    $.clients.forEach(function(c) {
+        if (!c.inGame || !c.actorId || c.solo || c.roam || c.roamPending || c.subOf || $.isDown(c.guestId)) return;
+        if (!$.limbless(c.actorId)) return;
+        var own = c._fhCtxSw = c._fhCtxSw || {};
+        if (!own[$.DISABLED_SWITCH]) {
+            own[$.DISABLED_SWITCH] = true;
+            $.dlog('no limbs left:', c.name, '- unable to move (SW41 its own)');
+        }
+        if (!$.guestOnMap(c) || $.isBusy(c)) {
+            c._fhDisabledAt = Graphics.frameCount + $.DISABLED_RETRY; // (after its event: the wait from there)
+            return;
+        }
+        if (Graphics.frameCount < (c._fhDisabledAt || 0)) return;
+        var here = $.disabledPageHere();
+        if (!here) return;
+        $.runOwned(c, here.page.list, $gameMap.event(here.id));
+    });
+};
+$.worldExtras.push($.disabledGuests);
+
+// A thin guest's PC: no step with no limbs left (its own map: the page holds it)
+var _canMoveDisabled = Game_Player.prototype.canMove;
+Game_Player.prototype.canMove = function() {
+    if ($.isThin && $.isThin() && !$.isDownMe() && !this._fhGhost && $.myActorId && $.limbless($.myActorId)) return false;
+    return _canMoveDisabled.call(this);
 };
 
 //=============================================================================

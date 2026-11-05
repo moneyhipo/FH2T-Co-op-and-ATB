@@ -242,7 +242,10 @@ $.inContext = function(conn, fn) {
 // coming_UP_LADDERS (EV108 on; the parallel EV87 tints the screen back and
 // turns it off) and SW4318 UPSTAIRS (Map020/147 EV75 regain_sanity) are
 // where that one player is.
-$.CTX_OWN_SWITCHES = [202, 410, 203, 241, 4318];
+// SW41 disabled too (CE40 turns it on when that player's character has lost
+// its last arm and leg; the "disabled" autorun of every map then holds it:
+// FH_CoopRoam "No limbs left").
+$.CTX_OWN_SWITCHES = [202, 410, 203, 241, 4318, 41];
 $.ctxOwnSave = null; // the host's values while a guest's context is active
 
 var _enterContextOwn = $.enterContext;

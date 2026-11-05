@@ -1655,6 +1655,9 @@ $.resetPicks = function() {
         c.toldWait = false;
         c.inGame = false;
         c.atExit = false;
+        // its tutorial was the world before's: kept, no snapshot went to it
+        // (snapshotTargets) and it never came back in from the lobby
+        delete c.solo;
     });
 };
 
