@@ -2,7 +2,7 @@
 // FH_ATB.js
 //=============================================================================
 /*:
- * @plugindesc v0.6.0 Gauge-based ATB battles for Fear & Hunger 2: Termina.
+ * @plugindesc v1.0.0 Gauge-based ATB battles for Fear & Hunger 2: Termina.
  * Place at the very bottom of the plugin list. Turn Galv_ExAgiTurn OFF.
  * @author FH2 Co-op Mod
  *
@@ -24,12 +24,12 @@
  * @decimals 2
  * @default 0.2
  *
- * @param Time Stop AGI Ratio
- * @desc From this AGI / enemy average AGI on (3 = AGI 30 against 10), time
- * stops while that player chooses: no gauge moves, every turn, no limit.
+ * @param Time Stop AGI Gap
+ * @desc From this many AGI above the enemy average on (30 = AGI 40 against 10),
+ * time stops while that player chooses: no gauge moves, every turn, no limit.
  * @type number
  * @decimals 2
- * @default 3
+ * @default 30
  *
  * @param Actor Rate Log Scale
  * @desc Faster than the enemies: rate = 1 + this x ln(AGI / enemy average
@@ -203,7 +203,7 @@ $.enabled = params['Enabled'] !== 'false';
 $.actorAverageSec = Number(params['Actor Average Seconds'] || 4.5);
 $.actorRatePerAgi = Number(params['Actor Rate Per AGI'] || 0.2);
 $.actorRateLogScale = Number(params['Actor Rate Log Scale'] || 2);
-$.timeStopRatio = Number(params['Time Stop AGI Ratio'] || 3);
+$.timeStopGap = Number(params['Time Stop AGI Gap'] || 30);
 $.TIME_STOP_TEXT = 'Everything around you starts to look slow...';
 $.TIME_STOP_TEXT_KO = '주변의 모든 것이 느려 보이기 시작했다...';
 $.enemyAverageSec = Number(params['Enemy Average Seconds'] || 5);
@@ -275,10 +275,26 @@ Game_Battler.prototype.setAtbGauge = function(value) {
 Game_Battler.prototype.atbRate = function(avgAgi) {
     if (this.isActor()) {
         var foeAvg = BattleManager.atbEnemyAverageAgi();
-        return $.actorRate(this.agi, foeAvg);
+        var rate = $.actorRate(this.agi, foeAvg), cap = $.actorRateCap();
+        return cap > 0 ? Math.min(rate, cap) : rate;
     }
     var ratio = avgAgi > 0 ? this.agi / avgAgi : 1;
     return Math.max($.enemyRateMin, Math.min($.rateMax, ratio));
+};
+
+// Mod Settings (user 2026-11-08; the menu is FH_CoopRoam's, kept in the
+// config - in co-op the host's): undefined without the co-op plugins.
+$.modSetting = function(key) {
+    var coop = window.FH && FH.Coop;
+    return coop && coop.coopSettingValue ? coop.coopSettingValue(key) : undefined;
+};
+
+// "Most player turns per enemy turn" (atbTurnCap, 0 = no limit, else 2-10):
+// a player's rate at most N turns in an average enemy's fill time (N x 4.5 s
+// / 5 s); a slower player keeps its own.
+$.actorRateCap = function() {
+    var n = Number($.modSetting('atbTurnCap')) || 0;
+    return n >= 2 ? n * $.actorAverageSec / $.enemyAverageSec : 0;
 };
 
 // Speed-based extra turns (user decisions 2026-11-02). Faster than the enemy
@@ -533,20 +549,30 @@ BattleManager.atbEnemyPace = function() {
     return pace;
 };
 
-// Time stop (user decision 2026-11-02): from Time Stop AGI Ratio (AGI 30
-// against 10, 3.5 turns per enemy turn) a player's choosing stops time
-// altogether - every gauge, the round and the enemies' first-turn wait -
-// on every turn of its, with no count or time limit.
+// Time stop (user decision 2026-11-02; a gap, not 3x their AGI: user
+// 2026-11-09): from Time Stop AGI Gap above the enemies (AGI 40 against 10) a
+// player's choosing stops time altogether - every gauge, the round and the
+// enemies' first-turn wait - on every turn of its, with no count or time limit.
 BattleManager.atbStopsTime = function(actor) {
     var foe = this.atbEnemyAverageAgi();
-    return !!actor && foe > 0 && actor.agi >= foe * $.timeStopRatio;
+    return !!actor && foe > 0 && actor.agi - foe >= $.timeStopGap;
+};
+
+// "Time stops on your turn" (Mod Settings atbWaitTurn, user 2026-11-08): any
+// player choosing stops time the time stop's way, whatever its speed (no
+// "slow" line: that one stays the time stop's).
+BattleManager.atbWaitsFor = function(actor) {
+    return !!actor && !!$.modSetting('atbWaitTurn');
+};
+BattleManager.atbHoldsTime = function(actor) {
+    return this.atbStopsTime(actor) || this.atbWaitsFor(actor);
 };
 
 // A player choosing now stops time (co-op adds the joiners asked for theirs:
 // FH_CoopBattle).
 BattleManager.atbTimeStopChoosing = function() {
     var a = this._phase === 'input' ? this._atbInputActor : null;
-    return this.atbStopsTime(a);
+    return this.atbHoldsTime(a);
 };
 
 // Other players fight in this battle (FH_CoopBattle).
@@ -595,7 +621,9 @@ BattleManager.tickAtb = function() {
             b.setAtbGauge(0);
         }
     }, this);
-    this._atbRoundTick += pace;
+    // (the Moonless beast approaching: its steps keep their pace while a player
+    // chooses - about 5-6 s each, user 2026-11-08; a time stop still holds it)
+    this._atbRoundTick += pace > 0 && this.atbApproaching() ? 1 : pace;
     if (this._atbOneTurn) return; // rounds follow the actors (updateAtb)
     if (this._atbRoundTick >= $.roundTicks()) {
         this._atbRoundTick = 0;
@@ -607,7 +635,41 @@ BattleManager.tickAtb = function() {
 // acts right away. The command windows close, the enemy (and a pending
 // round end) runs, then the actor gets its command window back.
 BattleManager.atbEnemyWaiting = function() {
-    return $gameTroop.members().some(function(e) { return e.isAtbReady(); });
+    return $gameTroop.members().some(function(e) { return e.isAtbReady(); }) || this.atbApproachRoundDue();
+};
+
+// The Moonless beast far away (user 2026-11-08: "it only comes closer after
+// the player who started the fight acts once - make it come by itself every
+// 5-6 s"). Troops 212/213: a turn-end page walks it in while V1811
+// moonless_appear is 0 (V19 1: glowing eyes, 2: a hulking beast, 3: it
+// appears and V1811 becomes 1; until then Talk says "too far away"). A round
+// end waits for every full gauge to act first (updateAtb), and the Lurker in
+// the dark has no action: its turn interrupted the window, the player got it
+// back at once, and a player still choosing held the round end - and the
+// beast - for good. While it approaches, a round end that is due closes the
+// window like a ready enemy does (the command comes back where it was) and
+// goes before a player's turn, so it comes one step a round (5 s, up to 8
+// while a player chooses: the enemies' slow-down).
+$.APPROACH_VAR = 1811;
+$.approachTroops = {};
+BattleManager.atbApproachTroop = function() {
+    var troop = $gameTroop.troop();
+    if (!troop) return false;
+    if ($.approachTroops[troop.id] === undefined) {
+        $.approachTroops[troop.id] = troop.pages.some(function(page) {
+            return page.conditions.turnEnding && page.list.some(function(cmd) {
+                var p = cmd.parameters;
+                return cmd.code === 111 && p[0] === 1 && p[1] === $.APPROACH_VAR && p[2] === 0 && p[3] === 0 && p[4] === 0;
+            });
+        });
+    }
+    return $.approachTroops[troop.id];
+};
+BattleManager.atbApproaching = function() {
+    return this.atbApproachTroop() && $gameVariables.value($.APPROACH_VAR) === 0;
+};
+BattleManager.atbApproachRoundDue = function() {
+    return !!this._atbRoundPending && this.atbApproaching();
 };
 
 BattleManager.suspendAtbInput = function() {
@@ -638,7 +700,9 @@ BattleManager.updateAtb = function() {
     // right after it, on the next round's first tick: troop 212's Moonless
     // beast on every round, play test 2026-10-31).
     var ready = this.atbReadyBattler();
-    if (this._atbRoundPending && !ready) {
+    // (a player's turn waits for the round end while the Moonless beast
+    // approaches: atbApproachRoundDue above)
+    if (this._atbRoundPending && (!ready || (ready.isActor() && this.atbApproaching()))) {
         this._atbRoundPending = false;
         this.startAtbRoundEnd();
         return;
@@ -682,6 +746,43 @@ BattleManager.atbSpringTrapOnGuard = function() {
     trap.setAtbGauge($.MAX); // it is the trap's move now
     $.log('guard: the bear trap resolves now');
     return true;
+};
+
+// A guard lasts until the guarder's next action here (state 2, finishAtbTurn
+// above), but SW1281 GUARD_BATTLE went off at every round end (the troops'
+// turn-end pages: Poe troop 210 page 12 ...). Poe's grab (page 11: SW1281
+// on - "You dodge the grasp of the monster!", else the SNAP NECK toss) came a
+// few rounds after a guard - Poe is slow - and the guard did not count (play
+// test 2026-11-06). Now SW1281 stays on through a round end while someone in
+// the party still guards, and goes off when the last guard ends.
+$.GUARD_STATE = 2;
+
+$.partyGuards = function() {
+    return $gameParty.members().some(function(a) { return a.isStateAffected($.GUARD_STATE); });
+};
+
+var _command121Guard = Game_Interpreter.prototype.command121;
+Game_Interpreter.prototype.command121 = function() {
+    var p = this._params, id = $.GUARD_TRAP.guardSwitch;
+    var keep = p[2] === 1 && p[0] <= id && p[1] >= id && $gameParty.inBattle() && BattleManager.isAtb() &&
+        BattleManager._phase === 'turnEnd' && !!$gameSwitches._data[id] && $.partyGuards();
+    var out = _command121Guard.call(this);
+    if (keep && !$gameSwitches._data[id]) {
+        $gameSwitches._data[id] = true;
+        $.log('guard: SW' + id + ' stays on through the round end (still guarding)');
+    }
+    return out;
+};
+
+var _removeStateGuard = Game_Battler.prototype.removeState;
+Game_Battler.prototype.removeState = function(stateId) {
+    var had = stateId === $.GUARD_STATE && this.isStateAffected(stateId);
+    _removeStateGuard.call(this, stateId);
+    var id = $.GUARD_TRAP.guardSwitch;
+    if (had && this.isActor() && $gameParty.inBattle() && BattleManager.isAtb() && $gameSwitches._data[id] &&
+            !$.partyGuards()) {
+        $gameSwitches.setValue(id, false);
+    }
 };
 
 // Installations (user request 2026-10-19): the bear trap (enemy 50) and the

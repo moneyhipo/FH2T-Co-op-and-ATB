@@ -2,7 +2,7 @@
 // FH_Coop.js
 //=============================================================================
 /*:
- * @plugindesc v0.6.0 Co-op core: session (IP, F6), guest join, snapshots,
+ * @plugindesc v1.0.0 Co-op core: session (IP, F6), guest join, snapshots,
  * shared map view with player avatars. Place below FH_ATB.
  * @author FH2 Co-op Mod
  *
@@ -386,7 +386,7 @@ $.hud = function(text) {
             'padding:3px 8px;border-radius:3px;pointer-events:none;';
         document.body.appendChild(el);
     }
-    el.textContent = text;
+    el.textContent = $.ko ? $.ko(text) : text; // (the Korean patch: in Korean)
     el.style.display = text ? 'block' : 'none';
 };
 
@@ -494,7 +494,7 @@ $.startHost = function() {
 // Host and guest must run the same mod code: the release label (main.js of
 // a release sets FH_COOP_VERSION; install.bat copies are '<MOD_RELEASE> dev')
 // and a hash of the mod plugin files, which is what is compared.
-$.MOD_RELEASE = '0.6.0';
+$.MOD_RELEASE = '1.0.0';
 $.modVersion = (typeof FH_COOP_VERSION !== 'undefined' && FH_COOP_VERSION) || $.MOD_RELEASE + ' dev';
 $.modHash = (function() {
     try {
@@ -983,7 +983,11 @@ $.sendSnapshot = function(conn) {
         // its own character and bag as the host has them, in the same
         // message: a 'me' sent after a 1.8 MB snapshot can come frames late
         var me = $.snapMe ? $.snapMe(c) : null;
-        c.send(me ? Object.assign({}, snap, { me: me }) : snap);
+        // (and its own "a scene runs" switches: the world's are the host's - a
+        // snapshot during the host's own scene left SW202 / SW410 on there:
+        // 4p flows A-1, 2026-11-10; FH_CoopWorld CTX_OWN_SWITCHES)
+        var pc = $.ctxOwnOf ? { pc: $.ctxOwnOf(c) } : null;
+        c.send(me || pc ? Object.assign({}, snap, me ? { me: me } : {}, pc || {}) : snap);
         c.inGame = true;
     });
     $.resetSyncKeys();
@@ -2473,6 +2477,7 @@ $.keepOwnPicture = function(id, own) {
     var pic = $gameScreen.picture(id);
     if (!pic || !pic.name()) return false;
     if ($.PERSONAL_PICTURES && $.PERSONAL_PICTURES[pic.name()]) return true;
+    if ($.privatePicture && $.privatePicture(pic)) return true; // (its count, its own item's: FH_CoopWorld)
     if (!own) return false;
     if ($.fxRuns && $.fxRuns.length) return true;
     return !!$.ownPicIds[id];
@@ -4020,12 +4025,100 @@ $.migrateLegacyMultiplayerSaves = function() {
 };
 $.migrateLegacyMultiplayerSaves();
 
+// Co-op saves: 20 slots (user 2026-11-07: "make the save slots 20 at most,
+// what are 70 for"). The game's save menu (MrTS_SimpleSaveLoadMenu, Max Saves
+// 99) gave co-op 99 slots too. Solo keeps the game's own number.
+$.MULTI_MAX_SAVES = 20;
+var _maxSavefilesMulti = DataManager.maxSavefiles;
+DataManager.maxSavefiles = function() {
+    var n = _maxSavefilesMulti.call(this);
+    return $.isMultiplayerSaveMode() ? Math.min(n, $.MULTI_MAX_SAVES) : n;
+};
+
+// Once, for co-op saves made before: the newest 20 go to slots 1-20 (oldest
+// first, as they were in order), the others to save/multiplayer/older/
+// (moved, not deleted: a file there can be put back by hand). fsLib / pathLib:
+// the tests' own.
+$.trimMultiplayerSaves = function(fsLib, pathLib) {
+    if (!StorageManager.isLocalMode()) return null;
+    var fs = fsLib || require('fs'), path = pathLib || require('path');
+    return $.withSaveMode($.SAVE_MODE_MULTIPLAYER, function() {
+        var info;
+        try {
+            info = JSON.parse(StorageManager.load(0) || '[]');
+        } catch (e) {
+            return null;
+        }
+        if (!Array.isArray(info)) info = [];
+        var file = function(id) { return StorageManager.localFilePath(id); };
+        var last = Math.max(_maxSavefilesMulti.call(DataManager), info.length - 1);
+        var ids = [];
+        for (var id = 1; id <= last; id++) if (fs.existsSync(file(id))) ids.push(id);
+        if (!ids.some(function(i) { return i > $.MULTI_MAX_SAVES; })) return null;
+        var time = function(i) {
+            if (info[i] && info[i].timestamp) return info[i].timestamp;
+            try { return fs.statSync(file(i)).mtimeMs; } catch (e) { return 0; }
+        };
+        ids.sort(function(a, b) { return time(b) - time(a); });
+        var keep = ids.slice(0, $.MULTI_MAX_SAVES).sort(function(a, b) { return time(a) - time(b); });
+        var older = ids.slice($.MULTI_MAX_SAVES);
+        var dir = path.dirname(file(1));
+        var olderDir = path.join(dir, 'older');
+        var move = function(from, to) {
+            fs.renameSync(from, to);
+            if (fs.existsSync(from + '.bak')) fs.renameSync(from + '.bak', to + '.bak');
+        };
+        try {
+            if (older.length && !fs.existsSync(olderDir)) fs.mkdirSync(olderDir);
+            older.forEach(function(i) {
+                var to = path.join(olderDir, path.basename(file(i)));
+                if (fs.existsSync(to)) to = to.replace(/\.rpgsave$/, '_' + Date.now() + '.rpgsave');
+                move(file(i), to);
+            });
+            // (through temporary names: slot 3 may become slot 1 while 1 becomes 2)
+            keep.forEach(function(i) { move(file(i), file(i) + '.fhmove'); });
+            var fresh = [];
+            keep.forEach(function(i, k) {
+                move(file(i) + '.fhmove', file(k + 1));
+                fresh[k + 1] = info[i] || null;
+            });
+            StorageManager.save(0, JSON.stringify(fresh));
+            try {
+                fs.writeFileSync(path.join(olderDir, 'saves_moved.txt'), older.map(function(i) {
+                    return 'file' + i + ' ' + new Date(time(i)).toISOString();
+                }).join('\n'));
+            } catch (e) {}
+            console.log('[FH_Coop] co-op saves: the newest ' + keep.length + ' in slots 1-' + keep.length + ', ' +
+                older.length + ' older ones moved to save/multiplayer/older/');
+            return { keep: keep, older: older };
+        } catch (e) {
+            console.error('[FH_Coop] could not tidy the co-op saves', e);
+            return null;
+        }
+    });
+};
+$.trimMultiplayerSaves();
+
+// The title's command window grows upwards from the bottom (TitleCommandPosition
+// Offset Y -300): with the co-op commands its top went over the TERMINA logo
+// (user 2026-11-08: "put the buttons under the title"). Its top stays under
+// the logo; it grows downwards.
+$.TITLE_COMMAND_TOP = 84; // (where the original's three commands start: 624 - 144 - 96 - 300)
+var _titleCommandUpdatePlacement = Window_TitleCommand.prototype.updatePlacement;
+Window_TitleCommand.prototype.updatePlacement = function() {
+    _titleCommandUpdatePlacement.call(this);
+    if (this.y < $.TITLE_COMMAND_TOP) this.y = Math.min($.TITLE_COMMAND_TOP, Graphics.boxHeight - this.height);
+};
+
 var _Window_TitleCommand_makeCommandList = Window_TitleCommand.prototype.makeCommandList;
 Window_TitleCommand.prototype.makeCommandList = function() {
     $.withSaveMode($.SAVE_MODE_NORMAL, function() {
         _Window_TitleCommand_makeCommandList.call(this);
     }.bind(this));
     this.addCommand('Co-op Join', 'fhCoopJoin');
+    // (user 2026-11-08: under Co-op Join, easy to find - FH_CoopRoam)
+    // ("Mod Settings", was Co-op Settings - user 2026-11-08: ATB ones too)
+    if ($.Scene_FHCoopSettings) this.addCommand('Mod Settings', 'fhCoopSettings');
     this.addCommand('Multi Continue', 'fhCoopContinue',
         $.hasSaveFilesInMode($.SAVE_MODE_MULTIPLAYER));
 };
@@ -4035,6 +4128,12 @@ Scene_Title.prototype.createCommandWindow = function() {
     _Scene_Title_createCommandWindow.call(this);
     this._commandWindow.setHandler('fhCoopJoin', this.commandFHCoopJoin.bind(this));
     this._commandWindow.setHandler('fhCoopContinue', this.commandFHCoopContinue.bind(this));
+    this._commandWindow.setHandler('fhCoopSettings', this.commandFHCoopSettings.bind(this));
+};
+
+Scene_Title.prototype.commandFHCoopSettings = function() {
+    this._commandWindow.close();
+    SceneManager.push($.Scene_FHCoopSettings);
 };
 
 var _Scene_Title_commandNewGame = Scene_Title.prototype.commandNewGame;
@@ -4162,7 +4261,9 @@ $.askAddress = function(onOk, onCancel) {
 };
 
 //=============================================================================
-// Keys: F6 = open session; F8 = quick access to the save screen
+// Keys: F6 = open session; F8 / F9 = quick access to the save / load screen
+// (F9 user 2026-11-07: "make F9 quick load too while at it"; in co-op the
+// host only, like a load from the menu; the Co-op Settings switch covers both)
 //=============================================================================
 
 document.addEventListener('keydown', function(e) {
@@ -4170,20 +4271,502 @@ document.addEventListener('keydown', function(e) {
         e.preventDefault();
         $.startHost();
     }
-    if (e.keyCode === 119) { // F8
+    if (e.keyCode === 119 || e.keyCode === 120) { // F8 save, F9 load
+        var load = e.keyCode === 120;
         e.preventDefault();
         e.stopImmediatePropagation();
         if (!(SceneManager._scene instanceof Scene_Map) || !$gameMap || $gameParty.inBattle()) return;
         if ($.isGuest()) {
-            $.toast('Co-op: only the host can save');
+            $.toast(load ? 'Co-op: only the host can load' : 'Co-op: only the host can save');
+            return;
+        }
+        // (Mod Settings, FH_CoopRoam.js: the host's choice, or this PC's in a solo game - user 2026-11-08)
+        if ($.coopSettingOn && !$.coopSettingOn('quickSave')) {
+            $.toast('F8 / F9 quick save and load are off (Mod Settings)');
             return;
         }
         if ($gameMap.isEventRunning() || $gameMessage.isBusy()) {
-            $.toast('Save is unavailable during an event or message');
+            $.toast((load ? 'Load' : 'Save') + ' is unavailable during an event or message');
             return;
         }
-        SceneManager.push(Scene_Save);
+        if (load && !DataManager.isAnySavefileExists()) {
+            $.toast('No save to load');
+            return;
+        }
+        SceneManager.push(load ? Scene_Load : Scene_Save);
     }
 });
+
+//=============================================================================
+// The Korean patch: the mod's own texts in Korean (user 2026-11-07)
+//=============================================================================
+// The mod writes its texts in English (toasts, gab lines, the lines and
+// choices of the scenes it makes, its menus). A game with the Korean patch
+// ($.koreanData: the data's names are in Hangul) shows them in Korean: each
+// PC translates what it shows (a host in English, a guest in Korean, or the
+// other way round). $.ko(text): the whole line from KO_EXACT, else the first
+// rule of KO_RULES that matches it (names in it stay as they are), else the
+// English line. "Co-op: " in front becomes "코옵: ". Terms as the Korean
+// patch's data (이성, 영혼석, 수음, 위대한 의술 ...).
+
+$.koOn = function() {
+    return !!($.koreanData && $.koreanData());
+};
+
+// Reasons and short parts that go into longer lines.
+$.KO_PART = {
+    'died': '사망했다',
+    'lost their head': '머리를 잃었다',
+    'lost their mind': '미쳐 버렸다',
+    'was moonscorched by Rher': '레르에게 달에 그을렸다',
+    'starved to death': '굶어 죽었다',
+    'lost their mind to the Necronomicon': '네크로노미콘에 정신을 잃었다',
+    'was struck down by the gods': '신들에게 벌을 받았다',
+    'burst into flames': '불길에 휩싸였다',
+    'became part of the sleeping house': '잠든 집의 일부가 되었다',
+    'burned to death': '불에 타 죽었다',
+    'stepped on a mine': '지뢰를 밟았다',
+    'had their neck snapped': '목이 꺾였다',
+    'died of an infected wound': '감염된 상처로 죽었다',
+    'was killed in the duel': '결투에서 죽었다',
+    'did not answer in the duel and died': '결투에서 응답하지 않아 죽었다',
+    'died on the cross': '십자가에서 죽었다',
+    'fled the duel and died': '결투에서 도망쳐 죽었다',
+    'left the duels and died': '결투를 떠나 죽었다',
+    'quit breathing': '숨을 거두었다',
+    'this fight is one on one': '일대일 싸움이다',
+    'the fight is full': '싸움 인원이 가득 찼다',
+    'you are down': '쓰러져 있다',
+    'you are busy': '다른 일을 하는 중이다',
+    'not on the same map': '같은 맵이 아니다',
+    'not in a dream': '꿈속에서는 안 된다',
+    'not in the tutorial': '튜토리얼에서는 안 된다',
+    'not in an ending': '엔딩에서는 안 된다',
+    'the tournament is on': '토너먼트 중이다',
+    'not on a map another guest runs': '다른 게스트가 돌리는 맵에서는 안 된다',
+    'someone is down': '쓰러진 사람이 있다',
+    'someone is busy': '다른 일을 하는 사람이 있다',
+    'the host is busy': '호스트가 다른 일을 하는 중이다',
+    'no duel form for that character': '그 캐릭터는 결투 형태가 없다',
+    'no duel form for your character': '내 캐릭터는 결투 형태가 없다',
+    'that skill cannot be used on others': '그 스킬은 다른 사람에게 쓸 수 없다',
+    'you are not on the same map': '같은 맵에 있지 않다',
+    'that player is not here': '그 플레이어가 여기 없다',
+    'the host cannot take it now': '호스트가 지금 받을 수 없다',
+    'it would have no effect': '아무 효과가 없다',
+    'the host says so': '호스트가 취소했다',
+    'is watching you': '님이 지켜보고 있다',
+    'Look out!': '조심해!',
+    'Over here!': '여기야!',
+    'Run!': '도망쳐!',
+    'Good luck!': '행운을 빌어!'
+};
+
+$.KO_FORM = {
+    'Weeping scope': '위핑 스코프', 'Cocoon': '코쿤', 'Pocketcat': '포켓캣', 'Chaugnar': '쇼그나르',
+    'Mastermind': '마스터마인드', 'Giant': '자이언트', 'Valkyrie': '발키리', 'Mechanical dance': '메카니컬 댄스',
+    'Moonscorched': '달에 그을린 자',
+    'Solitary': '고독한', 'Changeling': '변화하는', 'Blank': '공허한', 'Caressing': '어루만지는',
+    'Enlightened': '계몽된', 'Tainted': '더럽혀진', 'Endless': '무한한', 'Shadowed': '그림자진'
+};
+
+$.koPart = function(s) {
+    s = String(s);
+    return $.KO_PART[s] || $.KO_FORM[s] || $.koLine(s);
+};
+
+$.KO_EXACT = {
+    // title, lobby, connection
+    'press F6 on the title screen': '타이틀 화면에서 F6을 누르세요',
+    'waiting for the host': '호스트를 기다리는 중',
+    'connected, waiting for the host': '연결됨, 호스트를 기다리는 중',
+    'disconnected from host': '호스트와 연결이 끊겼다',
+    'you left the session': '세션에서 나왔다',
+    'the host is choosing a character first': '호스트가 먼저 캐릭터를 고르는 중',
+    'another player is choosing a character': '다른 플레이어가 캐릭터를 고르는 중',
+    'the host is waiting at the train exit': '호스트가 기차 출구에서 기다리는 중',
+    'choose your character': '캐릭터를 고르세요',
+    'your own story - meet the others at the train exit': '각자의 이야기 - 기차 출구에서 다른 사람들과 만나세요',
+    'joining the shared game': '공유 게임에 합류하는 중',
+    'waiting for the others at the train exit': '기차 출구에서 다른 사람들을 기다리는 중',
+    'The others are still on the train... wait for them here before you step outside.':
+        '다른 사람들이 아직 기차에 있다... 밖으로 나가기 전에 여기서 기다리자.',
+    'You died. Try again?': '죽었다. 다시 할까?',
+    'Retry': '다시 하기',
+    'Skip the character history': '캐릭터 과거 건너뛰기',
+    'Co-op Join': '코옵 참가',
+    'Multi Continue': '멀티 이어하기',
+    'Each player needs a different name (Steam name, or Windows user name for IP play).':
+        '플레이어마다 이름이 달라야 한다(스팀 이름, IP 접속은 윈도우 사용자 이름).',
+    'Install the same version on both PCs.': '두 PC에 같은 버전을 설치하세요.',
+    'the host loaded a save': '호스트가 세이브를 불러왔다',
+    // saving, loading
+    'only the host can load': '호스트만 불러올 수 있다',
+    'only the host can save': '호스트만 저장할 수 있다',
+    'F8 / F9 quick save and load are off (Mod Settings)': 'F8 / F9 빠른 저장·불러오기가 꺼져 있다 (모드 설정)',
+    'Save is unavailable during an event or message': '이벤트나 대사 중에는 저장할 수 없다',
+    'Load is unavailable during an event or message': '이벤트나 대사 중에는 불러올 수 없다',
+    'No save to load': '불러올 세이브가 없다',
+    'only the host can use this (the host keeps the saves).': '호스트만 쓸 수 있다 (세이브는 호스트가 가진다).',
+    // votes, trade, talk
+    'another vote is running': '다른 투표가 진행 중이다',
+    'everyone agreed': '모두 동의했다',
+    'not everyone agreed': '모두 동의하지 않았다',
+    'Trade': '거래',
+    'Give an item to:': '아이템을 줄 사람:',
+    'the trade did not go through': '거래가 이루어지지 않았다',
+    'Wave': '손 흔들기',
+    'Cancel': '취소',
+    'Player': '플레이어',
+    'no answer from you - the host goes on with the dialogue': '응답이 없어 호스트가 대화를 이어 간다',
+    // guns, field
+    'You seem to have been hit somewhere not so good...': '당신은 영 좋지 않은 곳에 맞은 것 같다...',
+    'Your arm...!': '팔이...!',
+    'Your leg...!': '다리가...!',
+    'A strange chill runs through you... your feet will not move forward.': '이상한 한기가 몸을 훑는다... 발이 앞으로 나아가지 않는다.',
+    'Someone else is dealing with this right now...': '다른 누군가가 지금 이걸 처리하는 중이다...',
+    'could not sync this bed event': '이 침대 이벤트를 맞추지 못했다',
+    'cannot join - you are busy': '참가할 수 없다 - 다른 일을 하는 중이다',
+    // downs, deaths, ghosts
+    'the host died - game over': '호스트가 죽었다 - 게임 오버',
+    'you are a ghost now - walk around, Z: ping the others': '이제 유령이다 - 돌아다니며 Z로 다른 사람에게 신호를 보낼 수 있다',
+    'Ghost: watching a fight': '유령: 싸움을 보는 중',
+    // battle
+    'cannot join - the fight is full': '참가할 수 없다 - 싸움 인원이 가득 찼다',
+    'you left the battle': '전투에서 나왔다',
+    'the battle is over': '전투가 끝났다',
+    'lost the battle view - back to the map': '전투 화면을 잃었다 - 맵으로 돌아간다',
+    'everyone in the room is drawn into the fight!': '방 안의 모두가 싸움에 끌려 들어간다!',
+    'the fight began - your menu was closed': '싸움이 시작되어 메뉴가 닫혔다',
+    'you are attacked - your menu was closed': '습격을 받아 메뉴가 닫혔다',
+    'the attack wakes you - you are in the fight!': '습격에 잠이 깼다 - 싸움에 들어간다!',
+    'It was a lie!': '거짓말이었다!',
+    'Shut up!': '닥쳐!',
+    'Shut up': '닥쳐',
+    // duels, tower
+    'Strange... a murderous urge toward each other is boiling up!!!': '이상하다... 서로를 향한 살의가 끓어오른다!!!',
+    '... Nothing happens.': '... 아무 일도 일어나지 않는다.',
+    'Someone is down. Revive them first, or wait.': '쓰러진 사람이 있다. 먼저 살리거나 기다리자.',
+    'The duels are under way.': '결투가 진행 중이다.',
+    'Someone is busy (in a fight or an event). Wait for them.': '누군가 다른 일(싸움이나 이벤트) 중이다. 기다리자.',
+    'the duels go on - your menu was closed': '결투가 계속되어 메뉴가 닫혔다',
+    'A foul stench grows strong.....': '지독한 냄새가 강하게 느껴진다.....',
+    'Only the living may pass.': '산 자만 지나갈 수 있다.',
+    'Esc: stop watching': 'Esc: 구경 그만하기',
+    'O, you don\'t have the right.': '오, 너에겐 자격이 없다.',
+    'The host leads the way from here.': '여기서부터는 호스트가 앞장선다.',
+    'The end. The session is over.': '끝. 세션이 끝났다.',
+    'Not now. Try again.': '지금은 안 된다. 다시 해 보자.',
+    'A chill runs down your spine...': '등골이 오싹해진다...',
+    // sleeping, resting
+    'you fall asleep with the others': '다른 사람들과 함께 잠든다',
+    'Wait for the others to wake up.': '다른 사람들이 깨어날 때까지 기다리자.',
+    'Everyone must be here to rest.': '쉬려면 모두 여기 있어야 한다.',
+    'everyone lost the fight - you are taken away together': '모두 싸움에 져서 함께 끌려간다',
+    'You are not in bed. Lie down in any bed to sleep with the others.': '침대에 누워 있지 않다. 아무 침대에나 누우면 다른 사람들과 함께 잔다.',
+    'You are still awake. Use a bed again to sleep.': '아직 깨어 있다. 자려면 침대를 다시 쓰자.',
+    'Leave': '그만두기',
+    // Rher, bodies, keys, souls
+    'The Moon God has noticed you...': '달의 신이 당신을 알아챘다...',
+    'Pocketcat\'s paws are empty...': '포켓캣의 앞발은 비어 있다...',
+    '"Oh-ho! If it isn\'t my favorite little eavesdropper!"': '"오호! 내가 제일 좋아하는 꼬마 엿듣기쟁이 아니신가!"',
+    '"I\'ve been keeping these warm for you. Ssssomething tells me': '"이걸 너를 위해 따뜻하게 품고 있었지. 뭔가가 말해 주는군,',
+    'you\'ll be needing them more than the old me ever will..."': '옛날의 나보다 네가 훨씬 더 필요하게 될 거라고..."',
+    '"Ain\'t that a pickle to suckle on? Off you go, old sport."': '"참 곤란한 노릇이지? 자, 가 보게, 친구."',
+    'You take what the others left behind.': '다른 사람들이 남긴 것을 챙긴다.',
+    'A gasoline canister was set down!': '가스통이 놓였다!',
+    'Barely held on!': '간신히 버텨냈다!',
+    'The skin begins to rot...': '살갗이 썩어 들어가기 시작한다...',
+    'A weak point is exposed! Defense down.': '약점이 드러났다! 방어력이 떨어진다.',
+    'Someone has taken everything already.': '누군가 이미 전부 가져갔다.',
+    'Absorb': '흡수한다',
+    'The blood golem only answers in your own fight.': '피의 골렘은 자기 싸움에서만 응답한다.',
+    'No blood golem in a duel.': '결투에서는 피의 골렘을 쓸 수 없다.',
+    'The blood golem does not answer here.': '피의 골렘이 여기서는 응답하지 않는다.',
+    'The blood golem already serves someone else.': '피의 골렘은 이미 다른 사람을 섬긴다.',
+    'The blood golem crumbles.': '피의 골렘이 무너져 내린다.',
+    'only killing the priest frees them.': '사제를 죽여야만 풀려난다.',
+    '"Wait for me on the train."': '"기차에서 기다려."',
+    '"Wait for me at the club."': '"클럽에서 기다려."',
+    'Hold on!': '버텨!',
+    // the new gods
+    'There is a sigil of Gro-goroth drawn here.': '그로고로스의 인장이 그려져 있다.',
+    'Offer four arms and legs': '팔다리 네 개를 바친다',
+    'Something else': '다른 것',
+    'Gro-goroth wants four arms or legs.': '그로고로스는 팔이나 다리 네 개를 원한다.',
+    'Gro-goroth takes the flesh...': '그로고로스가 살점을 받아 간다...',
+    'Your affinity with the Gro-goroth has increased.': '그로고로스와의 유대감이 강해졌다.',
+    'You could use the skill \\c[2]Masturbation\\c[0] here...': '여기서 \\c[2]수음\\c[0] 스킬을 쓸 수 있을 것 같다...',
+    'Use \\c[2]Masturbation\\c[0]': '\\c[2]수음\\c[0] 사용',
+    'The Sylvian asks for a \\c[2]Soul stone\\c[0] the first time.': '실비안은 처음 한 번 \\c[2]영혼석\\c[0]을 요구한다.',
+    'You give a \\c[2]Soul stone\\c[0] to the Sylvian.': '실비안에게 \\c[2]영혼석\\c[0]을 바쳤다.',
+    'The ritual circle has been exhausted.': '의식의 원은 힘을 다했다.',
+    'Masturbation is not learned here. Once any player holds Samarie\'s soul, everyone can use it at a Sylvian sigil.':
+        '여기서는 수음을 배우지 않는다. 누군가 사마리의 영혼을 가지면 모두가 실비안 인장에서 쓸 수 있다.',
+    'Samarie\'s soul - your affinity with every god has increased.': '사마리의 영혼 - 모든 신과의 유대감이 강해졌다.',
+    // Magna-medicinal
+    'Magna-medicinal: 50 mind, a soul stone and a contestant\'s head.': '위대한 의술: 이성 50, 영혼석, 참가자의 머리.',
+    'You have no arm or leg left to sacrifice.': '바칠 팔이나 다리가 남아 있지 않다.',
+    'Sacrifice an arm': '팔을 바친다',
+    'Sacrifice a leg': '다리를 바친다',
+    'Nevermind': '그만두기',
+    // Mod Settings (was Co-op Settings, user 2026-11-08)
+    'Mod Settings': '모드 설정',
+    'Contestant souls (Hexen)': '참가자 영혼 (헥센)',
+    'Owner only': '가진 사람만',
+    'Everyone': '모두',
+    'Owner only: the player who got a soul (or was given it) opens its Hexen area.':
+        '가진 사람만: 영혼을 얻은(또는 받은) 플레이어만 그 헥센 구역이 열린다.',
+    'Everyone: a soul opens its Hexen area on every player\'s board, nobody is asked.':
+        '모두: 영혼이 모든 플레이어의 헥센판에서 그 구역을 연다. 묻지 않는다.',
+    'Bringing back the dead (Magna-medicinal)': '죽은 사람 되살리기 (위대한 의술)',
+    'Cost': '대가 있음',
+    'No cost': '대가 없음',
+    'Cost: at a dead player\'s body, 50 mind, a soul stone, a contestant\'s head and your arm or leg.':
+        '대가 있음: 죽은 플레이어의 시체에서 이성 50, 영혼석, 참가자의 머리, 자기 팔이나 다리.',
+    'No cost: only Magna-medicinal learned on the Hexen board is needed.':
+        '대가 없음: 헥센판에서 배운 위대한 의술만 있으면 된다.',
+    'Resurrect': '되살린다',
+    'Consumables found': '얻는 소모품',
+    'Normal': '보통',
+    'Double': '2배',
+    'Double: enemy drops and items picked up on the map count twice -': '2배: 적 드랍과 맵에서 줍는 아이템이 두 배 -',
+    'healing items and food only: no weapons, armor, ammo, bombs, traps, buffs, keys or soul stones.':
+        '회복 아이템과 음식만: 무기, 방어구, 탄약, 폭탄, 함정, 버프, 열쇠, 영혼석은 제외.',
+    'F8 save / F9 load': 'F8 저장 / F9 불러오기',
+    'Off': '끔',
+    'On': '켬',
+    'On: F8 / F9 on the map (not during an event or message) open the save / load screen - in co-op for the host only.':
+        '켬: 맵에서 F8 / F9로 저장 / 불러오기 화면을 연다 (이벤트·대사 중 제외) - 코옵에서는 호스트만.',
+    'Off: saving and loading only the original way.': '끔: 원작 방식으로만 저장·불러오기.',
+    'Only the host can change these.': '호스트만 바꿀 수 있다.',
+    'Co-op games only.': '코옵 게임에서만.',
+    'Time stops on your turn (ATB)': '내 턴에 시간 정지 (ATB)',
+    'On: when a player\'s turn comes, every gauge stops until that player has chosen.':
+        '켬: 플레이어의 턴이 오면 그 플레이어가 고를 때까지 모든 게이지가 멈춘다.',
+    'Off: time keeps running while you choose (the enemies only slow down for a moment).':
+        '끔: 고르는 동안에도 시간이 흐른다 (적은 잠깐 느려질 뿐이다).',
+    'Most player turns per enemy turn (ATB)': '적 한 턴당 플레이어 최대 턴 (ATB)',
+    'No limit': '제한 없음',
+    'A player acts at most this many times per enemy turn, however fast it is (2 - 10).':
+        '아무리 빨라도 적 한 턴에 플레이어는 이 횟수까지만 행동한다 (2 - 10).',
+    'No limit: speed alone decides. Left / right to change.': '제한 없음: 속도만으로 정해진다. 좌우 키로 바꾼다.',
+    // Steam
+    'Steam helper is outdated. Download the latest helper file.': '스팀 헬퍼가 오래됐다. 최신 헬퍼를 받으세요.',
+    'Steam session ready - press F7 to invite friends': '스팀 세션 준비 완료 - F7로 친구를 초대하세요',
+    'could not reach the host through Steam': '스팀으로 호스트에 연결하지 못했다',
+    'press F6 on the title screen to open a session first': '먼저 타이틀 화면에서 F6으로 세션을 여세요',
+    'the Steam session is not ready yet - try again in a moment': '스팀 세션이 아직 준비되지 않았다 - 잠시 후 다시 해 보세요',
+    'invite from the title screen or the field (not in battle)': '초대는 타이틀 화면이나 필드에서 (전투 중 제외)',
+    'Steam helper not found - friends can join by IP': '스팀 헬퍼가 없다 - 친구는 IP로 참가할 수 있다',
+    'joining your friend through Steam...': '스팀으로 친구에게 참가하는 중...',
+    'Steam helper not found': '스팀 헬퍼가 없다',
+    'Loading your Steam friends...': '스팀 친구 목록을 불러오는 중...',
+    'No Steam friend is online. (Esc: back)': '온라인인 스팀 친구가 없다. (Esc: 뒤로)',
+    'Invite a Steam friend to this session. (Esc: back)': '이 세션에 스팀 친구를 초대한다. (Esc: 뒤로)',
+    'They accept in Steam and join by themselves.': '친구가 스팀에서 수락하면 알아서 들어온다.',
+    'Steam did not answer. Esc: back, then use the Steam friends list': '스팀이 응답하지 않는다. Esc로 돌아가 스팀 친구 목록에서',
+    '(right-click a friend > Invite to Game) or let them join by IP.': '(친구 우클릭 > 게임에 초대) 초대하거나 IP로 참가하게 하세요.'
+};
+
+// [regexp, replacement]: $1 ... are the parts of the English line; a function
+// gets the match. Names stay as they are ("님" keeps the particles right).
+$.KO_RULES = [
+    [/^port (\d+) is already hosted - use "Co-op Join"$/, '포트 $1은 이미 열려 있다 - "코옵 참가"를 쓰세요'],
+    [/^server error \((.*)\)$/, '서버 오류 ($1)'],
+    [/^session open on port (\d+)$/, '포트 $1에서 세션이 열렸다'],
+    [/^(.+) has another mod version \((.*)$/, '$1 님의 모드 버전이 다르다 ($2'],
+    [/^(.+) could not join - the session is full \((\d+) players\)$/, '$1 님이 참가하지 못했다 - 세션이 가득 찼다 ($2명)'],
+    [/^(.+) joined$/, '$1 님이 들어왔다'],
+    [/^a second "(.+)" could not join - that name is already in the session$/, '두 번째 "$1" 님은 참가하지 못했다 - 같은 이름이 이미 세션에 있다'],
+    [/^(.+) left$/, '$1 님이 나갔다'],
+    [/^(.+) chose (.+)$/, '$1 님이 $2 선택'],
+    [/^you play (.+)$/, '당신은 $1'],
+    [/^(.+) reached the train exit$/, '$1 님이 기차 출구에 도착했다'],
+    [/^waiting at the train exit \((.*)\) - still on the train: (.*)$/, '기차 출구에서 기다리는 중 ($1) - 아직 기차에: $2'],
+    [/^connecting to (.+) \.\.\.$/, '$1에 연결하는 중...'],
+    [/^could not connect to (.+)$/, '$1에 연결하지 못했다'],
+    [/^different mod version - host (.+), yours (.+)\. Install the same version on both PCs\.$/, '모드 버전이 다르다 - 호스트 $1, 내 버전 $2. 두 PC에 같은 버전을 설치하세요.'],
+    [/^a player named "(.+)" is already in this session\. (.*)$/, function(m) {
+        return '"' + m[1] + '" 이름의 플레이어가 이미 세션에 있다. ' + $.koLine(m[2]);
+    }],
+    [/^Session is full \((\d+) players max\)\.$/, '세션이 가득 찼다 (최대 $1명).'],
+    [/^(.+) wants to let time pass\. Agree\?$/, '$1 님이 시간을 보내려고 한다. 동의할까?'],
+    [/^Give what to (.+)\?$/, '$1 님에게 무엇을 줄까?'],
+    [/^(.+) gave you (.+)$/, '$1 님이 $2 건넸다'],
+    [/^shot by (.+) \(-(\d+)\)$/, '$1 님에게 맞았다 (-$2)'],
+    [/^you shot (.+)$/, '$1 님을 쐈다'],
+    [/^waiting for (.+)\.\.\.$/, '$1 님을 기다리는 중...'],
+    [/^(.+) did not answer - your turn to go on$/, '$1 님이 응답하지 않아 당신이 이어 간다'],
+    [/^(.+) used (.+) on you\.$/, '$1 님이 당신에게 $2 사용했다.'],
+    [/^you cannot use (.+) now\.$/, '지금은 $1 쓸 수 없다.'],
+    [/^(.+) is busy right now\.$/, '$1 님은 지금 다른 일을 하는 중이다.'],
+    [/^(.+) is down! Revive them with OK \((\d+) s\)$/, '$1 님이 쓰러졌다! 확인 키로 살리자 ($2초)'],
+    [/^You are down: (\d+) s - wait for a revive$/, '쓰러졌다: $1초 - 부활을 기다리자'],
+    [/^(.+) is down: (\d+) s - revive them with OK$/, '$1 님이 쓰러졌다: $2초 - 확인 키로 살리자'],
+    [/^(.+) revived (.+)$/, '$1 님이 $2 님을 살렸다'],
+    [/^(.+) died\. The others play on \(the host walks as a ghost\)\.$/, '$1 님이 죽었다. 다른 사람들은 계속한다 (호스트는 유령으로 다닌다).'],
+    [/^(.+) left\. Waiting for them to come back\.$/, '$1 님이 나갔다. 돌아오기를 기다린다.'],
+    [/^cannot join - (.+)$/, function(m) { return '참가할 수 없다 - ' + $.koPart(m[1]); }],
+    [/^(.+) has joined the battle!$/, '$1 님이 전투에 참가했다!'],
+    [/^no command came from your PC in time - (.+) guards$/, '제때 명령이 오지 않아 $1 님이 방어한다'],
+    [/^(.+) fled from the battle\.$/, '$1 님이 전투에서 도망쳤다.'],
+    [/^(.+) lost an arm!$/, '$1 님이 팔을 잃었다!'],
+    [/^(.+) lost both arms!$/, '$1 님이 두 팔을 잃었다!'],
+    [/^(.+) lost a leg!$/, '$1 님이 다리를 잃었다!'],
+    [/^(.+) lost both legs!$/, '$1 님이 두 다리를 잃었다!'],
+    [/^(.+) (?:are|is) not here\. Go on without them\? \(They count as dead\.\)$/, '$1 님이 여기 없다. 없이 갈까? (죽은 것으로 친다.)'],
+    [/^(.+) is back\.$/, '$1 님이 돌아왔다.'],
+    [/^(.+) will not come back\. The tower door awaits the rest\.$/, '$1 님은 돌아오지 않는다. 탑의 문이 남은 사람을 기다린다.'],
+    [/^(.+) turned on (.+)!$/, '$1 님이 $2 님에게 등을 돌렸다!'],
+    [/^(.+) betrayed you - fight!$/, '$1 님이 당신을 배신했다 - 싸워라!'],
+    [/^(.+) killed (.+)\.$/, '$1 님이 $2 님을 죽였다.'],
+    [/^(.+) is down\.$/, '$1 님이 쓰러져 있다.'],
+    [/^Revive (.+)$/, '$1 님 살리기'],
+    [/^Kill (.+)$/, '$1 님 죽이기'],
+    [/^(.+) won the duel\.$/, '$1 님이 결투에서 이겼다.'],
+    [/^Everyone fights at once: (.+)\.$/, '모두 한꺼번에 싸운다: $1.'],
+    [/^Everyone for themselves: (.+)!$/, '모두가 적이다: $1!'],
+    [/^everyone for themselves - fight!$/, '모두가 적이다 - 싸워라!'],
+    [/^(.+) fell\.$/, '$1 님이 쓰러졌다.'],
+    [/^(.+): A weak point is exposed! Defense down\.$/, '$1: 약점이 드러났다! 방어력이 떨어진다.'],
+    [/^(Duels?): (.+)\.$/, function(m) {
+        var text = m[2].replace(/ vs /g, ' 대 ').replace(/, then /g, ', 다음 ');
+        text = text.replace(/\. (.+) waits for the next round$/, '. $1 님은 다음 라운드를 기다린다');
+        return '결투: ' + text + '.';
+    }],
+    [/^(.+) stayed in the menu: it is closed, the duels go on\.$/, '$1 님이 메뉴에 머물러 메뉴를 닫았다. 결투가 계속된다.'],
+    [/^the duels start once everyone is free(?: \((.+): a menu closes after (\d+) s\))?\.$/, function(m) {
+        return '모두 한가해지면 결투가 시작된다' + (m[1] ? ' (' + m[1] + ': ' + m[2] + '초 뒤 메뉴가 닫힌다)' : '') + '.';
+    }],
+    [/^(.+) recovers fully\.$/, '$1 님이 완전히 회복했다.'],
+    [/^the next duel waits for (.+) \(free, at the tower\)\.$/, '다음 결투가 $1 님을 기다린다 (한가한 상태로 탑에서).'],
+    [/^the duel waits: (.+) (?:are|is) busy\. It starts again once both are free\.$/, '결투 대기: $1 님이 다른 일을 하는 중. 둘 다 한가해지면 다시 시작한다.'],
+    [/^Final: (.+) vs (.+)!$/, '결승: $1 대 $2!'],
+    [/^Duel (\d+): (.+) vs (.+)!$/, '결투 $1: $2 대 $3!'],
+    [/^(.+) is the last one standing\. The tower door awaits\.$/, '$1 님이 마지막 생존자다. 탑의 문이 기다린다.'],
+    [/^(.+) decides\.\.\.$/, '$1 님이 고민하는 중...'],
+    [/^(.+) took too long to answer\.$/, '$1 님의 응답이 너무 늦었다.'],
+    [/^(.+) took too long - the cat chooses\.$/, '$1 님이 너무 늦어 고양이가 고른다.'],
+    [/^(.+) sought out its rightful owner: (.+)\.$/, '$1 - 원래 주인을 찾아갔다: $2.'],
+    [/^(.+) fights on\.$/, '$1 님이 계속 싸운다.'],
+    [/^(.+) is gone from the battle\.$/, '$1 님이 전투에서 사라졌다.'],
+    [/^(.+) is busy$/, '$1 님은 다른 일을 하는 중이다'],
+    [/^(.+) waves at you$/, '$1 님이 손을 흔든다'],
+    [/^no test duel - (.+)$/, function(m) { return '시험 결투 불가 - ' + $.koPart(m[1]); }],
+    [/^Test duel: (.+) won \(nobody dies\)\.$/, '시험 결투: $1 님 승리 (아무도 죽지 않는다).'],
+    [/^Test duel called off: (.+)\.$/, function(m) { return '시험 결투 취소: ' + $.koPart(m[1]) + '.'; }],
+    [/^you cannot attack now - (.+)\.$/, function(m) { return '지금은 공격할 수 없다 - ' + $.koPart(m[1]) + '.'; }],
+    [/^the fight was called off \((.+)\)\.$/, function(m) { return '싸움이 취소됐다 (' + $.koPart(m[1]) + ').'; }],
+    [/^Attack (.+)$/, '$1 공격'],
+    [/^Waiting for (.+)\.\.\.$/, '$1 님을 기다리는 중...'],
+    [/^(.+) is here\. Fight!$/, '$1 님이 왔다. 싸워라!'],
+    [/^(.+) fell for it!$/, '$1 님이 속았다!'],
+    [/^(.+): "Shut up!"$/, '$1: "닥쳐!"'],
+    [/^(.+): I'm sorry! I give up, please stop!$/, '$1: 미안해! 항복할게, 제발 그만해!'],
+    [/^to (.+) - (.+)$/, function(m) { return m[1] + ' 님에게 - ' + $.koPart(m[2]); }],
+    [/^(.+?): (Look out!|Over here!|Run!|Good luck!)$/, function(m) { return m[1] + ': ' + $.koPart(m[2]); }],
+    [/^(.+) is watching you$/, '$1 님이 지켜보고 있다'],
+    [/^Ghost(?: \(near (.+)\))?   Z: ping "(.+)"   Q\/W: line$/, function(m) {
+        return '유령' + (m[1] ? ' (' + m[1] + ' 근처)' : '') + '   Z: 신호 "' + $.koPart(m[2]) + '"   Q/W: 문구';
+    }],
+    [/^(.+) is here$/, '$1 님이 왔다'],
+    [/^(.+) absorbed the soul of (.+)\.$/, '$1 님이 $2의 영혼을 흡수했다.'],
+    [/^(.+) gave the soul of (.+) to (.+)\.$/, '$1 님이 $2의 영혼을 $3 님에게 주었다.'],
+    [/^The soul of (.+) is yours\.$/, '$1의 영혼은 당신의 것이다.'],
+    [/^Give to (.+)$/, '$1 님에게 준다'],
+    [/^(.+) shared (\d+) soul stones\.$/, '$1 님이 영혼석 $2개를 나눴다.'],
+    [/^(.+) shared a soul stone\.$/, '$1 님이 영혼석 하나를 나눴다.'],
+    [/^(.+) is sleeping\. Lie down in any bed to end the day\.$/, '$1 님이 자고 있다. 아무 침대에나 누우면 하루가 끝난다.'],
+    [/^(.+) got up\.$/, '$1 님이 일어났다.'],
+    [/^Waiting for the others to fall asleep\.\.\.(?: \((.+)\))?$/, function(m) {
+        return '다른 사람들이 잠들기를 기다리는 중...' + (m[1] ? ' (' + m[1] + ')' : '');
+    }],
+    [/^Waiting for the others to wake\.\.\.(?: \((.+)\))?$/, function(m) {
+        return '다른 사람들이 깨어나기를 기다리는 중...' + (m[1] ? ' (' + m[1] + ')' : '');
+    }],
+    [/^Waiting for (.+) before sleeping\.\.\.$/, '자기 전에 $1 님을 기다리는 중...'],
+    [/^(.+) \(fight - you can join it\)$/, '$1 (싸움 중 - 참가할 수 있다)'],
+    [/^(.+) is attacked in bed - it wakes you all, everyone fights\. Use a bed again later\.$/, '$1 님이 침대에서 습격당했다 - 모두 깨어나 싸운다. 나중에 침대를 다시 쓰자.'],
+    [/^(.+) turned into (?:the|a) (.+)\.$/, function(m) { return m[1] + ' 님이 ' + $.koPart(m[2]) + '(으)로 변했다.'; }],
+    [/^You shoot the (.+)!$/, function(m) { return $.koPart(m[1]) + '을(를) 쐈다!'; }],
+    [/^The (.+) is shot down!$/, function(m) { return $.koPart(m[1]) + '이(가) 쓰러졌다!'; }],
+    [/^The (.+) \((.+)\) is dead\.$/, function(m) { return $.koPart(m[1]) + ' (' + m[2] + ') 이(가) 죽었다.'; }],
+    [/^You absorbed the \\c\[2\](.+) soul\\c\[0\]\.$/, function(m) { return '\\c[2]' + $.koPart(m[1]) + ' 영혼\\c[0]을 흡수했다.'; }],
+    [/^(.+) absorbed the \\c\[2\](.+) soul\\c\[0\]\.$/, function(m) { return m[1] + ' 님이 \\c[2]' + $.koPart(m[2]) + ' 영혼\\c[0]을 흡수했다.'; }],
+    [/^you took (.+)'s belongings\.$/, '$1 님의 소지품을 챙겼다.'],
+    [/^Pocketcat hands you the keys (.+) had\.$/, '포켓캣이 $1 님이 가졌던 열쇠를 건넨다.'],
+    [/^(.+) reached the end\. The session is over\.$/, '$1 님이 끝에 도달했다. 세션이 끝났다.'],
+    [/^(.+) is in a fight\. Come back after it\.$/, '$1 님이 싸우는 중이다. 끝난 뒤에 다시 오자.'],
+    [/^You take what (.+) had\.$/, '$1 님이 가졌던 것을 챙긴다.'],
+    [/^You take the keys (.+) had\.$/, '$1 님이 가졌던 열쇠를 챙긴다.'],
+    [/^That body already serves (.+)\.$/, '그 시체는 이미 $1 님을 섬긴다.'],
+    [/^(.+) steps back - the fight is full\.$/, '$1 - 싸움 인원이 가득 차 물러난다.'],
+    [/^No room for ghouls on (.+)'s map\.$/, '$1 님의 맵에는 구울이 들어갈 자리가 없다.'],
+    [/^(.+) is held by the priest! Kill the priest to free them\.$/, '$1 님이 사제에게 붙잡혔다! 사제를 죽여 풀어 주자.'],
+    [/^(.+) is free: the priest is dead\.$/, '$1 님이 풀려났다: 사제가 죽었다.'],
+    [/^What do you want to sacrifice to resurrect (\\N\[\d+\])\?$/, '$1 님을 되살리려면 무엇을 바칠까?'],
+    [/^To resurrect (\\N\[\d+\]) with Magna-medicinal you need 50 mind, a soul stone and a contestant's head\.$/,
+        '위대한 의술로 $1 님을 되살리려면 이성 50, 영혼석, 참가자의 머리가 필요하다.'],
+    [/^Without a head, (\\N\[\d+\]) cannot be brought back\.$/, '머리가 없으면 $1 님을 되살릴 수 없다.'],
+    [/^Resurrect (\\N\[\d+\]) with Magna-medicinal\?$/, '위대한 의술로 $1 님을 되살릴까?'],
+    [/^It is too late to bring (\\N\[\d+\]) back\.$/, '$1 님을 되살리기에는 이미 늦었다.'],
+    [/^(.+) brought (.+) back with Magna-medicinal\.$/, '$1 님이 위대한 의술로 $2 님을 되살렸다.'],
+    [/^the host set (.+): (.+)\.$/, function(m) { return '호스트가 설정을 바꿨다 - ' + $.koLine(m[1]) + ': ' + $.koLine(m[2]) + '.'; }],
+    [/^(.+):  (.+)$/, function(m) { // a Mod Settings line: "label:  value" (a number stays)
+        var a = $.KO_EXACT[m[1]], b = /^\d+$/.test(m[2]) ? m[2] : $.KO_EXACT[m[2]];
+        return a && b ? a + ':  ' + b : null;
+    }],
+    [/^invite sent to (.+)$/, '$1 님에게 초대를 보냈다'],
+    [/^Steam did not send the invite to (.+)$/, '스팀이 $1 님에게 초대를 보내지 못했다'],
+    // the death line last: "<name> <why>."
+    [/^(.+?) ([a-z].+)\.$/, function(m) {
+        var why = $.KO_PART[m[2]];
+        return why ? m[1] + ' 님이 ' + why + '.' : null;
+    }]
+];
+
+$.koLine = function(s) {
+    s = String(s);
+    if (Object.prototype.hasOwnProperty.call($.KO_EXACT, s)) return $.KO_EXACT[s];
+    for (var i = 0; i < $.KO_RULES.length; i++) {
+        var rule = $.KO_RULES[i], m = rule[0].exec(s);
+        if (!m) continue;
+        var out = typeof rule[1] === 'function' ? rule[1](m) : s.replace(rule[0], rule[1]);
+        if (out !== null && out !== undefined) return out;
+    }
+    return s;
+};
+
+$.ko = function(text) {
+    if (text === null || text === undefined || !$.koOn()) return text;
+    var s = String(text);
+    if (s.indexOf('\n') >= 0) return s.split('\n').map($.ko).join('\n');
+    var m = /^Co-op( \(Steam\))?: /.exec(s);
+    if (m) return (m[1] ? '코옵(스팀): ' : '코옵: ') + $.koLine(s.slice(m[0].length));
+    return $.koLine(s);
+};
+
+// What every PC shows: the lines and choices of a message, menu commands.
+var _gameMessageAddKo = Game_Message.prototype.add;
+Game_Message.prototype.add = function(text) {
+    _gameMessageAddKo.call(this, $.ko(text));
+};
+
+var _gameMessageSetChoicesKo = Game_Message.prototype.setChoices;
+Game_Message.prototype.setChoices = function(choices, defaultType, cancelType) {
+    _gameMessageSetChoicesKo.call(this, $.koOn() && Array.isArray(choices) ? choices.map($.ko) : choices,
+        defaultType, cancelType);
+};
+
+var _windowCommandAddKo = Window_Command.prototype.addCommand;
+Window_Command.prototype.addCommand = function(name, symbol, enabled, ext) {
+    _windowCommandAddKo.call(this, $.ko(name), symbol, enabled, ext);
+};
+
+var _windowHelpSetTextKo = Window_Help.prototype.setText;
+Window_Help.prototype.setText = function(text) {
+    _windowHelpSetTextKo.call(this, $.ko(text));
+};
 
 })(FH.Coop);

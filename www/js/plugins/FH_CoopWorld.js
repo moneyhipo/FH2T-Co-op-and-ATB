@@ -2,7 +2,7 @@
 // FH_CoopWorld.js
 //=============================================================================
 /*:
- * @plugindesc v0.6.0 Co-op field play: guests run events, own inventories,
+ * @plugindesc v1.0.0 Co-op field play: guests run events, own inventories,
  * trading, time votes, host-only saves, guns, chasing enemies. Below FH_Coop.
  * @author FH2 Co-op Mod
  *
@@ -817,7 +817,7 @@ $.updateOwned = function() {
             $.causeSkip = false;
             $.exitContext();
         }
-        if (!entry.interp.isRunning()) $.finishOwned(id);
+        if (!entry.interp.isRunning() && !$.ownedLoops(entry, id)) $.finishOwned(id);
     });
     // Queued common events (sanity checks after the group moved, items)
     Object.keys($.ownedQueue).forEach(function(id) {
@@ -2192,7 +2192,7 @@ $.showVoteBox = function(text, done) {
     box.style.cssText = 'position:fixed;left:50%;top:30%;transform:translate(-50%,-50%);' +
         'z-index:102;background:rgba(0,0,0,0.85);padding:12px 16px;border:1px solid #888;' +
         'font:15px sans-serif;color:#fff;text-align:center;';
-    box.innerHTML = $.escape(text) + '<br><br>[Y] Yes &nbsp;&nbsp; [N] No';
+    box.innerHTML = $.escape($.ko(text)) + '<br><br>' + ($.koOn() ? '[Y] 예 &nbsp;&nbsp; [N] 아니요' : '[Y] Yes &nbsp;&nbsp; [N] No');
     document.body.appendChild(box);
     var off = function() {
         document.removeEventListener('keydown', onKey, true);
@@ -2475,10 +2475,13 @@ DataManager.makeSavefileInfo = function() {
 // moves the bullet event to the shooter (Set Event Location) and turns
 // SW297 (player_arrow) on; the bullet then flies ten tiles. Enemies check
 // the bullet themselves. Here a bullet that reaches another player hurts
-// that player: no limb damage, no instant death, damage by distance.
+// that player: no limb damage, no instant death, a fixed damage per gun.
 
 $.GUN_CES = { 227: 'rifle', 228: 'pistol', 229: 'shotgun' };
-$.GUN_DAMAGE = { pistol: [5, 30], rifle: [20, 55], shotgun: [40, 80] };
+// (user 2026-11-08: "fixed, in proportion - the field damage pistol 1, rifle
+// 2, shotgun 3, times 20; no less with distance"; was 5-30 / 20-55 / 40-80 by
+// distance)
+$.GUN_DAMAGE = { pistol: 20, rifle: 40, shotgun: 60 };
 $.BULLET_SWITCHES = [297, 300];
 $.GUN_OK_SWITCH = 2251;
 $.bullet = null;
@@ -2499,7 +2502,8 @@ Game_Switches.prototype.setValue = function(id, value) {
             var ch = shooter === 'host' ? $gamePlayer : $.remotes[shooter];
             $.bullet = {
                 eventId: $.lastLocated, shooter: shooter, gun: $.lastGun || 'pistol',
-                x0: ch ? ch.x : 0, y0: ch ? ch.y : 0, mapId: $gameMap.mapId()
+                x0: ch ? ch.x : 0, y0: ch ? ch.y : 0, mapId: $gameMap.mapId(),
+                marks: !!this._data[731] // MarksmanshipAVAILABLE: a rifle may kill at once (FH_CoopRoam forms)
             };
             // a guest's shot flies its way and hits with its gun (below)
             if ($.ctx) {
@@ -2512,26 +2516,23 @@ Game_Switches.prototype.setValue = function(id, value) {
     _Game_Switches_setValue.call(this, id, value);
 };
 
-$.gunDamage = function(gun, dist) {
-    var range = $.GUN_DAMAGE[gun] || $.GUN_DAMAGE.pistol;
-    if (dist <= 2) return range[1];
-    if (dist >= 5) return range[0];
-    var t = (dist - 2) / 3;
-    return Math.round(range[1] + (range[0] - range[1]) * t);
+$.gunDamage = function(gun) {
+    return $.GUN_DAMAGE[gun] || $.GUN_DAMAGE.pistol;
 };
 
 // Rare extras of a shot at another player (user decision 2026-10-29):
 // a pistol, 1 in 100, on a male character: twice the damage, 50 mind and a
-// line; a rifle, 1 in 20: an arm off (not through an arm guard); a shotgun,
-// 1 in 20: Fracture.
+// line; a rifle, 1 in 4: an arm off (not through an arm guard); a shotgun,
+// 1 in 2: Fracture (user 2026-11-08: "rifle 25%, shotgun 50%, not the
+// pistol"; both were 1 in 20).
 // (Marina is a man in a dress in the story: user decision 2026-10-31)
 $.GUN_MALE_ACTORS = [1, 3, 4, 6, 13]; // Levi, Marina, Daan, O'saa, Marcoh
 $.GUN_GROIN_RATE = 0.01;
 $.GUN_GROIN_MIND = 50;
 $.GUN_GROIN_TEXT = 'You seem to have been hit somewhere not so good...';
 $.GUN_GROIN_TEXT_KO = '당신은 영 좋지 않은 곳에 맞은 것 같다...';
-$.GUN_ARM_RATE = 0.05;
-$.GUN_FRACTURE_RATE = 0.05;
+$.GUN_ARM_RATE = 0.25;
+$.GUN_FRACTURE_RATE = 0.5;
 $.GUN_FRACTURE_STATE = 19;
 
 // The Korean patch: the data's names are in Hangul.
@@ -2588,7 +2589,7 @@ $.worldExtras.push(function() {
     })[0];
     if (!hit) return;
     var dist = Math.abs(hit.ch.x - b.x0) + Math.abs(hit.ch.y - b.y0);
-    var dmg = $.gunDamage(b.gun, dist);
+    var dmg = $.gunDamage(b.gun);
     var actor = $.actorOfPlayer(hit.id);
     $.bullet = null;
     $.BULLET_SWITCHES.forEach(function(id) { $gameSwitches.setValue(id, false); });
@@ -3175,6 +3176,42 @@ $.pageCause = function(ev) {
     return best;
 };
 
+// An event whose autorun pages read the keys (a panel, a puzzle) is played by
+// the one who set it off, its opening and closing pages too: as a shared
+// scene it ran on the host's PC with the host's keys.
+$.eventReadsKeys = function(ev) {
+    return ev.event().pages.some(function(pg) {
+        return pg.trigger === 3 && pg.list.some(function(c) { return c.code === 111 && c.parameters[0] === 11; });
+    });
+};
+
+// A page like that which is still the event's page goes round again at once.
+// Ending and starting it told the guest's PC "no event runs" between rounds:
+// its keys were not sent then and a short press was lost.
+$.ownedLoops = function(entry, id) {
+    var ev = entry.ev, o = ev && ev._fhLoopOwner;
+    if (!o || o.id !== id || o.page !== ev._pageIndex || ev._erased) return false;
+    if ($gameMap.event(ev.eventId()) !== ev || !$.eventReadsKeys(ev)) return false;
+    var page = ev.page();
+    if (!page || page.trigger !== 3 || ev.findProperPageIndex() !== ev._pageIndex) return false;
+    var conn = $.clientById(id);
+    if (!conn || !$.guestOnMap(conn) || $.isDown(id)) return false;
+    entry.interp.setup(page.list, ev.eventId());
+    return true;
+};
+
+// An autorun page that starts again and again for the guest who set it off
+// (its condition stays on while it waits for keys: the sewage panel, Map096
+// EV298 p2) stays that guest's, however long. Its cause is old after
+// $.CAUSE_MS, and the panel went to the host and the host's keys (4-player
+// review 2026-11-09: "only the host's game activates it").
+$.loopCause = function(ev) {
+    var o = ev._fhLoopOwner;
+    if (!o || o.page !== ev._pageIndex) return null;
+    var c = $.clientById(o.id);
+    return c && $.guestOnMap(c) && !c.roam ? { id: o.id, at: $.clockMs(), n: ++$.causeSeq } : null;
+};
+
 var _Game_Event_start_cause = Game_Event.prototype.start;
 $.pageTransferMap = function(page) {
     var commands = $.pageTransferCommands(page && page.list, {});
@@ -3225,6 +3262,8 @@ Game_Event.prototype.start = function() {
             return;
         }
         var cause = $.pageCause(this);
+        if (cause && cause.id === 'host') this._fhLoopOwner = null; // (the host's press now)
+        if (!cause) cause = $.loopCause(this);
         var conn = cause && cause.id !== 'host' ? $.clientById(cause.id) : null;
         // A guest running its own map set it and may be on its way here (the
         // well: jump down on its map, land on the host's): the page waits for
@@ -3256,7 +3295,8 @@ Game_Event.prototype.start = function() {
         // opened on the host wherever it stood when a guest stepped on the line)
         if (conn && conn.actorId && $.guestOnMap(conn) && !$.isDown(conn.guestId) &&
                 (!$.isCutscenePage(this.page()) || $.pageMovesPlayer(this.page()) || $.pagePersonal(this.page()) ||
-                $.pageUsesBag(this.page()) || $.pageFights(this.page()) || $.eventEndsGame(this))) {
+                $.pageUsesBag(this.page()) || $.pageFights(this.page()) || $.eventEndsGame(this) ||
+                $.eventReadsKeys(this))) {
             // its event is still finishing, or the host's own run of this
             // event (another of its pages) goes on: wait for it. (Falling
             // through queued the page for the host's interpreter: the host
@@ -3266,7 +3306,10 @@ Game_Event.prototype.start = function() {
                 cause.n = ++$.causeSeq;
                 return;
             }
-            if ($.startEventFor(conn, this, [3])) return;
+            if ($.startEventFor(conn, this, [3])) {
+                this._fhLoopOwner = { id: conn.guestId, page: this._pageIndex };
+                return;
+            }
         }
         // A page that moves the player, turned on by a guest who did not come
         // (its own map ran it: a bed's night scene, Map020 EV191 Samarie /
@@ -3391,6 +3434,30 @@ Game_Switches.prototype.setValue = function(id, value) {
         $.causes['sw:' + id] = { id: $.ymTarget, at: $.clockMs(), n: ++$.causeSeq };
     }
 };
+
+// The one it sees is down, dead or gone from this map (or runs it on its own
+// PC): the dance stops - nobody else takes its Hurting. (The original: losing
+// to it is a game over, so nobody lay in its sight.)
+$.ymCheckTarget = function() {
+    var id = $.ymTarget;
+    if (!id || !$.isHost() || !$gameSwitches._data[$.YM_DANCE_SWITCH]) return;
+    var why = '';
+    if ($.isDown && $.isDown(id)) why = 'down';
+    else if ($.isDead && $.isDead(id)) why = 'dead';
+    else if (id !== 'host') {
+        var c = $.clientById(id);
+        if (!c) why = 'left';
+        else if (c.roam) why = 'runs its own map';
+        else if (!c.lastPos || (c.lastPos.m && c.lastPos.m !== $gameMap.mapId())) why = 'not on this map';
+    }
+    if (!why) return;
+    $.dlog('yellow mage: its target is', why, '- the dance stops');
+    $gameSwitches.setValue($.YM_DANCE_SWITCH, false);
+    $.ymTarget = null;
+};
+$.worldExtras.push(function() {
+    if (Graphics.frameCount % 10 === 0) $.ymCheckTarget();
+});
 
 $.pageTransferCommands = function(list, seen, result) {
     seen = seen || {};
@@ -3898,9 +3965,132 @@ Game_Switches.prototype.setValue = function(id, value) {
 $.PERSONAL_PICTURES = { exhaustion: true };
 var _pictureInfoFx = $.pictureInfo;
 $.pictureInfo = function(pic) {
-    if (pic && pic.name && $.PERSONAL_PICTURES[pic.name()]) return null;
+    if (pic && pic.name && ($.PERSONAL_PICTURES[pic.name()] || $.privatePicture(pic))) return null;
     return _pictureInfoFx(pic);
 };
+
+// The coin / soul stone count (CE262 COIN_HUD, CE290 SOULSTONE_HUD: pictures 14-17 -
+// coin_background, the icon, two digits) is the count of this PC's player: the host's
+// or a sub-host's went to every guest on its map with its sync (gallery 4p report
+// 2026-11-09: the coin picture on the others' screens, the host's own chest).
+// (data: these names as pictures 14-17 are only these two events' - their icons
+// icon_small_coin / icon_small_stone. By name and place, not by the background:
+// a snapshot's pictures are taken away one by one, the background first)
+$.COUNT_HUD_PICS = [14, 15, 16, 17];
+$.countHudPicture = function(pic) {
+    if (!pic || !$gameScreen || !pic.name || !pic.name()) return false;
+    var at = function(id) { return $gameScreen.picture(id) === pic; };
+    var name = pic.name();
+    if (at(14)) return name === 'coin_background';
+    if (at(15)) return name === 'icon_small_coin' || name === 'icon_small_stone';
+    if (at(16) || at(17)) return /^number_\d$/.test(name);
+    // the ammo count (CE10 AMMO_HUD, pictures 10-13; data: these names there are only
+    // CE10's - Map073's intro pictures and Map102's blackscreen use other names)
+    if (at(10)) return name === 'ammo_background';
+    if (at(11)) return /^icon_small_(rifle|shotgun|pistol)$/.test(name);
+    if (at(12) || at(13)) return /^number_\d$/.test(name);
+    return false;
+};
+
+// What a player's own item or skill shows is that player's (2026-11-10, the same
+// class as the coin picture): the common event it reserves (a book, a letter, the
+// Prehevil map, the character chart, party talk ... - 64 items) runs on the map
+// interpreter of the PC running that map, and its pictures went to every guest on
+// that map with the sync (and with a snapshot / roam start). Its text did not (a
+// reserved common event is no shared scene). The pictures that interpreter (and its
+// children) shows are marked; the sync and a world sent leave them out, and the
+// guest that gets a world keeps its own. By where they come from, not by name: the
+// same pictures serve shared scenes too (the endings, character select, the Ouija
+// board events, the day text after a bed).
+$.ownCeReserved = 0; // a common event this PC's own player reserved by an item / skill
+var _applyGlobalOwnCe = Game_Action.prototype.applyGlobal;
+Game_Action.prototype.applyGlobal = function() {
+    var was = $.ownCeAction;
+    $.ownCeAction = !$.ctx && !$gameParty.inBattle();
+    try {
+        _applyGlobalOwnCe.call(this);
+    } finally {
+        $.ownCeAction = was;
+    }
+};
+var _reserveCommonEventOwn = Game_Temp.prototype.reserveCommonEvent;
+Game_Temp.prototype.reserveCommonEvent = function(id) {
+    _reserveCommonEventOwn.call(this, id);
+    if ($.ownCeAction && this._commonEventId === id) $.ownCeReserved = id;
+};
+var _setupStartingEventOwn = Game_Map.prototype.setupStartingEvent;
+Game_Map.prototype.setupStartingEvent = function() {
+    var id = $gameTemp.isCommonEventReserved() ? $gameTemp._commonEventId : 0;
+    var started = _setupStartingEventOwn.call(this);
+    if (started && id && id === $.ownCeReserved && !$gameTemp.isCommonEventReserved()) {
+        this._interpreter._fhPersonalPics = true;
+        $.ownCeReserved = 0;
+    }
+    return started;
+};
+var _clearPersonalPics = Game_Interpreter.prototype.clear;
+Game_Interpreter.prototype.clear = function() {
+    _clearPersonalPics.call(this);
+    this._fhPersonalPics = false;
+};
+var _setupChildPersonalPics = Game_Interpreter.prototype.setupChild;
+Game_Interpreter.prototype.setupChild = function(list, eventId) {
+    _setupChildPersonalPics.call(this, list, eventId);
+    if (this._fhPersonalPics && this._childInterpreter) this._childInterpreter._fhPersonalPics = true;
+};
+var _command231PersonalPics = Game_Interpreter.prototype.command231;
+Game_Interpreter.prototype.command231 = function() {
+    var result = _command231PersonalPics.call(this);
+    if (this._fhPersonalPics && $gameScreen) {
+        var pic = $gameScreen.picture(this._params[0]);
+        if (pic) pic._fhPersonal = true;
+    }
+    return result;
+};
+
+// A picture that is this PC's player's alone: a count (coin, soul stone, ammo) or
+// what its own item showed.
+$.privatePicture = function(pic) {
+    return !!pic && (!!pic._fhPersonal || $.countHudPicture(pic));
+};
+
+// The ammo count is each player's own (user 2026-11-10, "(나)"): CE10 AMMO_HUD
+// (parallel on SW79) draws the gun in hand (SW2252-2254, which the character's
+// outfit event sets from its weapon) and the bag's ammo for it. A thin guest's PC
+// runs no common event: it saw the host's count (synced) and never its own. The
+// count is a personal picture now (not synced, not taken from a snapshot), and a
+// thin guest's PC draws its own: CE10's list with its own gun and its own bag.
+$.AMMO_HUD_CE = 10;
+$.AMMO_HUD_EVERY = 6;   // frames (the host's CE10 runs every frame)
+$.AMMO_HUD_VAR = 252;   // CE10's scratch value (this PC's, put back)
+$.thinAmmoHud = function() {
+    if (!$.isThin || !$.isThin() || !$gameMap || !$gameMap.mapId() || $gameParty.inBattle()) return;
+    if (!(SceneManager._scene instanceof Scene_Map) || Graphics.frameCount % $.AMMO_HUD_EVERY !== 0) return;
+    var ce = $dataCommonEvents && $dataCommonEvents[$.AMMO_HUD_CE];
+    var actor = $gameActors.actor($.myActorId);
+    if (!ce || !actor || !$gameSwitches.value(ce.switchId)) return;
+    // (a shared scene's pictures there - Map073's intro, Map102's blackscreen: not over them)
+    var busy = [10, 11, 12, 13].some(function(id) {
+        var pic = $gameScreen.picture(id);
+        return !!pic && !!pic.name() && !$.countHudPicture(pic);
+    });
+    if (busy) return;
+    var sw = $gameSwitches._data, keep = {}, on = $.gunSwitchesFor(actor);
+    $.GUN_EQUIP_SWITCHES.forEach(function(id) {
+        keep[id] = sw[id];
+        sw[id] = !!on[id];
+    });
+    var v = $gameVariables._data[$.AMMO_HUD_VAR];
+    try {
+        var interp = new Game_Interpreter();
+        interp.setup(ce.list);
+        interp.update(); // (no wait before its pictures: its one wait is at the end)
+    } finally {
+        $.GUN_EQUIP_SWITCHES.forEach(function(id) { sw[id] = keep[id]; });
+        $gameVariables._data[$.AMMO_HUD_VAR] = v;
+    }
+};
+$.guestExtras.push($.thinAmmoHud);
 
 $.guestExtras.push(function() {
     if (!$.fxRuns.length) return;
@@ -3987,9 +4177,8 @@ $.ownEventView = function(conn) {
     return out;
 };
 
-var _hostSyncOwnEv = $.hostSync;
-$.hostSync = function() {
-    _hostSyncOwnEv();
+// (the host's guests from hostSync, a sub-host's from subHostSync: FH_CoopRoam)
+$.sendOwnEvents = function() {
     if (!$.runsWorld() || !$gameMap || !$gameMap.mapId()) return;
     $.clients.forEach(function(c) {
         if (!c.actorId || c.roam || c.roamPending || c.solo || !$.guestOnMap(c)) return;
@@ -3999,6 +4188,12 @@ $.hostSync = function() {
         c._fhOwnEvKey = key;
         c.send({ t: 'ownEv', m: $gameMap.mapId(), ev: view });
     });
+};
+
+var _hostSyncOwnEv = $.hostSync;
+$.hostSync = function() {
+    _hostSyncOwnEv();
+    $.sendOwnEvents();
 };
 
 var _sendSnapshotOwnEv = $.sendSnapshot;
@@ -4558,7 +4753,8 @@ $.pressedRun = function() {
 var _command223OwnTint = Game_Interpreter.prototype.command223;
 Game_Interpreter.prototype.command223 = function() {
     if ($.role && $.runsWorld() && !$.ctx && !$gameParty.inBattle() && $.inMapInterpreter(this)) {
-        if (this.isFHCoopShared() || !$.pressedRun()) {
+        // (and its own item's event - Heroin, the Necronomicon, Engrave ...: 2026-11-10)
+        if (this.isFHCoopShared() || !($.pressedRun() || $gameMap._interpreter._fhPersonalPics)) {
             $.ownTint = null;
         } else if (!$.ownTint) {
             var sc = $gameScreen;

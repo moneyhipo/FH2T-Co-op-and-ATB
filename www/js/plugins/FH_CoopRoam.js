@@ -2,7 +2,7 @@
 // FH_CoopRoam.js
 //=============================================================================
 /*:
- * @plugindesc v0.6.0 Co-op: every player explores on their own. A guest on a
+ * @plugindesc v1.0.0 Co-op: every player explores on their own. A guest on a
  * map without the host runs that map on its own PC. Below FH_CoopBattle.
  * @author FH2 Co-op Mod
  *
@@ -106,7 +106,13 @@ Game_Interpreter.prototype.fhDelegateBattle = function() {
 var _startPvpMeta = $.startPvp;
 $.startPvp = function(attackerId, foeId) {
     $.refreshMeta();
-    _startPvpMeta(attackerId, foeId);
+    return _startPvpMeta(attackerId, foeId);
+};
+
+var _startMeleeMeta = $.startMelee;
+$.startMelee = function(ids) {
+    $.refreshMeta();
+    return _startMeleeMeta(ids);
 };
 
 //=============================================================================
@@ -509,10 +515,11 @@ $.sendSnapshot = function(conn) {
     if (conn) {
         conn.roam = false;
         conn.roamPending = null;
+        conn._ghostStay = false;
         return _sendSnapshot(conn);
     }
     var all = $.clients.filter(function(c) { return !c.solo; });
-    var some = all.filter(function(c) { return !c.roam && !c.roamPending; });
+    var some = all.filter(function(c) { return !c.roam && !c.roamPending && !c._ghostStay; });
     if (some.length === all.length) return _sendSnapshot();
     if (some.length) _sendSnapshot(some); // one save build for all of them
 };
@@ -717,7 +724,7 @@ $.leaveGuestsBehind = function(newMapId) {
     $.clients.forEach(function(c) {
         if (!c.inGame || !c.actorId || c.solo || c.roam || c.roamPending || c.subOf) return;
         if ($.isDead(c.guestId)) {
-            if (c.lastPos) delete c.lastPos.m; // it follows the host
+            $.ghostLeftBehind(c, here, newMapId);
             return;
         }
         if (!c.lastPos || (c.lastPos.m && c.lastPos.m !== here)) return;
@@ -728,6 +735,58 @@ $.leaveGuestsBehind = function(newMapId) {
         data = data || $.snapshotData();
         $.sendRoam(c, { data: data });
     });
+};
+
+// A ghost stays where it is (user 2026-11-07: "the dead guest's ghost keeps
+// following me, and it lags"). A dead guest on the host's map used to follow
+// the host through every door (0.3.x spectating): a whole world sent to it at
+// each one, every fight of the host watched by it. Now the map it is on stays
+// on its PC as a still copy ($.spec, as when it walks through a door itself)
+// and the snapshots of the host's new maps leave it out (_ghostStay); a door
+// it takes to the host's map asks for the world again (needSnap), and the
+// host coming onto its map takes it back in where it stands.
+// Into an ending (the host won: the tower, ending A) it still follows the host
+// and watches it, as before (2026-11-06: "the ghosts watch the winner's ending").
+$.ghostLeftBehind = function(c, here, newMapId) {
+    if ($.ENDING_MAPS && $.ENDING_MAPS[newMapId]) {
+        c._ghostStay = false;
+        if (c.lastPos) delete c.lastPos.m; // it follows the host
+        return;
+    }
+    var at = c.lastPos && c.lastPos.m ? c.lastPos.m : here;
+    if (at === newMapId) { // the host comes onto its map: back in the world
+        c._ghostStay = false;
+        return;
+    }
+    if (at === here) {
+        c.lastPos = Object.assign({}, c.lastPos || {}, { m: here });
+        if (!c._ghostStay) c.send({ t: 'ghostStay', m: here });
+    }
+    c._ghostStay = true;
+    delete $.remotes[c.guestId];
+    $.dlog('ghost', c.name, 'stays on map', at, '- the host goes to', newMapId);
+};
+
+$.guestHandlers.ghostStay = function(msg) {
+    if (!$.isGhostMe() || $.spec || !$gameMap || $gameMap.mapId() !== msg.m) return;
+    var hide = $.playerInfo($.myId);
+    hide.tr = 1;
+    if ($.conn) $.conn.send({ t: 'pos', p: hide });
+    $.spec = { m: msg.m };
+    $.dlog('ghost: the host left, this map stays as a still copy', msg.m);
+};
+
+// Taken back in on the map it stood on: it stays where it stands.
+var _processPendingSnapshotGhostStay = $.processPendingSnapshot;
+$.processPendingSnapshot = function() {
+    var snap = $.pendingSnapshot, p = typeof $gamePlayer !== 'undefined' ? $gamePlayer : null;
+    var keep = snap && $.spec && p && !$.ghostArrive && snap.mapId === $.spec.m ?
+        { m: snap.mapId, x: p.x, y: p.y, d: p.direction() } : null;
+    _processPendingSnapshotGhostStay();
+    if (keep && $gameMap && $gameMap.mapId() === keep.m && $gamePlayer) {
+        $gamePlayer.locate(keep.x, keep.y);
+        $gamePlayer.setDirection(keep.d);
+    }
 };
 
 // Not left to its own map yet: busy, or its menu is open. The host's copy
@@ -921,7 +980,7 @@ $.dropOldWorld = function() {
         b.joiners.forEach(function(id) { $.bSend(id, { t: 'bEnd', bid: b.bid, r: 1 }); });
         if (b.owner !== 'host') $.sendTo(b.owner, { t: 'bDrop', bid: b.bid });
         // both duelists (each runs a battle; one may still wait to open it)
-        if (b.pvp) [b.attackerId, b.foeId].forEach(function(id) { if (id) $.sendTo(id, { t: 'pvpEnd', bid: b.bid }); });
+        if (b.pvp) $.duelIds(b).forEach(function(id) { if (id) $.sendTo(id, { t: 'pvpEnd', bid: b.bid }); });
     });
     $.battles = {};
     $.hostInJoin = 0;
@@ -1371,6 +1430,7 @@ $.guestHandlers.me = function(msg) {
 var _processPendingSnapshot = $.processPendingSnapshot;
 $.processPendingSnapshot = function() {
     var had = !!$.pendingSnapshot;
+    var ownPc = had ? $.pendingSnapshot.pc : null; // its own SW202 / SW410 ... (FH_Coop sendSnapshot)
     if (had) {
         $.roam = null;
         $.backToHost = null;
@@ -1378,6 +1438,9 @@ $.processPendingSnapshot = function() {
         $.worldDirty = null;
     }
     _processPendingSnapshot();
+    if (ownPc && $gameSwitches && $.CTX_OWN_SWITCHES) {
+        $.CTX_OWN_SWITCHES.forEach(function(id) { $gameSwitches._data[id] = !!ownPc[id]; });
+    }
     if (had && $gameParty) $gameParty._inBattle = false; // made while the host fought
 };
 
@@ -1516,6 +1579,15 @@ $.isDown = function(id) {
     return _isDownRoam(id);
 };
 
+// (the same for a death: the host's word, as the host told this PC. It was
+// always "no" on a sub-host - a trade to a ghost of its map went through, a
+// dead guest's bag came back after the host had emptied it: audit 2026-11-10)
+var _isDeadRoam = $.isDead;
+$.isDead = function(id) {
+    if (!$.isHost() && $.subHosting()) return $.pstateOf[id === 'host' ? $.myId : id] === 'dead';
+    return _isDeadRoam(id);
+};
+
 var _pstate = $.guestHandlers.pstate;
 $.guestHandlers.pstate = function(msg) {
     var wasDown = $.isGuest() && msg.id === $.myId && !!$.myState;
@@ -1640,6 +1712,10 @@ $.hostHandlers.betrayAsk = function(conn, msg) {
     var sub = msg.forId ? $.clientById(msg.forId) : null;
     if (msg.forId && (!sub || sub.subOf !== conn.guestId)) return;
     var id = sub ? sub.guestId : conn.guestId;
+    if ($.isDown(id)) { // (just died or down there: its state not on its PC yet - review 2026-11-06)
+        if (!sub) conn.send({ t: 'askNo', id: msg.id });
+        return;
+    }
     if ($.towerDoorUse(id)) {
         conn.send(sub ? { t: 'towerOk', forId: sub.guestId, ev: msg.ev } : { t: 'askOk', id: msg.id });
     } else if (!sub) {
@@ -1674,6 +1750,7 @@ $.guestHandlers.towerOk = function(msg) {
 // The host loaded a save: the tournament of the world before is over.
 var _dropOldWorldTourney = $.dropOldWorld;
 $.dropOldWorld = function() {
+    if ($.tourney && $.tourneyOver) $.tourneyOver('a save loaded');
     $.tourney = null;
     $.tourneyAsk = null;
     $.endDuelIntro(false);
@@ -1814,7 +1891,7 @@ $.hostHandlers.unroam = function(conn, msg) {
         var actor = $gameActors.actor(conn.actorId);
         owner.send({
             t: 'subAdd', id: conn.guestId, name: conn.name, actorId: conn.actorId,
-            actor: $.actorJson(actor), inv: $.inventoryOf(conn), hx: $.boardOf(conn),
+            actor: $.actorJson(actor), inv: $.inventoryOf(conn), hx: $.withHostSigils($.boardOf(conn)),
             pos: { m: msg.m, x: msg.x, y: msg.y, d: msg.d || 2 }, interp: msg.interp || null
         });
         $.dlog('sub', conn.name, 'joins', owner.name, 'on map', msg.m);
@@ -2104,7 +2181,8 @@ $.guestHandlers.subAdd = function(msg) {
 };
 
 $.subSendSnapshot = function(v) {
-    v.send({ t: 'snap', mapId: $gameMap.mapId(), data: $.snapshotData() });
+    // (its own SW202 / SW410 too, not this PC's: FH_Coop sendSnapshot)
+    v.send({ t: 'snap', mapId: $gameMap.mapId(), data: $.snapshotData(), pc: $.ctxOwnOf ? $.ctxOwnOf(v) : null });
     $.resetSyncKeys();
     v._lastMeKey = null;
     $.pushMe(v);
@@ -2262,6 +2340,21 @@ $.subHostSync = function() {
         }
     });
     if (++$.subFrame % 10 === 0) $.clients.forEach(function(c) { $.sendSubMe(c, false); });
+};
+
+// A ladder's blocker for this PC's guests too (FH_CoopWorld "Pages that hang on
+// a player's own switches"). Only the host sent them: a sub-host's guest stepped
+// onto a ladder, its move was refused for ever and it stood there (gallery report
+// 2026-11-09, four players; flows Z-21).
+var _subHostSyncOwnEv = $.subHostSync;
+$.subHostSync = function() {
+    _subHostSyncOwnEv();
+    $.sendOwnEvents();
+};
+var _subSendSnapshotOwnEv = $.subSendSnapshot;
+$.subSendSnapshot = function(v) {
+    v._fhOwnEvKey = null; // (its PC drops them with a snapshot)
+    return _subSendSnapshotOwnEv(v);
 };
 
 var _subHostSyncSnapPlace = $.subHostSync;
@@ -2548,6 +2641,7 @@ $.isBunkerDoor = function(ev) {
 };
 
 $.fieldGab = function(text) {
+    text = $.ko(text); // (the Korean patch: in Korean)
     var scene = SceneManager._scene;
     if (scene && scene._gabWindow) {
         try {
@@ -2955,7 +3049,7 @@ $.hostHandlers.subRevive = function(conn, msg) {
         return !!c && (c === conn || c.subOf === conn.guestId);
     };
     if (!conn.roam || msg.id === msg.by || !here(msg.id) || !here(msg.by) || $.isDown(msg.by)) return;
-    $.revive(msg.id, msg.by);
+    $.reviveOrAsk(msg.id, msg.by);
 };
 
 // A sub-host's guest that joined or left a fight is busy or free there too.
@@ -3654,7 +3748,9 @@ $.leaveAsGuest = function(message) {
 // sigils of the player at it (before, the host's: a guest's were "????").
 // Not per player: the *_SOUL switches (a contestant died: world story),
 // SKILL_dash (SW1956: also the run key's "running" flag), the trip there and
-// back (V2289, V2299, V2300, V2592, V2593, V2600, SW2879).
+// back (V2289, V2299, V2300, V2592, V2593, V2600, SW2879; on the board a PC
+// keeps its own V2289 / V2300 / V2592, and the Orphanage table's V2593 waits
+// for every player: "The Orphanage's Tes'tich table" near the end).
 
 $.HEXEN_MAP = 31;
 $.HEXEN_SWITCHES = [];
@@ -3673,6 +3769,11 @@ $.PERSONAL_EXTRA_SW = {};
 $.HEXEN_AFFLICTIONS = [261, 262, 263, 264, 265, 266];
 $.HEXEN_VARS = $.HEXEN_AFFLICTIONS.concat([435, 436, 1891, 1961]);
 for (var hxv = 1861; hxv <= 1876; hxv++) $.HEXEN_VARS.push(hxv);
+// The Spice forge's (CE503-508): forge_* 1841-1856 = which rank of which skill
+// this player chose, 1837-1839 / 1857 / 1858 = its window's spice and cursors.
+// Shared, one player's rank was taught to the next who ran CE505.
+for (hxv = 1841; hxv <= 1856; hxv++) $.HEXEN_VARS.push(hxv);
+$.HEXEN_VARS.push(1837, 1838, 1839, 1857, 1858);
 $.SIGIL_KNOWN = {};
 for (var sgk = 1421; sgk <= 1427; sgk++) $.SIGIL_KNOWN[sgk] = true;
 // The host's sigils stay known to everyone (as before; older boards have
@@ -3684,6 +3785,32 @@ $.withHostSigils = function(b, hostBoard) {
     Object.keys($.SIGIL_KNOWN).forEach(function(id) { if (host.s && host.s[id]) out.s[id] = true; });
     return out;
 };
+// A skin bible in the bag is its sigil known (user 2026-11-07: a book the host
+// got from a guest left the circle's sigil "????"). The original turns SIGIL_*
+// on only when a book is picked up (CE25 RANDOM BOOK GET: having 210 Gro-goroth,
+// 317 Sylvian, 244 Alll-mer, 211 Rher, 316 Vinushka, 315 Fear and Hunger), so a
+// bible handed over (trade, a body, an inheritance) never taught it. Read in co-op
+// on a PC that runs the world (the host - a guest's bag in its context - or a
+// roaming guest): an unknown sigil whose bible the bag holds is turned on for
+// that player (its board's own value, kept when the book is given away later).
+$.SIGIL_BOOKS = { 1421: 210, 1422: 317, 1423: 244, 1424: 211, 1425: 316, 1426: 315 };
+var _swValueSigilBook = Game_Switches.prototype.value;
+Game_Switches.prototype.value = function(id) {
+    var v = _swValueSigilBook.call(this, id);
+    var book = $.SIGIL_BOOKS[id];
+    if (v || !book || this !== $gameSwitches || !$.role || !($.isHost() || $.isRoaming())) return v;
+    if ($.sigilBookSetting || typeof $gameParty === 'undefined' || !$gameParty || !$dataItems ||
+            !$gameParty.hasItem($dataItems[book])) return v;
+    $.sigilBookSetting = true; // (the setValue wrappers read the old value)
+    try {
+        this.setValue(id, true);
+    } finally {
+        $.sigilBookSetting = false;
+    }
+    $.dlog('sigil', id, 'known: its skin bible is in the bag', $.ctx ? '(' + $.playerLabel($.ctx.guestId) + ')' : '');
+    return true;
+};
+
 $.HEXEN_SW = {};
 $.HEXEN_V = {};
 $.HEXEN_SWITCHES.forEach(function(id) { $.HEXEN_SW[id] = true; $.NO_SYNC_SWITCHES[id] = true; });
@@ -4047,11 +4174,57 @@ $.restoreSolo = function(conn, actorId) {
 var _command318Hx = Game_Interpreter.prototype.command318;
 Game_Interpreter.prototype.command318 = function() {
     var p = this._params;
-    if ($.role && $gameMap && $gameMap.mapId() === $.HEXEN_MAP && !$gameParty.inBattle()) {
+    var onBoard = $.role && $gameMap && $gameMap.mapId() === $.HEXEN_MAP && !$gameParty.inBattle();
+    if (onBoard || ($.role && this._fhForgeTeach)) {
         var id = p[0] === 0 ? p[1] : $gameVariables.value(p[1]);
         if (id > 0 && $gameParty._actors.indexOf(id) < 0) return true;
     }
     return _command318Hx.call(this);
+};
+
+// The Spice forge, used from the menu on any map (user 2026-11-09). CE505
+// forgets every rank for the party, then teaches the ranks of forge_* to the
+// actor in learns_*: anyone else's character is left alone (the rule above,
+// off the board too). CE503 opens with what this character really knows, so
+// a rank chosen while the values were shared does not come back.
+$.FORGE_MENU_EVENT = 503;
+$.FORGE_TEACH_EVENT = 505;
+
+// { skill: [forge variable, rank] }, read from CE505.
+$.forgeRanks = function() {
+    var out = {}, cond = null;
+    $dataCommonEvents[$.FORGE_TEACH_EVENT].list.forEach(function(c) {
+        if (c.code === 111 && c.parameters[0] === 1) cond = c.parameters;
+        if (c.code === 318 && c.parameters[0] === 1 && cond) out[c.parameters[3]] = [cond[1], cond[3]];
+    });
+    return out;
+};
+
+$.forgeFromSkills = function(actor) {
+    if (!actor) return;
+    var ranks = $.forgeRanks(), v = $gameVariables._data;
+    Object.keys(ranks).forEach(function(skill) { v[ranks[skill][0]] = 0; });
+    Object.keys(ranks).forEach(function(skill) {
+        var r = ranks[skill];
+        if (actor.isLearnedSkill(Number(skill)) && r[1] > (v[r[0]] || 0)) v[r[0]] = r[1];
+    });
+};
+
+var _setupForge = Game_Interpreter.prototype.setup;
+Game_Interpreter.prototype.setup = function(list, eventId) {
+    var ce = $dataCommonEvents;
+    this._fhForgeOpen = !!ce && !!ce[$.FORGE_MENU_EVENT] && list === ce[$.FORGE_MENU_EVENT].list;
+    this._fhForgeTeach = !!ce && !!ce[$.FORGE_TEACH_EVENT] && list === ce[$.FORGE_TEACH_EVENT].list;
+    _setupForge.call(this, list, eventId);
+};
+
+var _executeCommandForge = Game_Interpreter.prototype.executeCommand;
+Game_Interpreter.prototype.executeCommand = function() {
+    if (this._fhForgeOpen) {
+        this._fhForgeOpen = false;
+        if ($.role) $.forgeFromSkills($gameActors.actor($.ctx ? $.ctx.actorId : ($.isHost() ? $.hostActorId() : $.myActorId)));
+    }
+    return _executeCommandForge.call(this);
 };
 
 // Sub-host: its guest's board goes to the host with its bag.
@@ -4289,6 +4462,7 @@ $.boardSoul = function(id) {
     if (owner === $.boardCharacter()) return true;
     if ($.livingPlayerCharacters()[owner]) return false;
     var to = $.soulOwnerMap()[id]; // a dead contestant's soul one player took
+    if ($.coopSetting && $.coopSetting('soulsShared')) return undefined; // (Co-op Settings: everyone's board)
     if (to) return to === $.boardCharacter() ? undefined : false; // (its own: the world's value)
     return undefined;
 };
@@ -4347,6 +4521,7 @@ $.soulGained = function(id, causeId, mapId) {
     if (!contestant || $.livingPlayerCharacters()[contestant]) return; // a player's own pick
     var owners = $.soulOwnerMap();
     if (owners[id]) return;
+    if ($.coopSetting('soulsShared')) return; // (Co-op Settings: everyone's board, nobody is asked)
     var takers = $.soulTakers();
     var cause = takers.filter(function(p) { return p.id === causeId; })[0];
     if (!cause) return; // nobody living did it: every board, as before
@@ -4403,8 +4578,36 @@ Game_Switches.prototype.setValue = function(id, value) {
         !_switchValueSoul.call(this, id);
     _swSetSoul.call(this, id, value);
     if (gain && _switchValueSoul.call(this, id)) {
-        $.soulGained(id, $.soulCauseId || ($.ctx ? $.ctx.guestId : 'host'), $gameMap ? $gameMap.mapId() : 0);
+        $.soulGained(id, $.soulCauseId || ($.ctx ? $.ctx.guestId : $.soulShooter() || 'host'), $gameMap ? $gameMap.mapId() : 0);
     }
+};
+
+// A guest's bullet on the host's map: the map's gun check (arrow_check, a
+// parallel page the host runs as its own) turns the shot down form's soul on
+// (the giant SW499, the Chaugnar SW497, the Mastermind SW500 ...) - the
+// shooter's soul, not the host's (user 2026-11-08: "a guest shooting it?").
+$.soulShooter = function() {
+    var b = $.bullet;
+    if (!$.mapParallelDepth || !b || !b.shooter || b.shooter === 'host' || !$gameMap || b.mapId !== $gameMap.mapId()) return null;
+    return b.shooter;
+};
+
+// The Mastermind shot down on the field (Map080 EV35: SW3804 mastermind1 and
+// CE547 only) gives no soul in the original, unlike the other contestants'
+// forms shot down (Map076 EV101 the giant: SW499, Map084 the monstrosity:
+// SW493, the Chaugnar: SW497, the Judgement: SW738) and unlike its own fight
+// (Map080 EV82: SW500 then SW3804). User 2026-11-07 ("the others give their
+// soul when shot"): in co-op SW3804 coming on brings O'saa's soul (SW500) too,
+// on the PC that runs that world (whose it is: as any soul switch).
+$.MASTERMIND_DEAD_SWITCH = 3804;
+$.OSAA_SOUL_SWITCH = 500;
+var _swSetMastermindSoul = Game_Switches.prototype.setValue;
+Game_Switches.prototype.setValue = function(id, value) {
+    _swSetMastermindSoul.call(this, id, value);
+    if (id !== $.MASTERMIND_DEAD_SWITCH || !value || this !== $gameSwitches || !$.role) return;
+    if (!($.isHost() || ($.isRoaming && $.isRoaming())) || this._data[$.OSAA_SOUL_SWITCH]) return;
+    $.dlog('the Mastermind is dead without its fight - the soul of Osaa (SW500) too');
+    this.setValue($.OSAA_SOUL_SWITCH, true);
 };
 
 $.playerIdOfName = function(name) {
@@ -4426,7 +4629,22 @@ $.hostHandlers.wDelta = function(conn, msg) {
     }
     _wDeltaSoul(conn, msg);
     gains.forEach(function(id) {
-        if (_switchValueSoul.call($gameSwitches, id)) $.soulGained(id, conn.guestId, Number(msg.m) || 0);
+        // (its sub-guest's fight killed it: that guest's - subSoul below)
+        var by = $.subSoulBy[id] && $.subSoulBy[id].sub === conn.guestId ? $.subSoulBy[id].who : conn.guestId;
+        delete $.subSoulBy[id];
+        if (_switchValueSoul.call($gameSwitches, id)) $.soulGained(id, by, Number(msg.m) || 0);
+    });
+};
+
+// A sub-host's guest's own fight killed a contestant (isHost audit 2026-11-10): the
+// sub-host's world turns its switch on and its wDelta came as the sub-host's. The
+// sub-host names the guest first; the host credits that guest when the switch comes.
+$.subSoulBy = {}; // host: soul switch -> { who, sub }
+$.hostHandlers.subSoul = function(conn, msg) {
+    var c = msg && $.clientById(msg.who);
+    if (!c || c.subOf !== conn.guestId) return;
+    (msg.sw || []).forEach(function(id) {
+        if ($.SOUL_ACTOR[id]) $.subSoulBy[id] = { who: c.guestId, sub: conn.guestId };
     });
 };
 
@@ -4436,6 +4654,14 @@ $.hostHandlers.wDelta = function(conn, msg) {
 // is that fight's owner's, as its event's would be.
 var _battleEndSoul = $.hostHandlers.battleEnd;
 $.hostHandlers.battleEnd = function(conn, msg) {
+    if (!$.isHost()) {
+        // a sub-host (its guest's fight, passed on by the host): not its souls to give
+        var subGains = (msg && msg.swd || []).filter(function(d) {
+            return $.SOUL_ACTOR[d[0]] && d[1] && !_switchValueSoul.call($gameSwitches, d[0]);
+        }).map(function(d) { return d[0]; });
+        if (subGains.length && $.conn && conn && conn._sub) $.conn.send({ t: 'subSoul', who: conn.guestId, sw: subGains });
+        return _battleEndSoul(conn, msg);
+    }
     var gains = (msg && msg.swd || []).filter(function(d) {
         return $.SOUL_ACTOR[d[0]] && d[1] && !_switchValueSoul.call($gameSwitches, d[0]);
     }).map(function(d) { return d[0]; });
@@ -6176,8 +6402,13 @@ Game_Interpreter.prototype.command111 = function() {
 $.PERSONAL_FILTERS = ['MOTION2', 'RGB2', 'SATURATION2'];
 $.ZOOM_FIELDS = ['_zoomX', '_zoomY', '_zoomScale', '_zoomXTarget', '_zoomYTarget', '_zoomScaleTarget', '_zoomDuration'];
 
+// (and the coin / soul stone count, FH_CoopWorld $.countHudPicture: a snapshot or a
+// roam start - the whole save of the PC that sent it - carried that PC's count to the
+// guest; one that went on to run another map kept it there for good, nobody there to
+// erase it: the gallery 4p report "the coin picture on another map", 2026-11-10)
 $.personalPicture = function(pic) {
-    return !!pic && !!pic.name && !!$.PERSONAL_PICTURES && !!$.PERSONAL_PICTURES[pic.name()];
+    if (!pic || !pic.name) return false;
+    return (!!$.PERSONAL_PICTURES && !!$.PERSONAL_PICTURES[pic.name()]) || (!!$.privatePicture && $.privatePicture(pic));
 };
 
 $.ownFxState = function() {
@@ -8812,7 +9043,8 @@ $.preDreamRemoteStart = function(starter, why) {
     if (!$.PRE_DREAM_FIRST || !$.isGuest() || !$.isRoaming() || $.preDreamActive()) return null;
     var gid = $.preDreamGid(starter || $.myId) || ($.sleepMine && $.sleepMine.id) || 0;
     var old = $.preHold;
-    if (!starter && old && old.gid === gid && gid) return null; // (that sleep's events were read)
+    // (that sleep's events were read - unless a night ambush called that try off: $.preDreamStale)
+    if (!starter && old && old.gid === gid && gid && !(old.released && old.ambush)) return null;
     var plan = $.preDreamPlan($.preDreamRemoteIds(starter), starter);
     if (!plan) {
         $.preHold = { id: ++$.preHoldSeq, mapId: $gameMap.mapId(), gid: gid, released: true, until: $.clockMs(),
@@ -8828,6 +9060,15 @@ $.preDreamRemoteStart = function(starter, why) {
 };
 
 // to the host: 'held' (waits standing), 'stay' (sleeps no more this time)
+// A hold to read again before a lie-down: none, or one over for another sleep -
+// or one a night ambush called off (its "stays awake" marks were for that try:
+// the same sleep group goes on, and a sub-host's guest marked then was sent back
+// awake at every bed after it - 4p flows S-3 sub-host variant, 2026-11-10).
+$.preDreamStale = function(gid) {
+    var h = $.preHold;
+    return !h || (h.released && (h.gid !== gid || !!h.ambush));
+};
+
 $.preDreamRemoteSay = function(h, id, at) {
     var gid = $.preDreamGid(id) || h.gid;
     if (!$.conn || !gid) return false;
@@ -8855,7 +9096,7 @@ $.preDreamRemoteRelease = function(h) {
 var _sleepNowPre = $.guestHandlers.sleepNow;
 $.guestHandlers.sleepNow = function(msg) {
     if ($.PRE_DREAM_FIRST && $.isRoaming() && !$.pendingRoam) {
-        if (!$.preHold || ($.preHold.released && $.preHold.gid !== $.preDreamGid($.myId))) {
+        if ($.preDreamStale($.preDreamGid($.myId))) {
             $.preDreamRemoteStart($.preDreamBedStarter() || ($.sleepBedAsk ? $.myId : null), 'a lie-down from the host');
         }
         if ($.preDreamBlocks($.myId)) {
@@ -8875,7 +9116,7 @@ $.guestHandlers.sleepNow = function(msg) {
 var _startSubSleepPre = $.startSubSleep;
 $.startSubSleep = function(c, meta) {
     if (!$.PRE_DREAM_FIRST || !c || !c._sub || !$.subHosting()) return _startSubSleepPre(c, meta);
-    if (!$.preHold || ($.preHold.released && $.preHold.gid !== (meta && meta.groupId))) {
+    if ($.preDreamStale(meta && meta.groupId)) {
         $.preDreamRemoteStart($.preDreamBedStarter() || ($.subBedAsk && $.subBedAsk[c.guestId] ? c.guestId : null),
             'a lie-down from the host');
     }
@@ -9510,7 +9751,20 @@ $.RHER_SOUL_SWITCH = { 1: 494, 3: 495, 5: 497, 6: 500, 13: 499, 14: 498, 15: 493
 $.RHER_FALLBACK_FORM = { name: 'Moonscorched', troop: 27, live: ['$moonscorched1', 0, 2, 1], dead: ['$moonscorched1', 0, 2, 0], speed: 3 };
 $.RHER_EVENT_BASE = 9000;   // event ids of the forms: far above any map's own
 
-$.rherForm = function(actorId) {
+// The tower's (the one the others went on without, FH_CoopRoam "comes back
+// moonscorched"): as the original tower scene (Map111 EV617 p1) - Daan there
+// is no talk but the Pocketcat fight (troop 124 Pocketcat2, its win: SW496
+// doctor_SOUL, SW4808 pocketcat_sq, SW2821 Pocketcat1), with the museum's
+// moonscorched Daan look (Map084 EV108: $pocketcat2_5, killed $pocketcat2_2)
+// and its "Blank soul" box (EV108 p3: Aura1 6). User 2026-11-06.
+$.RHER_TOWER_FORMS = {
+    4: { name: 'Pocketcat', troop: 124, live: ['$pocketcat2_5', 0, 2, 1], dead: ['$pocketcat2_2', 0, 2, 1], speed: 3,
+        kill: [4808, 2821], soul: ['Aura1', 6, 'Blank'] }
+};
+$.RHER_SOUL_SWITCH[4] = 496; // doctor_SOUL (only the tower's Pocketcat is fought)
+
+$.rherForm = function(actorId, rec) {
+    if (rec && rec.tower && $.RHER_TOWER_FORMS[actorId]) return $.RHER_TOWER_FORMS[actorId];
     return $.RHER_FORMS[actorId] || $.RHER_FALLBACK_FORM;
 };
 
@@ -9801,14 +10055,16 @@ Scene_Title.prototype.start = function() {
 // the world is a snapshot's).
 $.rherLastOn = undefined;
 $.worldExtras.push(function() {
-    if (!$.isHost() || Graphics.frameCount % 10 !== 0) return;
+    if (!$.runsWorld() || Graphics.frameCount % 10 !== 0) return;
     var on = $gameVariables.value($.RHER_ACTIVE_VAR);
-    if (on !== $.rherLastOn) {
+    if ($.isHost() && on !== $.rherLastOn) {
         $.rherLastOn = on;
         $.clients.forEach(function(c) { c.send({ t: 'rherOn', v: on }); });
     }
+    // (a sub-host's guests: their own SW202 is on the sub-host, which tells them -
+    // isHost audit 2026-11-10)
     $.clients.forEach(function(c) {
-        if (c._sub || c.roam || !c.actorId) return;
+        if (c.roam || c.subOf || !c.actorId || ($.isHost() && c._sub)) return;
         var hold = !!$.ctxOwnOf(c)[$.RHER_HOLD_SWITCH];
         if (hold === !!c._fhRherHold) return;
         c._fhRherHold = hold;
@@ -10365,14 +10621,15 @@ $.rherNewId = function(m) {
     return top + 1;
 };
 
-$.rherSpawn = function(id, actorId, spot) {
+$.rherSpawn = function(id, actorId, spot, who, opts) {
     var data = $.rherData();
-    var form = $.rherForm(actorId);
+    var form = $.rherForm(actorId, opts);
     data.n = (data.n || 0) + 1;
     var rec = {
-        n: data.n, id: $.rherNewId(spot.m), a: actorId, who: $.nameOf(id) || '#host',
+        n: data.n, id: $.rherNewId(spot.m), a: actorId, who: who || $.nameOf(id) || '#host',
         kind: form.npc ? 'npc' : 'boss', m: spot.m, x: spot.x, y: spot.y, dead: false, first: null
     };
+    if (opts && opts.tower) rec.tower = true;
     data.list.push(rec);
     $.rherFreshId(rec.m, rec.id);
     $.dlog('Eye of Rher:', $.playerLabel(id), 'is now', form.name, '- event', rec.id, 'on map', rec.m, rec.x, rec.y);
@@ -10471,7 +10728,7 @@ $.rherChaseRoute = function() {
 };
 
 $.rherEventData = function(rec) {
-    var form = $.rherForm(rec.a);
+    var form = $.rherForm(rec.a, rec);
     var pages;
     if (rec.kind === 'npc') {
         // the museum's Pocketcat (Daan) as it is (it stands; play test
@@ -10523,11 +10780,11 @@ $.rherCatPage = function() {
 // Touching it starts the battle instead.
 $.RHER_MASTERMIND_RANGE = 4;
 $.RHER_MASTERMIND_ANIM_MS = [167, 1000]; // (10 and 60 frames at 60 fps, $.clockMs)
-$.RHER_MASTERMIND_HIT_MS = 1500;         // 90 frames
-// CE420's waits and the cooldown page are about a second; standing in its
-// sight that took all four limbs in eight seconds (0.41 play test: "far too
-// fast"), so a hit is followed by a longer rest here
-$.RHER_MASTERMIND_COOL_MS = 4000;
+$.RHER_MASTERMIND_HIT_MS = 1833;         // 90 frames to CE420, its 20-frame wait, then the cut (110)
+// CE420's waits and the cooldown page are about a second: the original's
+// pace (user 2026-11-06: "follow the original" - the 4 s rest of the 0.41
+// play test's "far too fast" is gone; the original Mastermind is as fast)
+$.RHER_MASTERMIND_COOL_MS = 1000;
 
 // A screen command on that player's own screen (its PC draws it).
 $.rherMastermindCmd = function(target, code, params) {
@@ -10859,7 +11116,7 @@ $.rherKilled = function(n, by) {
     var taker = rec.first && !dead[rec.first] ? rec.first : ($.nameOf(by) || rec.first);
     var bag = $.rherTakeBelongings(rec);
     var who = $dataActors[rec.a] ? $dataActors[rec.a].name : 'the dead';
-    var form = $.rherForm(rec.a);
+    var form = $.rherForm(rec.a, rec);
     $.dlog('Eye of Rher: form', n, 'killed by', $.playerLabel(by), '- the belongings go to', taker);
     if (taker) $.rherOwe(taker, bag, who);
     $.rherBroadcast();
@@ -10880,13 +11137,124 @@ $.rherKilled = function(n, by) {
     }
 };
 
+// Field guns on a form (user request 2026-11-07): a bullet (FH_CoopWorld
+// "Field guns") reaching a form's event hurts it as the original's
+// arrow_check hurts that enemy: a rifle +2 (with Marksmanship 1 in 4 at once,
+// where the original has it), a shotgun +3, a pistol +1; at its count or
+// more the next shot brings it down (the original's checks: Big boy 10,
+// Giant 10, Mastermind 8, Judgement/Mechanical dance 14, Moonscorched 3).
+// Weeping scope, Cocoon and Valkyrie are never shot in the original: counts
+// of our own. The tower's Pocketcat is not shot (user 2026-11-07: an NPC -
+// no count, the bullet goes by). Brought down = killed in a fight ($.rherKilled:
+// the belongings, the soul, the switches); no Eye of Rher reset (the
+// original's shot down has no CE547 either).
+$.RHER_SHOT_HP = {
+    'Chaugnar': 10, 'Giant': 10, 'Mastermind': 8, 'Mechanical dance': 14, 'Moonscorched': 3,
+    'Weeping scope': 10, 'Cocoon': 8, 'Valkyrie': 10
+};
+$.RHER_SHOT_CRIT = { 'Chaugnar': true, 'Mastermind': true, 'Moonscorched': true };
+$.RHER_SHOT_DAMAGE = { rifle: 2, shotgun: 3, pistol: 1 };
+$.RHER_SHOT_ANIM = 18;
+
+$.rherShotCheck = function() {
+    var b = $.bullet;
+    if (!b) return;
+    if (b.mapId !== $gameMap.mapId() || !$.BULLET_SWITCHES.some(function(id) { return $gameSwitches.value(id); })) {
+        if (!$.runsWorld()) $.bullet = null; // (the host's: the players' check above ends it)
+        return;
+    }
+    var ev = $gameMap.event(b.eventId);
+    if (!ev) return;
+    var rec = $.rherList().filter(function(r) {
+        var e = r.m === b.mapId && r.kind === 'boss' && !r.dead && $.RHER_SHOT_HP[$.rherForm(r.a, r).name] ?
+            $gameMap.event(r.id) : null;
+        return e && e.x === ev.x && e.y === ev.y;
+    })[0];
+    if (!rec) return;
+    $.bullet = null;
+    $.BULLET_SWITCHES.forEach(function(id) { $gameSwitches.setValue(id, false); });
+    var crit = b.gun === 'rifle' && !!b.marks && Math.randomInt(4) === 0;
+    var target = $gameMap.event(rec.id);
+    if (target) target.requestAnimation($.RHER_SHOT_ANIM);
+    if ($.isHost()) $.rherShot(rec.n, b.shooter, b.gun, crit);
+    else if ($.conn) {
+        // (a sub-host's guest shot it: the host credits that guest - isHost audit 2026-11-10)
+        var by = $.subHosting() && b.shooter && b.shooter !== 'host' ? b.shooter : undefined;
+        $.conn.send({ t: 'rherShot', n: rec.n, gun: b.gun, crit: crit, by: by });
+    }
+};
+$.worldExtras.push($.rherShotCheck);
+
+// A guest alone on the map it runs: FH_CoopWorld keeps no bullet there (its
+// world extras run only with guests of its own); its own shot, here.
+$.rherLoneRoamer = function() {
+    return $.role && $.isGuest() && $.isRoaming() && !($.runsWorld() && $.clients.length);
+};
+
+var _swSetRherShot = Game_Switches.prototype.setValue;
+Game_Switches.prototype.setValue = function(id, value) {
+    if (value && this === $gameSwitches && $.BULLET_SWITCHES.indexOf(id) >= 0 && !this._data[id] && $.lastLocated &&
+            $.rherLoneRoamer()) {
+        $.bullet = {
+            eventId: $.lastLocated, shooter: 'host', // (its gun: the EQUIPPED switches, RIFLE / SHOTGUN)
+            gun: this._data[2252] ? 'rifle' : this._data[2253] ? 'shotgun' : 'pistol',
+            x0: $gamePlayer.x, y0: $gamePlayer.y, mapId: $gameMap.mapId(), marks: !!this._data[731]
+        };
+    }
+    _swSetRherShot.call(this, id, value);
+};
+
+var _sceneMapUpdateRherShot = Scene_Map.prototype.update;
+Scene_Map.prototype.update = function() {
+    _sceneMapUpdateRherShot.call(this);
+    if ($.bullet && $.rherLoneRoamer()) $.rherShotCheck();
+};
+
+$.hostHandlers.rherShot = function(conn, msg) {
+    var gun = $.RHER_SHOT_DAMAGE[msg.gun] ? msg.gun : 'pistol';
+    var sub = msg.by && $.clientById(msg.by);
+    var by = sub && sub.subOf === conn.guestId ? sub.guestId : conn.guestId; // (only its own sub-guest)
+    $.rherShot(Number(msg.n), by, gun, !!msg.crit, true);
+};
+
+// (host) a shot of that player at form n; mine: its PC played the animation
+$.rherShot = function(n, by, gun, crit, theirs) {
+    var rec = $.rherRecordN(n);
+    if (!rec || rec.dead || rec.kind !== 'boss') return;
+    var form = $.rherForm(rec.a, rec);
+    var hp = $.RHER_SHOT_HP[form.name];
+    if (!hp) return;
+    var down = (rec.shot || 0) >= hp || (crit && !!$.RHER_SHOT_CRIT[form.name]);
+    // the guests on the host's map see it hit (the shooter's PC if it did not)
+    if (rec.m === $gameMap.mapId()) {
+        $.activeGuests().forEach(function(c) {
+            if ((theirs && c.guestId === by) || !$.guestOnMap(c)) return;
+            c.send({ t: 'cmd', c: 212, p: [rec.id, $.RHER_SHOT_ANIM, false] });
+        });
+    }
+    if (!down) {
+        rec.shot = (rec.shot || 0) + ($.RHER_SHOT_DAMAGE[gun] || 1);
+        $.dlog('Eye of Rher: form', n, 'shot by', $.playerLabel(by), gun, '-', rec.shot, 'of', hp);
+        $.gunGab(by, 'You shoot the ' + form.name + '!');
+        $.rherBroadcast();
+        return;
+    }
+    $.dlog('Eye of Rher: form', n, 'shot down by', $.playerLabel(by), gun, crit ? '(at once)' : '');
+    $.gunGab(by, 'The ' + form.name + ' is shot down!');
+    // (the original's soul line, to the shooter when its belongings go to it -
+    // the one who fought it first takes them, as in $.rherKilled)
+    var first = rec.first && !$.coopDead()[rec.first] ? rec.first : null;
+    $.rherKilled(n, by);
+    if (form.soul && (!first || first === $.nameOf(by))) $.gunGab(by, 'You absorbed the \\c[2]' + form.soul[2] + ' soul\\c[0].');
+};
+
 // User decision (2026-10-23): killing a player's form is killing that
 // character's moonscorched self. The world gets what the original's win over
 // that form gives (RHER_FORMS kill / v: the body pages of its own map, the
 // temple square, the ending maps), and its SOUL and <name>1 if still off.
 // CHARACTERS_LEFT is not taken again: the player's death did that.
 $.rherKillSwitches = function(rec) {
-    var form = $.rherForm(rec.a);
+    var form = $.rherForm(rec.a, rec);
     var on = [];
     (form.kill || []).concat([$.RHER_SOUL_SWITCH[rec.a], $.DEATH_SWITCH && $.DEATH_SWITCH[rec.a]]).forEach(function(id) {
         if (!id || $gameSwitches.value(id)) return;
@@ -11567,7 +11935,7 @@ $.fxPerPlayer = function(page) {
 $.fxNewChain = function(eventId, pageIndex, who, page) {
     var n = ++$.fxChainSeq, id = $.fxMe() + '#' + $.fxRunTag + '.' + n;
     $.fxChains[id] = { id: id, n: n, m: $gameMap.mapId(), e: eventId, p: pageIndex, who: who,
-        before: {}, items: [], gold: 0, itemWho: '', dirty: '', fights: 0, at: $.clockMs(), root: null };
+        before: {}, items: [], gold: 0, itemWho: '', dirty: '', fights: 0, at: $.clockMs(), root: null, evPos: {} };
     if (page && $.pageNeedsConsent(page.list || [])) $.fxChains[id].dirty = 'a bed (sleep, the day)';
     $.fxChainOrder.push(id);
     if ($.fxChainOrder.length > $.FX_CHAIN_KEEP) delete $.fxChains[$.fxChainOrder.shift()];
@@ -11633,6 +12001,26 @@ $.fxNote = function(key, before) {
     if (key === 'sw:' + $.FX_SLEEP_SWITCH) ch.dirty = ch.dirty || 'a bed (sleep, the day)';
     ch.at = $.clockMs();
     $.fxKeyChain[key] = ch.id;
+};
+
+// An event a scene moves with Set Event Location (user 2026-11-07: the altar
+// of the new gods, Map051 EV297 moves the god's figure EV474 onto the circle
+// before the Heartless one's fight - lost and rolled back, it stayed there, "a
+// spotlight sunk in the floor"): where it stood before, put back with the rest.
+$.fxNotePos = function(ev) {
+    if ($.fxQuiet || !ev) return;
+    var top = $.fxStack[$.fxStack.length - 1];
+    if (!top || top._fhGeneric || top._fhTroop) return;
+    var ch = $.fxCurChain();
+    if (!ch) return;
+    ch.evPos = ch.evPos || {};
+    if (!ch.evPos[ev.eventId()]) ch.evPos[ev.eventId()] = { x: ev.x, y: ev.y, d: ev.direction() };
+};
+
+var _command203Fx = Game_Interpreter.prototype.command203;
+Game_Interpreter.prototype.command203 = function() {
+    if ($.fxWorldPc() && $gameMap) $.fxNotePos(this.character(this._params[0]));
+    return _command203Fx.call(this);
 };
 
 $.fxNoteThing = function(ch, entry, gold) {
@@ -11773,7 +12161,7 @@ $.fxSnapshot = function(ch) {
     var after = {};
     Object.keys(ch.before).forEach(function(k) { after[k] = $.fxRaw(k); });
     return { m: ch.m, e: ch.e, p: ch.p, keys: Object.assign({}, ch.before), after: after, items: ch.items.slice(),
-        gold: ch.gold, who: ch.itemWho };
+        gold: ch.gold, who: ch.itemWho, pos: Object.assign({}, ch.evPos || {}) };
 };
 
 // The rollback of one key now: only what this scene changed. A variable
@@ -11905,6 +12293,12 @@ $.fxRollback = function(fx) {
         keys.forEach(function(k) { $.fxSetKey(k, target[k]); });
         rb.items.forEach(function(it) { $.fxGiveBack(it); });
         if (rb.gold) $.fxGoldBack(-rb.gold);
+        Object.keys(rb.pos || {}).forEach(function(id) {
+            var ev = $gameMap.event(Number(id)), at = rb.pos[id];
+            if (!ev) return;
+            ev.locate(at.x, at.y);
+            ev.setDirection(at.d);
+        });
     } finally {
         $.fxQuiet = false;
     }
@@ -12616,7 +13010,7 @@ $.ENDING_WATCH_MAPS = { 119: true, 120: true, 146: true, 154: true, 163: true, 1
 $.ENDING_MAPS = Object.assign({ 162: true, 143: true }, $.ENDING_WATCH_MAPS);
 $.TOWER_GHOST_TEXT = 'Only the living may pass.';
 $.TOWER_OPEN_SWITCH = 4188; // Map111 EV62 p7 (the opened door's step)
-// A dead host at the opened door (it cannot watch: user decision 2026-10-30)
+// A dead host at the opened door with no winner's ending to watch
 $.TOWER_HOST_TEXT = 'O, you don\'t have the right.';
 
 // (FH_CoopBattle ghostTryDoor; the tower's line once a second)
@@ -12628,7 +13022,9 @@ $.ghostDoorBarred = function(ev) {
             // a dead guest at the opened door: the host lets it watch (or says no)
             var open = $gameSwitches.value($.TOWER_OPEN_SWITCH);
             if ($.isGuest() && $.conn && open) $.conn.send({ t: 'endingWatch' });
-            else $.fieldGab($.isHost() && open ? $.TOWER_HOST_TEXT : $.TOWER_GHOST_TEXT);
+            else if (!($.isHost() && open && $.hostWatchStart())) {
+                $.fieldGab($.isHost() && open ? $.TOWER_HOST_TEXT : $.TOWER_GHOST_TEXT);
+            }
         }
         return 'the tower is for the living';
     }
@@ -12719,8 +13115,8 @@ $.hostHandlers.endingOver = function(conn) {
 // new map's snapshot once it is set up. The ending's last game over ends the
 // session as before (everyone to the title). A watcher goes back to the
 // host's world when the winner's PC refuses it (in a transfer or a fight),
-// gives it back, or drops. A dead host runs the world: it cannot be a guest
-// of another PC, and stays out (plan A, "Only the living may pass.").
+// gives it back, or drops. A dead host runs the world and cannot be a guest
+// of another PC: it is sent the winner's screen ($.hostWatchStart).
 $.ENDING_WATCH_FIGHT_TEXT = ' is in a fight. Come back after it.';
 $.ENDING_WATCH_RETRY_TEXT = 'Not now. Try again.';
 
@@ -12791,15 +13187,187 @@ $.onGuestClosed = function(conn) {
     var back = $.clients.filter(function(c) { return c !== conn && $.isWatcherOf(c, conn); });
     back.forEach(function(c) { c.subOf = null; }); // (not given a map of its own below)
     _onGuestClosedWatch(conn);
+    // (not when its leaving ended the session's game: the watchers went to
+    // the lobby, a snapshot now took them back into it - review 2026-11-06)
     back.forEach(function(c) {
-        if ($.clients.indexOf(c) >= 0) $.watchBack(c, conn.name + ' is gone');
+        if ($.clients.indexOf(c) >= 0 && $.hostInGame) $.watchBack(c, conn.name + ' is gone');
     });
 };
 
 var _resetRoamsWatch = $.resetRoams;
 $.resetRoams = function() {
+    if ($.hostWatch) $.hostWatchStop('the session game is over');
     $.clients.forEach(function(c) { c._watchOf = null; });
     _resetRoamsWatch();
+};
+
+// A dead host watches too (user 2026-11-10, reversing 2026-10-30): the winner's
+// world cannot come here as it does for a ghost guest, because this PC runs the
+// session's world and passes everyone's messages. The winner's PC sends what its
+// screen shows instead, one picture each time the host asks for the next, so a
+// slow line only lowers the rate. Nothing of the world changes here.
+$.EW_FRAMES = 15;      // at most 4 pictures a second
+$.EW_WIDTH = 600;
+$.EW_QUALITY = 0.6;
+$.EW_HINT = 'Esc: stop watching';
+// The picture covers the game, so no key may act behind it (F9 would open the
+// load screen unseen). These three belong to the window: F4, F5, F12.
+$.EW_WINDOW_KEYS = { 115: 1, 116: 1, 123: 1 };
+$.hostWatch = null;    // host: { from, img, hint, onKey, au }
+
+$.hostWatchStart = function() {
+    if ($.hostWatch) return true;
+    if (!$.isHost() || !$.isDead('host') || typeof document === 'undefined') return false;
+    var w = $.endingWinnerConn();
+    if (!w) return false;
+    var img = document.createElement('img');
+    img.id = 'fhcoop-endwatch';
+    img.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;object-fit:contain;background:#000;z-index:101;';
+    var hint = document.createElement('div');
+    hint.id = 'fhcoop-endwatch-hint';
+    hint.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:102;color:#ccc;font:14px sans-serif;';
+    hint.textContent = $.ko($.EW_HINT);
+    document.body.appendChild(img);
+    document.body.appendChild(hint);
+    var onKey = function(e) {
+        if ($.EW_WINDOW_KEYS[e.keyCode]) return;
+        e.stopPropagation();
+        e.preventDefault();
+        if (e.keyCode === 27 || e.keyCode === 88) $.hostWatchStop('closed');
+    };
+    document.addEventListener('keydown', onKey, true);
+    $.hostWatch = { from: w.guestId, img: img, hint: hint, onKey: onKey, au: $.audioInfo() };
+    w.send({ t: 'ewAsk', on: true });
+    $.dlog('ending watch: the dead host watches', w.name);
+    return true;
+};
+
+$.hostWatchStop = function(why) {
+    var h = $.hostWatch;
+    if (!h) return;
+    $.hostWatch = null;
+    document.removeEventListener('keydown', h.onKey, true);
+    [h.img, h.hint].forEach(function(el) { if (el.parentNode) el.parentNode.removeChild(el); });
+    var c = $.clientById(h.from);
+    if (c) c.send({ t: 'ewAsk', on: false });
+    $.applyAudio(h.au);
+    $.dlog('ending watch: the host stops watching (' + why + ')');
+};
+
+$.hostHandlers.ewShot = function(conn, msg) {
+    var h = $.hostWatch;
+    if (!h || !msg || h.from !== conn.guestId) return;
+    if (msg.img) h.img.src = msg.img;
+    if (msg.au) $.applyAudio(msg.au);
+    conn.send({ t: 'ewAsk', on: true });
+};
+
+var _canMoveHostWatch = Game_Player.prototype.canMove;
+Game_Player.prototype.canMove = function() {
+    if ($.hostWatch && this === ($.realPlayer || $gamePlayer)) return false; // (not a guest's stand-in)
+    return _canMoveHostWatch.call(this);
+};
+
+// No menu behind the picture: a pad's menu button or a right click closes it.
+var _updateCallMenuHostWatch = Scene_Map.prototype.updateCallMenu;
+Scene_Map.prototype.updateCallMenu = function() {
+    if (!$.hostWatch) return _updateCallMenuHostWatch.call(this);
+    if (this.isMenuCalled()) $.hostWatchStop('closed');
+};
+
+var _endingOverHostWatch = $.endingOver;
+$.endingOver = function(by) {
+    $.hostWatchStop('the ending is over');
+    _endingOverHostWatch(by);
+};
+
+var _onGuestClosedHostWatch = $.onGuestClosed;
+$.onGuestClosed = function(conn) {
+    if ($.hostWatch && $.hostWatch.from === conn.guestId) $.hostWatchStop(conn.name + ' is gone');
+    _onGuestClosedHostWatch(conn);
+};
+
+// The winner's PC: the next picture, after the host asked for it.
+$.ewWant = false;
+$.ewAt = 0;
+$.ewAu = '';
+
+$.guestHandlers.ewAsk = function(msg) {
+    $.ewWant = !!(msg && msg.on);
+    if (!$.ewWant) $.ewAu = '';
+};
+
+$.ewCapture = function() {
+    var snap = Bitmap.snap(SceneManager._scene);
+    var out = document.createElement('canvas');
+    out.width = $.EW_WIDTH;
+    out.height = Math.round($.EW_WIDTH * snap.height / snap.width);
+    var ctx = out.getContext('2d');
+    ctx.drawImage(snap.canvas, 0, 0, out.width, out.height);
+    // (a movie plays in its own element over the game: Map146's moon scene)
+    if (Graphics.isVideoPlaying()) ctx.drawImage(Graphics._video, 0, 0, out.width, out.height);
+    return out.toDataURL('image/jpeg', $.EW_QUALITY);
+};
+
+$.ewShotFrame = function() {
+    if (!$.ewWant || !$.conn || !SceneManager._scene || Graphics.frameCount - $.ewAt < $.EW_FRAMES) return;
+    $.ewWant = false; // (the next one when this one has arrived)
+    $.ewAt = Graphics.frameCount;
+    var msg = { t: 'ewShot' };
+    try {
+        msg.img = $.ewCapture();
+    } catch (e) {
+        $.dlog('ending watch: no picture', String(e && e.message || e)); // (the host asks again)
+    }
+    var au = JSON.stringify($.audioInfo());
+    if (au !== $.ewAu) {
+        $.ewAu = au;
+        msg.au = $.audioInfo();
+    }
+    $.conn.send(msg);
+};
+
+var _renderSceneEw = SceneManager.renderScene;
+SceneManager.renderScene = function() {
+    _renderSceneEw.call(this);
+    if ($.ewWant && this.isCurrentSceneStarted()) $.ewShotFrame(); // (a scene still loading has no picture)
+};
+
+// A map a guest runs (roaming, or a sub-host): the field NPC of every other
+// player's character is hidden there too, as on the host's map (FH_Coop
+// $.hideTakenNpc). It was not: on its own map a guest met the NPC of the host's
+// or a friend's character (isHost audit 2026-11-10, user: "why leave it?").
+// The players: the session roster; its own character is the original's to handle.
+$.ROAM_NPC_FRAMES = 30;
+$.roamNpcKey = '';
+$.roamNpcFor = null;
+$.roamTakenPrep = function() {
+    var keys = [], sels = [];
+    ($.roster || []).forEach(function(r) {
+        var a = Number(r && r.a);
+        if (!a || a === $.myActorId || !$dataActors[a]) return;
+        keys.push($dataActors[a].characterName.replace(/^[!$%]+/, '').replace(/\d+$/, ''));
+        if ($.SELECT_OF_ACTOR[a]) sels.push($.SELECT_OF_ACTOR[a]);
+    });
+    $.takenSelects = sels;
+    return keys.length ? new RegExp('^[!$%]*(' + keys.join('|') + ')(\\d|_|$)') : null;
+};
+$.hideRoamNpcs = function() {
+    if (!$.isGuest() || !$.isRoaming() || !$gameMap || !$gameMap.mapId() || $.ctx) return;
+    if (Graphics.frameCount % $.ROAM_NPC_FRAMES !== 0) return;
+    var re = $.roamTakenPrep();
+    if (!re) return;
+    $gameMap.events().forEach(function(ev) { $.hideTakenNpc(ev, re); });
+    var key = re.source + '/' + $gameMap.mapId();
+    if (key !== $.roamNpcKey) {
+        $.roamNpcKey = key;
+        $.dlog('this map: the other players\' characters as NPCs hidden (' + re.source + ')');
+    }
+};
+var _sceneMapUpdateRoamNpc = Scene_Map.prototype.update;
+Scene_Map.prototype.update = function() {
+    _sceneMapUpdateRoamNpc.call(this);
+    $.hideRoamNpcs();
 };
 
 // The winner's PC ---------------------------------------------------------------
@@ -12996,17 +13564,32 @@ $.actorOfName = function(name) {
 // runs, else the host; a roaming guest's world: below).
 var _swSetInherit = Game_Switches.prototype.setValue;
 Game_Switches.prototype.setValue = function(id, value) {
-    var opens = id === $.INHERIT_SWITCH && !!value && this === $gameSwitches && $.isHost() && !this._data[id];
+    var opening = id === $.INHERIT_SWITCH && !!value && this === $gameSwitches && !this._data[id];
+    var opens = opening && $.isHost();
     _swSetInherit.call(this, id, value);
     if (opens && this._data[id]) $.coopData().doorBy = $.ctx && $.ctx.name ? $.ctx.name : $.nameOf('host');
+    // a sub-host: its guest's event opened it - the host hears whose before its
+    // world delta (that came as the sub-host's own: isHost audit 2026-11-10)
+    if (opening && !$.isHost() && $.subHosting() && $.ctx && $.ctx._sub && $.conn && this._data[id]) {
+        $.conn.send({ t: 'subDoorBy', who: $.ctx.guestId });
+    }
+};
+
+$.subDoorBy = null; // host: { who: name, sub: the sub-host's id }
+$.hostHandlers.subDoorBy = function(conn, msg) {
+    var c = msg && $.clientById(msg.who);
+    if (!c || c.subOf !== conn.guestId || !c.name) return; // (only a sub-host for its own guest)
+    $.subDoorBy = { who: c.name, sub: conn.guestId };
 };
 
 var _wDeltaInherit = $.hostHandlers.wDelta;
 $.hostHandlers.wDelta = function(conn, msg) {
     var opens = !!conn && !!conn.name && !!msg && !!msg.sw && !!msg.sw[$.INHERIT_SWITCH] &&
         !$gameSwitches._data[$.INHERIT_SWITCH];
+    var sub = $.subDoorBy && conn && $.subDoorBy.sub === conn.guestId ? $.subDoorBy.who : '';
+    if (opens) $.subDoorBy = null;
     _wDeltaInherit(conn, msg);
-    if (opens && $gameSwitches._data[$.INHERIT_SWITCH]) $.coopData().doorBy = conn.name;
+    if (opens && $gameSwitches._data[$.INHERIT_SWITCH]) $.coopData().doorBy = sub || conn.name;
 };
 
 // A dead player's bag and gear, emptied into gift.
@@ -16062,7 +16645,15 @@ $.priestCross = null; // this PC's player on the cross: { list, ev }
 // guest's own), or null (another PC's: the original goes on).
 $.priestPlayerOf = function(actor) {
     if (!actor || !$.runsOwnMap()) return null;
-    if (!$.isHost()) return actor === $.ownActor() ? 'self' : null;
+    if (!$.isHost()) {
+        if (actor === $.ownActor()) return 'self';
+        // a sub-host: its guest on its map, as the host's thin guest (isHost audit
+        // 2026-11-10: the toss lost by a sub-host's guest ran the original page in the
+        // sub-host's world); its scene runs as that guest's here (priestStartScenes)
+        if (!$.subHosting()) return null;
+        var sub = $.clients.filter(function(c) { return c._sub && c.actorId === actor.actorId(); })[0];
+        return sub && $.guestOnMap(sub) ? sub.guestId : null;
+    }
     var id = $.playerOfActor(actor.actorId());
     if (id === 'host') return id;
     var conn = id ? $.clientById(id) : null;
@@ -16855,6 +17446,54 @@ var _sceneBaseUpdateMinimap = Scene_Base.prototype.update;
 Scene_Base.prototype.update = function() {
     _sceneBaseUpdateMinimap.call(this);
     if ($.role && window.Imported && Imported.TM_Minimap && Graphics.frameCount % $.MM_HUD_FRAMES === 0) $.mmPlaceHud();
+};
+
+// ---- (1b) not over a choice list (user 2026-11-07: "the minimap sometimes
+// cuts the choices off - can it close while a menu is open"): while the message
+// asks for a choice, a number or an item, its window and its corner canvas are
+// not shown. Its own update shows them again every frame, so this hides them
+// after it, for that frame; the canvas draws again once it is not hidden
+// ($.mmPatchScreen). Alone too.
+// Off for the last stretch of an ending (user 2026-11-10: nothing left to look
+// up there): ending A from the Sylvian cavalry's tunnel (Map137) on, B / C inside
+// the hollow tower. Each PC by the map it is on.
+$.MM_OFF_MAPS = Object.assign({ 137: true, 139: true, 136: true, 140: true }, $.ENDING_MAPS);
+$.mmOffHere = function() {
+    return typeof $gameMap !== 'undefined' && !!$gameMap && !!$.MM_OFF_MAPS[$gameMap.mapId()];
+};
+
+$.mmMenuOpen = function() {
+    if ($.mmOffHere()) return true;
+    if ($.mmHexenOpen()) return true;
+    if (typeof $gameMessage === 'undefined' || !$gameMessage) return false;
+    return $gameMessage.isChoice() || $gameMessage.isNumberInput() || $gameMessage.isItemChoice();
+};
+
+// The Hexen's skill pages (user 2026-11-08, "spice forge too"): standing on a
+// skill shows its page, picture hexen_<skill> over the right half - the
+// minimap's place. Not while one is shown.
+$.mmHexenOpen = function() {
+    var list = typeof $gameScreen !== 'undefined' && $gameScreen && $gameScreen._pictures;
+    if (!list) return false;
+    for (var i = 0; i < list.length; i++) {
+        var p = list[i];
+        if (p && p.opacity() > 0 && /^hexen_/.test(p.name())) return true;
+    }
+    return false;
+};
+
+$.mmHideForMenu = function(scene) {
+    var win = scene && scene._fhMinimap;
+    if (!win || !window.FH || !FH.Minimap || !$.mmMenuOpen()) return false;
+    win.visible = false;
+    if (typeof FH.Minimap.hideScreen === 'function') FH.Minimap.hideScreen();
+    return true;
+};
+
+var _sceneMapUpdateMmMenu = Scene_Map.prototype.update;
+Scene_Map.prototype.update = function() {
+    _sceneMapUpdateMmMenu.call(this);
+    $.mmHideForMenu(this);
 };
 
 // ---- (2) one explored map for everyone
@@ -17796,9 +18435,11 @@ Game_Event.prototype.checkEventTriggerAuto = function() {
 
 // Host: a thin guest with no limbs left
 $.disabledGuests = function() {
-    if (!$.isHost() || $.ctx || !$gameMap || Graphics.frameCount % 10 !== 0) return;
+    if (!$.runsWorld() || $.ctx || !$gameMap || Graphics.frameCount % 10 !== 0) return;
     $.clients.forEach(function(c) {
-        if (!c.inGame || !c.actorId || c.solo || c.roam || c.roamPending || c.subOf || $.isDown(c.guestId)) return;
+        // (a sub-host: its own guests - isHost audit 2026-11-10)
+        if ($.subHosting() && !c._sub) return;
+        if ((!c.inGame && !c._sub) || !c.actorId || c.solo || c.roam || c.roamPending || c.subOf || $.isDown(c.guestId)) return;
         if (!$.limbless(c.actorId)) return;
         var own = c._fhCtxSw = c._fhCtxSw || {};
         if (!own[$.DISABLED_SWITCH]) {
@@ -17825,6 +18466,1244 @@ Game_Player.prototype.canMove = function() {
 };
 
 //=============================================================================
+// The duels hold: no step, no time (user 2026-11-06)
+//=============================================================================
+// A duelist whose turn came walked off the tower map and the bracket waited
+// for it for ever (review 2026-11-06). User: "못 움직이고, 시간도 동결시켜서
+// 다른 거 안 줄어들게" - from the tournament's start scene to its end, every
+// living player in it stays where it is, and its time stands still: its
+// hunger common events wait, its mind (MP) does not go down, its Eye of Rher
+// timer (hard mode, "레르빔 제한시간도 멈춰야 함") waits. One who lost is a
+// ghost: free. The host tells every PC when the duels are over or gone (a
+// load); a player back in the middle of them is told too.
+$.tourneyHold = null; // every PC: { ids } while the duels last
+
+$.tourneyHoldMe = function() {
+    var h = $.tourneyHold;
+    if (!h || !$.role || h.ids.indexOf($.myPlayerId()) < 0) return false;
+    return !($.isGhostMe && $.isGhostMe()) && !($.isDownMe && $.isDownMe());
+};
+
+var _tourneyIntroHold = $.guestHandlers.tourneyIntro;
+$.guestHandlers.tourneyIntro = function(msg) {
+    $.tourneyHold = { ids: (msg.ids || []).slice() };
+    $.dlog('the duels hold: no step, no time until they are over');
+    return _tourneyIntroHold(msg);
+};
+
+$.guestHandlers.tourneyHold = function(msg) {
+    $.tourneyHold = msg.on ? { ids: (msg.ids || []).slice() } : null;
+    if (!msg.on) $.dlog('the duels are over: free again');
+};
+
+// Host: the duels are over (or gone with a load)
+$.tourneyOver = function(why) {
+    $.tourneyHold = null;
+    $.dlog('the duels hold ends (' + why + ')');
+    $.clients.forEach(function(c) { c.send({ t: 'tourneyHold', on: false }); });
+};
+
+// a player back in the middle of them
+var _sendAssignTourneyHold = $.sendAssign;
+$.sendAssign = function(conn, actorId) {
+    _sendAssignTourneyHold(conn, actorId);
+    if ($.isHost() && $.tourney) conn.send({ t: 'tourneyHold', on: true, ids: $.tourney.players });
+    if ($.isHost() && $.towerReadyNow) conn.send({ t: 'towerReady', on: true });
+};
+
+var _canMoveTourneyHold = Game_Player.prototype.canMove;
+Game_Player.prototype.canMove = function() {
+    if ($.tourneyHoldMe()) return false;
+    return _canMoveTourneyHold.call(this);
+};
+
+var _commonEventUpdateTourneyHold = Game_CommonEvent.prototype.update;
+Game_CommonEvent.prototype.update = function() {
+    if ($.isHungerCe && $.isHungerCe(this._commonEventId) && $.tourneyHoldMe()) return;
+    _commonEventUpdateTourneyHold.call(this);
+};
+
+var _gainMpTourneyHold = Game_Battler.prototype.gainMp;
+Game_Battler.prototype.gainMp = function(value) {
+    if (value < 0 && !$.ctx && this.isActor() && !$gameParty.inBattle() && $.tourneyHoldMe() &&
+            $gameParty.members().indexOf(this) >= 0) return;
+    _gainMpTourneyHold.call(this, value);
+};
+
+var _rherPausedTourneyHold = $.rherPaused;
+$.rherPaused = function() {
+    return $.tourneyHoldMe() || _rherPausedTourneyHold();
+};
+
+// The tower's duels can start (user 2026-11-09): once only players are left
+// (the door's condition, $.onlyPlayersLeft) the Eye of Rher's time stands
+// still for whoever is on the tower map; elsewhere it goes on. The host works
+// it out and tells every PC when it changes, and one who comes back.
+$.towerReadyNow = false;
+$.updateTowerReady = function() {
+    if (!$.isHost()) return;
+    var on = !!$.onlyPlayersLeft();
+    if (on === $.towerReadyNow) return;
+    $.towerReadyNow = on;
+    $.dlog('tower: only players left', on);
+    $.clients.forEach(function(c) { c.send({ t: 'towerReady', on: on }); });
+};
+
+$.guestHandlers.towerReady = function(msg) {
+    $.towerReadyNow = !!(msg && msg.on);
+};
+
+var _rherPausedTower = $.rherPaused;
+$.rherPaused = function() {
+    return ($.towerReadyNow && !!$gameMap && $gameMap.mapId() === $.TOWER_MAP) || _rherPausedTower();
+};
+
+var _sceneMapUpdateTowerReady = Scene_Map.prototype.update;
+Scene_Map.prototype.update = function() {
+    _sceneMapUpdateTowerReady.call(this);
+    if (Graphics.frameCount % 30 === 0) $.updateTowerReady();
+};
+
+//=============================================================================
+// The one the others went on without comes back moonscorched (user 2026-11-06)
+//=============================================================================
+// A player away from the tower door whom the others voted to go on without
+// counts as dead (FH_CoopBattle towerDropOffline). User: once the duels are
+// over (or at once, nobody left to duel), the last one standing is told "A
+// chill runs down your spine..." (등골이 서늘하다), and a second later that
+// player's character stands there moonscorched: its Eye of Rher form
+// ($.RHER_FORMS; Daan as the original tower's: the Pocketcat fight,
+// $.RHER_TOWER_FORMS), in its character's
+// seat of the original tower scene (Map111 EV617), else by the winner. Its
+// belongings: the one who kills it, or the tower's heir (whichever comes
+// first - both take them out of its bag). Waiting ones are in the save.
+$.TOWER_CHILL_TEXT = 'A chill runs down your spine...';
+$.TOWER_CHILL_DELAY_MS = 1500; // the winner back from its last duel: a moment, then the line
+$.TOWER_CHILL_MS = 3000;       // the line's time on screen (a toast), then the encounter at once
+$.towerChill = null; // host: { win, at (ms), told } from the duels' end to the encounter
+
+var _towerDropOfflineForms = $.towerDropOffline;
+$.towerDropOffline = function(names) {
+    var was = Object.assign({}, $.coopDead());
+    _towerDropOfflineForms(names);
+    var dead = $.coopDead(), assign = $.assignments(), data = $.coopData();
+    (names || []).forEach(function(name) {
+        if (was[name] || !dead[name] || !assign[name]) return;
+        data.towerForms = data.towerForms || [];
+        data.towerForms.push({ name: name, a: assign[name] });
+        $.dlog('tower:', name, 'comes back moonscorched once the duels are over');
+    });
+};
+
+// Its character's seat of the tower scene (Map111 EV617 -> "<name>_in_party"
+// -> the seat event whose first page needs it), from the map's data.
+$.towerSeatFromData = function(actorId) {
+    var map = $.bodyMapData ? $.bodyMapData($.TOWER_MAP) : null;
+    var ev = map && map.events[$.TOWER_SCENE_EVENT];
+    if (!ev || !ev.pages[0]) return null;
+    var sw = 0, at = 0;
+    ev.pages[0].list.forEach(function(cmd) {
+        var p = cmd.parameters;
+        if (cmd.code === 111 && p[0] === 4 && p[2] === 0) at = p[1];
+        else if (cmd.code === 121 && at) {
+            if (at === actorId && !sw) sw = p[0];
+            at = 0;
+        }
+    });
+    if (!sw) return null;
+    var seat = null;
+    map.events.some(function(e) {
+        var c = e && e.pages[0] && e.pages[0].conditions;
+        if (!c || !c.switch1Valid || c.switch1Id !== sw || c.switch2Valid) return false;
+        seat = { m: $.TOWER_MAP, x: e.x, y: e.y, d: e.pages[0].image.direction || 2 };
+        return true;
+    });
+    return seat;
+};
+
+$.towerWinnerSpot = function(id) {
+    if (id === 'host') return { m: $gameMap.mapId(), x: $gamePlayer.x, y: $gamePlayer.y, d: $gamePlayer.direction() };
+    var c = $.clientById(id), p = c && c.lastPos;
+    return p ? { m: p.m || $gameMap.mapId(), x: p.x, y: p.y, d: p.d || 2 } : null;
+};
+
+// The winner is back on its map, free (not fighting, no event of its own).
+$.towerWinnerFree = function(id) {
+    if (id === 'host') return !$gameParty.inBattle() && SceneManager._scene instanceof Scene_Map && !$gameMap.isEventRunning();
+    var c = $.clientById(id);
+    return !!c && !c.inBattle && !$.isBusy(c);
+};
+
+$.towerFormsUpdate = function() {
+    var data = $.coopData(), list = data.towerForms;
+    if (!$.isHost() || !list || !list.length || $.tourney || $.tourneyAsk || $.consent) return;
+    var living = $.towerLiving();
+    if (living.length !== 1) { $.towerChill = null; return; } // (the duels first)
+    var win = living[0], now = $.clockMs();
+    var ch = $.towerChill;
+    if (!ch || ch.win !== win) ch = $.towerChill = { win: win, at: 0, told: false };
+    if (!ch.told) {
+        if (!$.towerWinnerFree(win)) { ch.at = 0; return; }
+        if (!ch.at) { ch.at = now + $.TOWER_CHILL_DELAY_MS; return; }
+        if (now < ch.at) return;
+        ch.told = true;
+        ch.at = now + $.TOWER_CHILL_MS;
+        if (win === 'host') $.toast($.TOWER_CHILL_TEXT);
+        else $.clientById(win).send({ t: 'toast', text: $.TOWER_CHILL_TEXT });
+        $.dlog('tower: the chill for', $.playerLabel(win));
+        return;
+    }
+    if (now < ch.at) return;
+    $.towerChill = null;
+    var near = $.towerWinnerSpot(win);
+    data.towerForms = [];
+    var first = null;
+    list.forEach(function(f) {
+        var seat = $.towerSeatFromData(f.a);
+        var spot = seat && near && near.m === $.TOWER_MAP ? seat : near;
+        if (!spot) return;
+        if ($gameActors.actor(f.a)) $.markDoom($gameActors.actor(f.a), 'moonscorch');
+        var rec = $.rherSpawn(null, f.a, spot, f.name, { tower: true });
+        first = first || rec;
+        $.dlog('tower:', f.name, 'is back moonscorched at map', spot.m, spot.x, spot.y);
+    });
+    if (first) $.towerEncounter(win, first);
+};
+// (every map frame, not as a world extra: those run only while a guest is connected,
+// and a host alone at the door - the others offline - never got its encounter:
+// user test 2026-11-10, log window_18216)
+var _sceneMapUpdateTowerForms = Scene_Map.prototype.update;
+Scene_Map.prototype.update = function() {
+    _sceneMapUpdateTowerForms.call(this);
+    if ($.isHost() && $.hostInGame) $.towerFormsUpdate();
+};
+
+// The encounter at once: the form's page (its fight - Pocketcat: its talk)
+// for the winner.
+$.towerEncounter = function(win, rec) {
+    var c = win === 'host' ? null : $.clientById(win);
+    if (c && (c.roam || c.roamPending)) {
+        c.send({ t: 'rherStart', n: rec.n }); // (its PC runs that map)
+        return;
+    }
+    var ev = rec.m === $gameMap.mapId() ? $gameMap.event(rec.id) : null;
+    if (!ev) return;
+    if (c) $.runOwned(c, ev.list(), ev);
+    else ev.start();
+    $.dlog('tower: the encounter with', rec.who + '\'s form for', $.playerLabel(win));
+};
+
+// A PC running its own map: that form's page starts here (once it stands here).
+$.rherStartWant = null; // { n, until (ms) }
+$.guestHandlers.rherStart = function(msg) {
+    $.rherStartWant = { n: Number(msg.n), until: $.clockMs() + 5000 };
+};
+$.guestExtras.push(function() {
+    var w = $.rherStartWant;
+    if (!w) return;
+    if ($.clockMs() > w.until) { $.rherStartWant = null; return; }
+    var rec = $.rherRecordN(w.n);
+    var ev = rec && rec.m === $gameMap.mapId() ? $gameMap.event(rec.id) : null;
+    if (!ev || $gameMap.isEventRunning() || $gamePlayer.isTransferring()) return;
+    $.rherStartWant = null;
+    ev.start();
+});
+
+//=============================================================================
+// The Orphanage's Tes'tich table (hard mode): each player once (user 2026-11-06)
+//=============================================================================
+// Original (data): Map164 EV104 (the table, 81,45), hard mode (SW4819): "Use
+// hexen" sets V2300 facing and V2592 school_hexen_use 1 and goes to the board
+// (Map031 8,8). The board's way out (Map031 EV1 page 1): V2592 1 -> 0, and in
+// hard mode with V2593 gull_hexen_surprise 0: V2600 GULL_BROS_ACTIVE 1 (the
+// Gull Bros about Prehevil) and V2593 1, back by the table. The table's page
+// on V2593 >= 1 is empty; Map164 EV109 (parallel, V2593 >= 1): the Gull Bros
+// come in and crush it (V2594 1-3), then hunt the player.
+// Co-op (user 2026-11-06): every living player may use it once. The first one
+// back turns the Gull Bros on (V2600, as in the original); the crush waits
+// until the last of them is back from the board (V2593: the host turns it on
+// then). One who used it has "Use hexen" greyed out.
+// The trip's values (V2289 / V2592 / V2300) are world values: another
+// player's way out (V2592 back to 0) or use (its facing) came into a PC on the
+// board and sent it out the wrong way (to the Moon tower). On the board a PC
+// keeps its own (set before it went there) and takes no other player's.
+$.TESTICH = { map: 164, ev: 104, hard: $.HARD_MODE_SWITCH || 4819, use: 2592, crush: 2593, board: 31 };
+$.TRIP_VARS = { 2289: true, 2592: true, 2300: true };
+$.testichSeen = {};        // a guest: name -> 'in' / 'done' (from the host)
+$.testichMe = '';          // a guest: its name on the host
+$.testichCrushing = false; // the host turns V2593 on
+
+$.testichHard = function() {
+    return !!$gameSwitches && !!$gameSwitches.value($.TESTICH.hard);
+};
+
+// name -> 'in' (on its way / on the board) or 'done' (back)
+$.testichUses = function() {
+    if (!$.isHost()) return $.testichSeen;
+    var d = $.coopData();
+    if (!d.testich) d.testich = {};
+    return d.testich;
+};
+
+$.testichSpent = function(name) {
+    return !!name && !!$.testichUses()[name];
+};
+
+$.testichTell = function() {
+    var s = $.testichUses();
+    $.clients.forEach(function(c) { c.send({ t: 'testich', s: s, me: c.name }); });
+};
+$.guestHandlers.testich = function(msg) {
+    $.testichSeen = Object.assign({}, msg.s || {});
+    $.testichMe = String(msg.me || '');
+};
+
+$.testichMark = function(name, st, why) {
+    var uses = $.testichUses();
+    if (!name || uses[name] === st || (st === 'done' && uses[name] !== 'in')) return;
+    uses[name] = st;
+    $.dlog("Tes'tich table:", name, st === 'in' ? 'uses it' : 'is back from the board', '(' + why + ')');
+    $.testichTell();
+};
+
+// A player back in the game is not on the board (its trip there is over).
+var _sendAssignTestich = $.sendAssign;
+$.sendAssign = function(conn, actorId) {
+    _sendAssignTestich(conn, actorId);
+    if (!$.isHost() || !$.coopData().testich) return;
+    if (conn.name && $.coopData().testich[conn.name] === 'in') $.testichMark(conn.name, 'done', 'back in the game');
+    conn.send({ t: 'testich', s: $.coopData().testich, me: conn.name });
+};
+
+// Every PC: no crush from the board's way out in co-op. The host: who used it
+// (its own event or a guest's event on its map) and who is back.
+var _varSetTestich = Game_Variables.prototype.setValue;
+Game_Variables.prototype.setValue = function(id, value) {
+    var T = $.TESTICH, mapId = $gameMap ? $gameMap.mapId() : 0;
+    if (id === T.crush && this === $gameVariables && $.role && mapId === T.board && Number(value) > 0 &&
+            !$.testichCrushing) {
+        $.dlog("Tes'tich table: the crush waits for the last player back from the board");
+        return;
+    }
+    _varSetTestich.call(this, id, value);
+    if (id !== T.use || this !== $gameVariables || !$.role || !$.testichHard()) return;
+    var st = Number(value) === 1 && mapId === T.map ? 'in' : !Number(value) && mapId === T.board && !$.ctx ? 'done' : '';
+    if (!st) return;
+    if ($.isHost()) {
+        $.testichMark($.ctx ? $.ctx.name : $.nameOf('host'), st, st === 'in' ? 'its event' : 'its way out');
+    } else if ($.conn) {
+        // a roaming guest's own map; a sub-host's: maybe the event of a guest
+        // it runs (not the sub-host's own use - its world writes would say so)
+        $.conn.send({ t: 'testichUse', st: st, who: $.ctx && $.ctx._sub ? $.ctx.guestId : null });
+    }
+};
+
+$.hostHandlers.testichUse = function(conn, msg) {
+    if (!conn || !msg || !$.testichHard()) return;
+    var c = conn;
+    if (msg.who) {
+        c = $.clientById(msg.who);
+        if (!c || c.subOf !== conn.guestId) return;
+    }
+    if (msg.st === 'in' || msg.st === 'done') $.testichMark(c.name, msg.st, msg.who ? 'on the map of ' + conn.name : 'its map');
+};
+
+// On the board: no other player's trip values.
+var _applyWorldDeltaTrip = $.applyWorldDelta;
+$.applyWorldDelta = function(d, pending, persist) {
+    if (d && d.v && $.role && $gameMap && $gameMap.mapId() === $.TESTICH.board &&
+            Object.keys(d.v).some(function(k) { return $.TRIP_VARS[k]; })) {
+        var v = {};
+        Object.keys(d.v).forEach(function(k) { if (!$.TRIP_VARS[k]) v[k] = d.v[k]; });
+        d = Object.assign({}, d, { v: v });
+    }
+    return _applyWorldDeltaTrip(d, pending, persist);
+};
+
+// The host: every living player has used it and is back - the crush.
+$.testichCheck = function() {
+    if (!$.isHost() || !$gameVariables || !$.testichHard() || $gameVariables.value($.TESTICH.crush) > 0) return false;
+    var uses = $.coopData().testich;
+    if (!uses || !Object.keys(uses).length) return false;
+    var ids = ['host'].concat($.activeGuests().map(function(c) { return c.guestId; }));
+    var names = ids.filter(function(id) { return !$.isDead(id); }).map($.nameOf);
+    if (!names.length || names.some(function(n) { return uses[n] !== 'done'; })) return false;
+    $.testichCrushing = true;
+    try {
+        $gameVariables.setValue($.TESTICH.crush, 1);
+    } finally {
+        $.testichCrushing = false;
+    }
+    $.dlog("Tes'tich table: everyone has used it and is back - the Gull Bros come for it");
+    return true;
+};
+$.worldExtras.push(function() {
+    if (Graphics.frameCount % 10 === 0) $.testichCheck();
+});
+
+// "Use hexen": the answer whose branch sets V2592 to 1 (-1: not the table's).
+$.testichAnswer = function(interp, list, at) {
+    var T = $.TESTICH, c = list && list[at];
+    if (!$.role || !c || c.code !== 102 || !$gameMap || $gameMap.mapId() !== T.map || interp._eventId !== T.ev ||
+            !$.testichHard()) return -1;
+    var ans = -1;
+    for (var i = at + 1; i < list.length && list[i].indent >= c.indent; i++) {
+        var x = list[i];
+        if (x.indent === c.indent) {
+            if (x.code !== 402) break;
+            ans = x.parameters[0];
+        } else if (x.code === 122 && x.parameters[0] <= T.use && T.use <= x.parameters[1] && x.parameters[3] === 0 &&
+                x.parameters[4] === 1) {
+            return ans;
+        }
+    }
+    return -1;
+};
+
+// its own event (the host's, a roaming guest's)
+var _setupChoicesTestich = Game_Interpreter.prototype.setupChoices;
+Game_Interpreter.prototype.setupChoices = function(params) {
+    var n = this._fhOwner ? -1 : $.testichAnswer(this, this._list, this._index);
+    _setupChoicesTestich.call(this, params);
+    if (n >= 0 && $.testichSpent($.isHost() ? $.nameOf('host') : $.testichMe || $.myName) && $gameMessage.isChoice() &&
+            $gameMessage.disableChoice) $gameMessage.disableChoice(n, true);
+};
+
+// a guest's event on the host's map: its choice goes to its screen
+var _fhRemoteMessageTestich = Game_Interpreter.prototype.fhRemoteMessage;
+Game_Interpreter.prototype.fhRemoteMessage = function(withText) {
+    if (this._fhOwner && $.ctx && this._list) {
+        var at = this._index;
+        if (withText) {
+            at++;
+            while (this._list[at] && this._list[at].code === 401) at++;
+        }
+        var n = $.testichAnswer(this, this._list, at);
+        if (n >= 0 && $.testichSpent($.ctx.name)) $.choiceModsOf().dis[n] = true;
+    }
+    return _fhRemoteMessageTestich.call(this, withText);
+};
+
+//=============================================================================
+// Magna-medicinal on a dead player's body (co-op only, user 2026-11-06)
+//=============================================================================
+// Original (data): skill 368 Magna-medicinal (Map031 EV115: the Hexen board,
+// Daan's area; 677 is Daan's own from the character history) - in a fight,
+// 50 mind, CE494 "What do you want to sacrifice to resurrect \N[x]?" -
+// Sacrifice an arm / a leg / Nevermind (an option greyed out when the caster
+// has lost both: its <name>_arm2 / _leg2 switch), then the dead member is up
+// with 21 HP (311 +20, 313 off Knockout) and the caster loses that limb
+// (CE495 / CE496 add state 3 / 14 to the caster by its SELECT switch, CE240
+// does the rest).
+// Co-op (user 2026-11-06): a living player who learned it on the Hexen board
+// (368, not Daan's 677) can bring back a dead player at that player's body,
+// at any time: 50 mind, a soul stone, a contestant's head (any of the
+// fourteen) and its own arm or leg (its choice, as in CE494). Only a
+// player who died on its own: its body is the companion's ("Here lies ...",
+// 'plain'), not a duel's (a kill at mind 0, the tower), not headless, not
+// moonscorched (no body). Not once the tower door was touched (the vote, the
+// duels, the door open). Its player must be in the game. Keys someone took
+// from the body stay taken. The world values its death changed go back: its
+// <name>1 switch (dead) off, V201 CHARACTERS_LEFT +1. It is up where its
+// body lay, with 21 HP.
+$.MAGNA_SKILL = 368;
+$.MAGNA_MIND = 50;
+$.MAGNA_HP = 21;
+$.MAGNA_CE = 494;
+$.MAGNA_HEADS = [293, 296, 288, 277, 298, 279, 278, 292, 309, 302, 275, 289, 282, 283]; // the 14 contestants
+$.MAGNA_TEXT = {
+    cost: 'Magna-medicinal: 50 mind, a soul stone and a contestant\'s head.',
+    ask: 'What do you want to sacrifice to resurrect \\N[%1]?',
+    need: 'To resurrect \\N[%1] with Magna-medicinal you need 50 mind, a soul stone and a contestant\'s head.',
+    limbs: 'You have no arm or leg left to sacrifice.',
+    head: 'Without a head, \\N[%1] cannot be brought back.',
+    tower: 'It is too late to bring \\N[%1] back.',
+    away: '\\N[%1]\'s player is not in the game.',
+    done: '%1 brought %2 back with Magna-medicinal.',
+    free: 'Resurrect \\N[%1] with Magna-medicinal?',
+    yes: 'Resurrect'
+};
+// Mod Settings "Bringing back the dead": no cost (the skill still needed).
+$.magnaFree = function() {
+    return !!$.coopSetting && !!$.coopSetting('magnaFree');
+};
+$.magnaOk = {}; // a guest: body number -> '' (can be brought back) or why not (from the host)
+
+$.magnaTowerOver = function() {
+    return !!$.tourney || !!$.coopData().towerTouched || !!($gameSwitches && $gameSwitches.value($.INHERIT_SWITCH));
+};
+
+// The tower door touched: the vote, the duels.
+var _towerDropOfflineMagna = $.towerDropOffline;
+$.towerDropOffline = function() {
+    if ($.isHost()) $.coopData().towerTouched = true;
+    return _towerDropOfflineMagna.apply(this, arguments);
+};
+var _startTourneyMagna = $.startTourney;
+$.startTourney = function(ids) {
+    if ($.isHost()) $.coopData().towerTouched = true;
+    return _startTourneyMagna.apply(this, arguments);
+};
+
+// Host: the player id of a name (null: not in the game now).
+$.idOfName = function(name) {
+    if (name === $.nameOf('host')) return 'host';
+    var c = $.activeGuests().filter(function(x) { return x.name === name; })[0];
+    return c ? c.guestId : null;
+};
+
+// Host: why that body's player cannot be brought back ('' : it can).
+$.magnaWhyNot = function(rec) {
+    if (!rec || rec.kind !== 'plain') return 'kind';
+    var name = $.nameOfActor(rec.a);
+    if (!name || !$.coopDead()[name]) return 'kind';
+    if ($.duelDead()[rec.a]) return 'kind';
+    var actor = $gameActors.actor(rec.a), doom = actor && actor._fhDoom;
+    if (doom === 'moonscorch') return 'kind';
+    if (doom === 'headless') return 'head';
+    if ($.magnaTowerOver()) return 'tower';
+    if (!$.idOfName(name)) return 'away';
+    return '';
+};
+
+$.magnaList = function() {
+    var out = {};
+    $.corpses().forEach(function(r) { if (r.kind === 'plain' && r.n) out[r.n] = $.magnaWhyNot(r); });
+    return out;
+};
+
+$.magnaTell = function(force) {
+    var list = $.magnaList(), key = JSON.stringify(list);
+    if (!force && key === $.magnaSentKey) return;
+    $.magnaSentKey = key;
+    $.clients.forEach(function(c) { c.send({ t: 'magnaOk', s: list }); });
+};
+$.magnaSentKey = '';
+$.guestHandlers.magnaOk = function(msg) {
+    $.magnaOk = Object.assign({}, msg.s || {});
+};
+$.worldExtras.push(function() {
+    if (Graphics.frameCount % 30 === 0 && $.clients.length) $.magnaTell(false);
+});
+var _sendAssignMagna = $.sendAssign;
+$.sendAssign = function(conn, actorId) {
+    _sendAssignMagna(conn, actorId);
+    if ($.isHost()) conn.send({ t: 'magnaOk', s: $.magnaList() });
+};
+
+// Who runs this body's event: its actor, whether it can do it at all.
+$.magnaRunner = function() {
+    if ($.isHost()) {
+        var id = $.ctx ? $.ctx.guestId : 'host';
+        return { id: id, name: $.nameOf(id), actor: $.ctx ? $gameActors.actor($.ctx.actorId) : $gameActors.actor($.realHostActorId()),
+            up: !$.isDead(id) && !$.isDown(id) };
+    }
+    if ($.ctx && $.ctx._sub) {
+        return { id: $.ctx.guestId, actor: $gameActors.actor($.ctx.actorId), up: !$.ctx.dead && !$.ctx.down };
+    }
+    return { id: $.myId, actor: $gameActors.actor($.myActorId), up: !$.isGhostMe() && !$.isDownMe() };
+};
+
+$.magnaHead = function() {
+    return $.MAGNA_HEADS.filter(function(id) { return $dataItems[id] && $gameParty.numItems($dataItems[id]) > 0; })[0] || 0;
+};
+
+// The limbs it can give: [arm, leg].
+$.magnaLimbs = function(actor) {
+    var sw = actor && $.LIMB_SWITCHES[actor.actorId()];
+    if (!sw) return [false, false];
+    return [!$gameSwitches.value(sw[1]), !$gameSwitches.value(sw[3])];
+};
+
+// Its body's event: what to show ('' nothing, 'ask', 'need', 'limbs',
+// 'head', 'tower', 'away').
+$.magnaCheck = function(interp) {
+    interp._fhMagna = null;
+    if (!$.role || !$.sessionActive || !$.sessionActive()) return '';
+    var rec = $.bodyRecord(interp._eventId, interp._mapId);
+    var who = rec && rec.kind === 'plain' ? $.magnaRunner() : null;
+    if (!who || !who.up || !who.actor || !who.actor.isLearnedSkill($.MAGNA_SKILL)) return '';
+    var why = $.isHost() ? $.magnaWhyNot(rec) : $.magnaOk[rec.n];
+    if (why === undefined || why === 'kind') return '';
+    var st = why;
+    if (!st && $.magnaFree()) {
+        st = 'free'; // (Mod Settings: no cost)
+    } else if (!st) {
+        var limbs = $.magnaLimbs(who.actor);
+        if (who.actor.mp < $.MAGNA_MIND || $gameParty.numItems($dataItems[$.SOUL_STONE_ITEM]) < 1 || !$.magnaHead()) st = 'need';
+        else if (!limbs[0] && !limbs[1]) st = 'limbs';
+        else st = 'ask';
+    }
+    interp._fhMagna = { st: st, n: rec.n, a: rec.a, who: who.id };
+    return st;
+};
+
+$.magnaIs = function(interp, st) {
+    return !!interp._fhMagna && interp._fhMagna.st === st;
+};
+
+// Before the question: the options it has no limb for.
+$.magnaGrey = function(interp) {
+    var who = $.magnaRunner(), limbs = $.magnaLimbs(who && who.actor);
+    if (!$gameMessage.disableChoice) return;
+    if (!limbs[0]) $gameMessage.disableChoice(0, true);
+    if (!limbs[1]) $gameMessage.disableChoice(1, true);
+};
+
+// Its choice: the costs (the limb goes with the original's CE495 / CE496 and
+// CE240 after this). false: not any more - nothing happens.
+$.magnaPay = function(interp, limb) {
+    var m = interp._fhMagna;
+    if (!m || $.magnaCheck(interp) !== 'ask' || !$.magnaLimbs($.magnaRunner().actor)[limb === 'arm' ? 0 : 1]) {
+        $.dlog('Magna-medicinal: not any more');
+        return false;
+    }
+    var who = $.magnaRunner(), head = $.magnaHead();
+    who.actor.setMp(who.actor.mp - $.MAGNA_MIND);
+    $gameParty.loseItem($dataItems[$.SOUL_STONE_ITEM], 1);
+    $gameParty.loseItem($dataItems[head], 1);
+    $.dlog('Magna-medicinal by', who.actor.name(), ': 50 mind, a soul stone,', $dataItems[head].name + ', an', limb);
+    return true;
+};
+
+// Its yes with no cost (Mod Settings): still so? false - nothing happens.
+$.magnaPayFree = function(interp) {
+    if (!interp._fhMagna || $.magnaCheck(interp) !== 'free') {
+        $.dlog('Magna-medicinal: not any more');
+        return false;
+    }
+    $.dlog('Magna-medicinal by', $.magnaRunner().actor.name(), ': no cost (Mod Settings)');
+    return true;
+};
+
+// The scene is over: the host brings that player back.
+$.magnaFinish = function(interp) {
+    var m = interp._fhMagna;
+    interp._fhMagna = null;
+    if (!m) return;
+    if ($.isHost()) $.magnaRevive(m.n, m.who);
+    else if ($.conn) $.conn.send({ t: 'magnaRevive', n: m.n, who: $.ctx && $.ctx._sub ? $.ctx.guestId : null });
+};
+
+$.hostHandlers.magnaRevive = function(conn, msg) {
+    if (!conn || !msg) return;
+    var by = conn.guestId;
+    if (msg.who) {
+        var c = $.clientById(msg.who);
+        if (!c || c.subOf !== conn.guestId) return;
+        by = c.guestId;
+    }
+    $.magnaRevive(Number(msg.n), by);
+};
+
+// Host: that body's player is up again, where the body lay.
+$.magnaRevive = function(n, byId) {
+    var list = $.corpses();
+    var rec = list.filter(function(r) { return r.n === n; })[0];
+    var why = $.magnaWhyNot(rec);
+    if (!rec || why) {
+        $.dlog('Magna-medicinal: body', n, 'cannot be brought back (' + (why || 'gone') + ')');
+        return false;
+    }
+    var name = $.nameOfActor(rec.a), id = $.idOfName(name);
+    delete $.coopDead()[name];
+    var sw = $.DEATH_SWITCH[rec.a];
+    if (sw && $gameSwitches.value(sw)) {
+        $gameSwitches.setValue(sw, false);
+        $gameVariables.setValue($.CHARACTERS_LEFT_VAR, $gameVariables.value($.CHARACTERS_LEFT_VAR) + 1);
+    }
+    var data = $.coopData();
+    if (data.keysTaken) delete data.keysTaken[name]; // (the keys taken are not given back)
+    var actor = $gameActors.actor(rec.a);
+    if (actor) {
+        actor.removeState($.KNOCKOUT);
+        actor._fhDoom = null;
+        actor._fhDownStates = null;
+        actor.setHp($.MAGNA_HP);
+    }
+    list.splice(list.indexOf(rec), 1);
+    var stamp = data.corpsesStamp = $.corpseStamp();
+    $.clients.forEach(function(c) { c.send({ t: 'corpses', list: list, stamp: stamp }); });
+    $.bodyDropGone();
+    $.dlog('Magna-medicinal:', name, 'is up again at', rec.m, rec.x + ',' + rec.y, 'by', $.playerLabel(byId));
+    $.magnaPlace(id, rec);
+    $.broadcastState(id);
+    $.magnaTell(true);
+    $.broadcastToast($.MAGNA_TEXT.done.replace('%1', $.playerLabel(byId)).replace('%2', $.playerLabel(id)));
+    return true;
+};
+
+// Where its body lay.
+$.magnaPlace = function(id, rec) {
+    if (id === 'host') {
+        if ($gameMap.mapId() === rec.m) $gamePlayer.locate(rec.x, rec.y);
+        else $gamePlayer.reserveTransfer(rec.m, rec.x, rec.y, 2, 0);
+        $gamePlayer.refresh();
+        return;
+    }
+    var conn = $.clientById(id);
+    if (!conn) return;
+    var spot = { m: rec.m, x: rec.x, y: rec.y, d: 2 };
+    conn._lastMeKey = null;
+    if (!conn.roam && !conn.subOf && rec.m === $gameMap.mapId()) {
+        $.pushMe(conn);
+        conn.send({ t: 'place', x: rec.x, y: rec.y, d: 2 });
+        var remote = $.remotes[id];
+        if (remote) remote.setPosition(rec.x, rec.y);
+        conn.lastPos = Object.assign({}, conn.lastPos || {}, spot);
+    } else {
+        if (conn.subOf && $.detachSub) $.detachSub(conn);
+        $.sendRoam(conn, { pos: spot });
+        conn.lastPos = Object.assign({}, conn.lastPos || {}, spot);
+        $.pushMe(conn);
+    }
+};
+
+// Bodies gone from the list: off this map now (erased), out of it (its event
+// and data) once nothing runs it any more - the revive runs in that body's
+// own event, which still needs its page to end.
+$.bodyGone = {}; // event id -> map id
+$.bodyDropGone = function() {
+    if (!$gameMap || !$dataMap || !$dataMap.events) return;
+    var have = {};
+    $.corpses().forEach(function(r) { if (r.m === $gameMap.mapId() && r.id) have[r.id] = r.n; });
+    $gameMap._events.forEach(function(ev, id) {
+        var data = ev && $dataMap.events[id];
+        if (!data || data._fhBody === undefined || have[id] === data._fhBody || $.bodyGone[id]) return;
+        ev.erase();
+        $.bodyGone[id] = $gameMap.mapId();
+        $.dlog('body', data._fhBody, 'is gone from this map');
+    });
+};
+
+$.bodyRunning = function(id) {
+    var main = $gameMap._interpreter;
+    if (main && main.isRunning() && main.eventId() === id) return true;
+    return Object.keys($.owned || {}).some(function(k) {
+        var o = $.owned[k], it = o && o.interp;
+        return !!it && it.isRunning() && it._eventId === id && it._mapId === $gameMap.mapId();
+    });
+};
+
+$.bodyGoneSweep = function() {
+    var ids = Object.keys($.bodyGone);
+    if (!ids.length || !$gameMap) return;
+    ids.forEach(function(k) {
+        var id = Number(k);
+        if ($.bodyGone[k] !== $gameMap.mapId()) {
+            delete $.bodyGone[k]; // (another map's data: gone with that map)
+            return;
+        }
+        if ($.bodyRunning(id)) return;
+        delete $.bodyGone[k];
+        var data = $dataMap && $dataMap.events[id];
+        if (data && data._fhBody !== undefined) delete $dataMap.events[id];
+        delete $gameMap._events[id];
+    });
+};
+$.worldExtras.push(function() { $.bodyGoneSweep(); });
+$.guestExtras.push(function() { $.bodyGoneSweep(); });
+
+var _corpsesGone = $.guestHandlers.corpses;
+$.guestHandlers.corpses = function(msg) {
+    _corpsesGone(msg);
+    if ($gameSystem) $.bodyDropGone();
+};
+
+// The companion body's page: the question before its keys.
+var _bodyPlainPagesMagna = $.bodyPlainPages;
+$.bodyPlainPages = function(actorId) {
+    var pages = _bodyPlainPagesMagna(actorId);
+    if (!pages) return pages;
+    var list = pages[0].list, at = list.length - 2; // (before the keys and the end)
+    Array.prototype.splice.apply(list, [at, 0].concat($.magnaCommands(actorId)));
+    return pages;
+};
+
+$.magnaCommands = function(actorId) {
+    var cmd = function(code, indent, params) { return { code: code, indent: indent, parameters: params }; };
+    var line = function(key, indent) {
+        return [cmd(101, indent, ['', 0, 0, 2]), cmd(401, indent, [$.MAGNA_TEXT[key].replace('%1', actorId)])];
+    };
+    var out = [cmd(355, 0, ['FH.Coop.magnaCheck(this);'])];
+    ['need', 'limbs', 'head', 'tower', 'away'].forEach(function(st) {
+        out.push(cmd(111, 0, [12, "FH.Coop.magnaIs(this, '" + st + "')"]));
+        out = out.concat(line(st, 1), [cmd(0, 1, []), cmd(412, 0, [])]);
+    });
+    out.push(cmd(111, 0, [12, "FH.Coop.magnaIs(this, 'ask')"]));
+    out.push(cmd(355, 1, ['FH.Coop.magnaGrey(this);']));
+    out.push(cmd(101, 1, ['', 0, 0, 2]), cmd(401, 1, [$.MAGNA_TEXT.cost]),
+        cmd(401, 1, [$.MAGNA_TEXT.ask.replace('%1', actorId)]));
+    out.push(cmd(102, 1, [['Sacrifice an arm', 'Sacrifice a leg', 'Nevermind'], 2, 0, 2, 0]));
+    var scene = $.magnaScenes();
+    ['arm', 'leg'].forEach(function(limb, i) {
+        out.push(cmd(402, 1, [i, i ? 'Sacrifice a leg' : 'Sacrifice an arm']));
+        out.push(cmd(111, 2, [12, "FH.Coop.magnaPay(this, '" + limb + "')"]));
+        (scene[i] || []).forEach(function(c) { out.push(cmd(c.code, c.indent - scene.base + 3, $.bodyCopy(c.parameters))); });
+        out.push(cmd(355, 3, ['FH.Coop.magnaFinish(this);']), cmd(0, 3, []), cmd(412, 2, []), cmd(0, 2, []));
+    });
+    out.push(cmd(402, 1, [2, 'Nevermind']), cmd(0, 2, []), cmd(404, 1, []), cmd(0, 1, []), cmd(412, 0, []));
+    // no cost (Mod Settings): a yes, no limb scene
+    out.push(cmd(111, 0, [12, "FH.Coop.magnaIs(this, 'free')"]));
+    out.push(cmd(101, 1, ['', 0, 0, 2]), cmd(401, 1, [$.MAGNA_TEXT.free.replace('%1', actorId)]));
+    out.push(cmd(102, 1, [[$.MAGNA_TEXT.yes, 'Nevermind'], 1, 0, 2, 0]));
+    out.push(cmd(402, 1, [0, $.MAGNA_TEXT.yes]));
+    out.push(cmd(111, 2, [12, 'FH.Coop.magnaPayFree(this)']));
+    out.push(cmd(355, 3, ['FH.Coop.magnaFinish(this);']), cmd(0, 3, []), cmd(412, 2, []), cmd(0, 2, []));
+    out.push(cmd(402, 1, [1, 'Nevermind']), cmd(0, 2, []), cmd(404, 1, []), cmd(0, 1, []), cmd(412, 0, []));
+    return out;
+};
+
+// The original's two answers (CE494, its first question): the sounds, the
+// dark, the limb (CE495 / CE496, CE240) - not its revive of that party
+// member (311 / 313: the host does it).
+$.magnaScenes = function() {
+    if ($.magnaScenesCache) return $.magnaScenesCache;
+    var ce = $dataCommonEvents && $dataCommonEvents[$.MAGNA_CE], list = ce ? ce.list : [];
+    var box = list.findIndex(function(c) { return c.code === 102; });
+    var out = [];
+    out.base = box >= 0 ? list[box].indent + 1 : 0;
+    if (box < 0) return out;
+    var ind = list[box].indent;
+    for (var i = box + 1; i < list.length && list[i].indent >= ind; i++) {
+        var c = list[i];
+        if (c.indent === ind && c.code === 404) break;
+        if (c.indent === ind && c.code === 402) {
+            out[c.parameters[0]] = [];
+            continue;
+        }
+        var cur = out[out.length - 1];
+        if (!cur || c.indent === ind + 1 && c.code === 0) continue;
+        if (c.code === 311 || c.code === 313 && c.parameters[3] === $.KNOCKOUT) continue;
+        cur.push(c);
+    }
+    out.length = Math.min(out.length, 2);
+    $.magnaScenesCache = out;
+    return out;
+};
+
+//=============================================================================
+// Co-op Settings (the menu, user 2026-11-06) - "Mod Settings" since 2026-11-08
+// (with the ATB ones, which count in a solo game too: coop: true marks the
+// co-op only ones)
+//=============================================================================
+// A menu entry "Co-op Settings" in a shared game. Only the host changes them
+// (a guest sees them); they are kept in the host's save
+// (coopData().settings) and go to every guest (a join, a load, a change).
+// - soulsShared (user: "players will fight over who owns a soul"): off - a
+//   dead contestant's soul is the player's who got it ("Absorb / Give to",
+//   only its board opens that area, as before); on - nobody is asked, every
+//   player's Hexen board opens it. The souls of characters players play stay
+//   theirs either way.
+$.COOP_SETTINGS = [
+    // (Everyone by default, user 2026-11-07: "players will fight over souls")
+    { key: 'soulsShared', label: 'Contestant souls (Hexen)', off: 'Owner only', on: 'Everyone', def: true, coop: true,
+        help: ['Owner only: the player who got a soul (or was given it) opens its Hexen area.',
+            'Everyone: a soul opens its Hexen area on every player\'s board, nobody is asked.'] },
+    // (user 2026-11-10: "a setting that takes away the cost of bringing back a dead
+    // player's body - the Hexen skill still needed") Magna-medicinal at a dead player's
+    // body: off - 50 mind, a soul stone, a contestant's head and an arm or leg; on - no
+    // cost, the skill (368, learned on the Hexen board) still needed.
+    { key: 'magnaFree', label: 'Bringing back the dead (Magna-medicinal)', off: 'Cost', on: 'No cost', coop: true,
+        help: ['Cost: at a dead player\'s body, 50 mind, a soul stone, a contestant\'s head and your arm or leg.',
+            'No cost: only Magna-medicinal learned on the Hexen board is needed.'] },
+    { key: 'doubleFinds', label: 'Consumables found', off: 'Normal', on: 'Double', coop: true,
+        help: ['Double: enemy drops and items picked up on the map count twice -',
+            'healing items and food only: no weapons, armor, ammo, bombs, traps, buffs, keys or soul stones.'] },
+    // (user 2026-11-07: "put save in the options too, keep it on for now";
+    // F9 load the same day) F8 / F9: the save / load screen anywhere on the
+    // map (FH_Coop.js); off - the host saves and loads the original way only.
+    // On unless the host turns it off.
+    // (user 2026-11-08: not co-op only - "it works in solo too, many want
+    // to save and load": a solo game follows it as well)
+    { key: 'quickSave', label: 'F8 save / F9 load', off: 'Off', on: 'On', def: true,
+        help: ['On: F8 / F9 on the map (not during an event or message) open the save / load screen - in co-op for the host only.',
+            'Off: saving and loading only the original way.'] },
+    // ATB (user 2026-11-08: "Mod Settings", not co-op only - solo games too;
+    // in co-op the host's, like the others). Read by FH_ATB (FH.Coop.coopSettingValue).
+    // atbWaitTurn: a player choosing a command stops every gauge (the time
+    // stop's way, also for a joiner choosing on its PC).
+    { key: 'atbWaitTurn', label: 'Time stops on your turn (ATB)', off: 'Off', on: 'On',
+        help: ['On: when a player\'s turn comes, every gauge stops until that player has chosen.',
+            'Off: time keeps running while you choose (the enemies only slow down for a moment).'] },
+    // atbTurnCap: 0 (no limit) or 2-10 player turns per enemy turn at most.
+    { key: 'atbTurnCap', label: 'Most player turns per enemy turn (ATB)', type: 'num', min: 2, max: 10, off: 'No limit',
+        help: ['A player acts at most this many times per enemy turn, however fast it is (2 - 10).',
+            'No limit: speed alone decides. Left / right to change.'] }
+];
+$.coopSettingsSeen = {}; // a guest: the host's
+
+$.coopSettingItem = function(key) {
+    return $.COOP_SETTINGS.filter(function(x) { return x.key === key; })[0];
+};
+// A stored value as that setting's kind: on / off, or a number in its range
+// (anything else: 0, no limit).
+$.coopSettingNorm = function(item, v) {
+    if (item.type === 'num') {
+        v = Math.floor(Number(v));
+        return v >= item.min && v <= item.max ? v : 0;
+    }
+    return !!v;
+};
+$.coopSettingText = function(item, v) {
+    if (item.type === 'num') return v ? String(v) : item.off;
+    return v ? item.on : item.off;
+};
+// The value after this one (OK, right) or before it (left): on / off, or
+// no limit, min ... max, no limit again.
+$.coopSettingNext = function(item, v, dir) {
+    if (item.type !== 'num') return !v;
+    var list = [0];
+    for (var n = item.min; n <= item.max; n++) list.push(n);
+    var i = Math.max(0, list.indexOf($.coopSettingNorm(item, v)));
+    return list[(i + (dir < 0 ? -1 : 1) + list.length) % list.length];
+};
+
+$.coopSettingsData = function() {
+    if (!$.isHost()) return $.coopSettingsSeen;
+    var d = $.coopData();
+    if (!d.settings) d.settings = {};
+    return d.settings;
+};
+
+// This PC's own choices (the title's Co-op Settings, user 2026-11-08: "under
+// Co-op Join, easy to find"): kept in config.rpgsave, for every game this PC
+// hosts. A change in a game's menu is kept there too, so the title shows the
+// last choice; a game hosted on a PC with no choice of its own uses its save's.
+$.coopSettingsPref = function() {
+    if (!ConfigManager.fhCoopSettings || typeof ConfigManager.fhCoopSettings !== 'object') ConfigManager.fhCoopSettings = {};
+    return ConfigManager.fhCoopSettings;
+};
+var _configMakeDataSettings = ConfigManager.makeData;
+ConfigManager.makeData = function() {
+    var config = _configMakeDataSettings.call(this);
+    config.fhCoopSettings = Object.assign({}, $.coopSettingsPref());
+    return config;
+};
+var _configApplyDataSettings = ConfigManager.applyData;
+ConfigManager.applyData = function(config) {
+    _configApplyDataSettings.call(this, config);
+    var s = config && config.fhCoopSettings;
+    this.fhCoopSettings = {};
+    if (s && typeof s === 'object') {
+        $.COOP_SETTINGS.forEach(function(item) {
+            if (typeof s[item.key] === (item.type === 'num' ? 'number' : 'boolean')) {
+                this.fhCoopSettings[item.key] = $.coopSettingNorm(item, s[item.key]);
+            }
+        }, this);
+    }
+};
+
+// Who may change them: the host, or anyone on the title (not in a session).
+$.canEditCoopSettings = function() {
+    return !$.role || $.isHost();
+};
+
+// A setting's value: a guest - the host's; the host (or the title, or a solo
+// game) - this PC's choice, else the save's, else its default (def).
+$.coopSettingValue = function(key) {
+    var item = $.coopSettingItem(key);
+    if (!item) return false;
+    var pref = $.isGuest() ? undefined : $.coopSettingsPref()[key];
+    var v = pref !== undefined ? pref : (!$.role ? undefined : $.coopSettingsData()[key]);
+    return $.coopSettingNorm(item, v === undefined ? item.def : v);
+};
+$.coopSettingOn = function(key) {
+    return !!$.coopSettingValue(key);
+};
+
+$.coopSetting = function(key) {
+    return !!$.role && !!($gameSystem || $.isGuest()) && $.coopSettingOn(key);
+};
+
+$.sendCoopSettings = function(conn) {
+    // (the values in use: this PC's choice over the save's)
+    var now = {};
+    $.COOP_SETTINGS.forEach(function(item) { now[item.key] = $.coopSettingValue(item.key); });
+    var msg = { t: 'coopSettings', s: now };
+    if (conn) conn.send(msg);
+    else $.clients.forEach(function(c) { c.send(msg); });
+};
+
+$.guestHandlers.coopSettings = function(msg) {
+    if ($.isHost()) return;
+    var was = JSON.stringify($.coopSettingsSeen);
+    $.coopSettingsSeen = Object.assign({}, (msg && msg.s) || {});
+    if (was !== JSON.stringify($.coopSettingsSeen)) $.dlog('co-op settings from the host:', JSON.stringify($.coopSettingsSeen));
+};
+
+$.setCoopSetting = function(key, value) {
+    if (!$.canEditCoopSettings()) return;
+    var item = $.coopSettingItem(key);
+    if (!item) return;
+    value = $.coopSettingNorm(item, value);
+    $.coopSettingsPref()[key] = value;
+    try { ConfigManager.save(); } catch (e) { $.dlog('ERROR co-op settings: config not saved', e && e.message); }
+    if (!$.role) {
+        $.dlog('mod setting (title / solo)', key, '=', value);
+        return;
+    }
+    $.coopSettingsData()[key] = value;
+    $.dlog('co-op setting', key, '=', value);
+    $.sendCoopSettings(null);
+    $.broadcastToast('the host set ' + item.label + ': ' + $.coopSettingText(item, value) + '.');
+};
+
+var _sendAssignSettings = $.sendAssign;
+$.sendAssign = function(conn, actorId) {
+    _sendAssignSettings(conn, actorId);
+    if ($.isHost()) $.sendCoopSettings(conn);
+};
+var _sendSnapshotSettings = $.sendSnapshot;
+$.sendSnapshot = function(conn) {
+    var out = _sendSnapshotSettings.apply(this, arguments);
+    if ($.isHost() && $gameSystem && conn) $.sendCoopSettings(conn);
+    return out;
+};
+
+var _makeMenuCommandListSettings = Window_MenuCommand.prototype.makeCommandList;
+Window_MenuCommand.prototype.makeCommandList = function() {
+    _makeMenuCommandListSettings.call(this);
+    // (user 2026-11-08: "Mod Settings" - the ATB ones count in a solo game too)
+    if (this.findSymbol('fhCoopSettings') < 0) this.addCommand('Mod Settings', 'fhCoopSettings', true);
+};
+var _createCommandWindowSettings = Scene_Menu.prototype.createCommandWindow;
+Scene_Menu.prototype.createCommandWindow = function() {
+    _createCommandWindowSettings.call(this);
+    this._commandWindow.setHandler('fhCoopSettings', function() { SceneManager.push(Scene_FHCoopSettings); });
+};
+
+function Window_FHCoopSettings() {
+    this.initialize.apply(this, arguments);
+}
+Window_FHCoopSettings.prototype = Object.create(Window_Command.prototype);
+Window_FHCoopSettings.prototype.constructor = Window_FHCoopSettings;
+Window_FHCoopSettings.prototype.windowWidth = function() {
+    return Graphics.boxWidth;
+};
+Window_FHCoopSettings.prototype.makeCommandList = function() {
+    $.COOP_SETTINGS.forEach(function(item) {
+        this.addCommand(item.label + ':  ' + $.coopSettingText(item, $.coopSettingValue(item.key)), item.key,
+            $.canEditCoopSettings());
+    }, this);
+};
+// Left / right change the value under the cursor (a number a step, on / off
+// flips), as in the original Options.
+Window_FHCoopSettings.prototype.fhStep = function(dir) {
+    var item = $.COOP_SETTINGS[this.index()];
+    if (!item || !$.canEditCoopSettings()) return;
+    $.setCoopSetting(item.key, $.coopSettingNext(item, $.coopSettingValue(item.key), dir));
+    SoundManager.playCursor();
+    this.refresh();
+};
+Window_FHCoopSettings.prototype.cursorRight = function() {
+    this.fhStep(1);
+};
+Window_FHCoopSettings.prototype.cursorLeft = function() {
+    this.fhStep(-1);
+};
+
+function Scene_FHCoopSettings() {
+    this.initialize.apply(this, arguments);
+}
+Scene_FHCoopSettings.prototype = Object.create(Scene_MenuBase.prototype);
+Scene_FHCoopSettings.prototype.constructor = Scene_FHCoopSettings;
+Scene_FHCoopSettings.prototype.create = function() {
+    Scene_MenuBase.prototype.create.call(this);
+    this._help = new Window_Help(3);
+    this.addWindow(this._help);
+    this._list = new Window_FHCoopSettings(0, this._help.height);
+    var self = this;
+    $.COOP_SETTINGS.forEach(function(item) {
+        self._list.setHandler(item.key, function() {
+            $.setCoopSetting(item.key, $.coopSettingNext(item, $.coopSettingValue(item.key), 1));
+            self._list.refresh();
+            self._list.activate();
+            self.updateHelp();
+        });
+    });
+    this._list.setHandler('cancel', this.popScene.bind(this));
+    this.addWindow(this._list);
+    this.updateHelp();
+};
+Scene_FHCoopSettings.prototype.updateHelp = function() {
+    var item = $.COOP_SETTINGS[this._list.index()] || $.COOP_SETTINGS[0];
+    var lines = item.help.slice();
+    // (no "OK: change it" line - user 2026-11-08: not needed, stiff; a guest
+    // is still told why it cannot change them)
+    if (!$.canEditCoopSettings()) lines.push('Only the host can change these.');
+    else if (item.coop && !$.role) lines.push('Co-op games only.');
+    this._help.setText(lines.join('\n'));
+};
+Scene_FHCoopSettings.prototype.update = function() {
+    Scene_MenuBase.prototype.update.call(this);
+    if (this._list && this._list.index() !== this._lastIndex) {
+        this._lastIndex = this._list.index();
+        this.updateHelp();
+    }
+};
+$.Scene_FHCoopSettings = Scene_FHCoopSettings;
+$.Window_FHCoopSettings = Window_FHCoopSettings;
+
+// doubleFinds (user 2026-11-06: "even two players are short of supplies in
+// hard mode, three or more cannot cope"; "consumables only, no equipment"):
+// a consumable item (itype 1, consumed on use) that is not a key (the
+// companion body's keys list) or a soul stone. Enemy drops (the PC that runs
+// the fight) and a map event's "Change Items +" (the player whose event it
+// is: a guest's on the host goes to its bag) - not a common event's
+// (crafting, trading, a recipe's result) and not a troop event's.
+// Not the ones for a fight either (user, same day: "no ammo, no bombs - what
+// hurts or puts a state on enemies"): an item used on enemies (scope 1-6) or
+// that deals HP damage (Pipe bomb, the vials, stones, darts, glass shards, the
+// poison plants ...), and gun powder (the ammo is no consumable in the data:
+// 9mm, 12-gauge, .303 are not counted anyway).
+// And only what heals (user, same day: "no buffs either - only the healing
+// ones double"): an item counts when it restores Body or Mind, cures a state,
+// fills hunger (the FOOD common events) or gives regen - and not when it puts a
+// buff on (Brown and Green vial, Pep pills, Heroin, the talismans, the "+"
+// dishes). Crafting things with no use of their own (matches, oil, stick,
+// flour, red herb ...) are not counted.
+$.DOUBLE_FIND_NOT = [247, 76, 104, 200, 149]; // Gun powder, Bear trap, Booby trap, Gasoline canister, Purifying talisman
+$.DOUBLE_FIND_BUFFS = [18, 20, 21, 105, 107, 108, 192, 197]; // speed, attack, evasion, heroin, defence, magic def
+$.DOUBLE_FIND_HEAL_STATES = [172, 220, 221]; // Condensed green, Regen, Greater regen
+$.DOUBLE_FIND_FOOD_CES = [31, 32, 33];
+$.doubleFindItem = function(item) {
+    if (!item || !DataManager.isItem(item) || item.itypeId !== 1 || !item.consumable) return false;
+    if (item.id === $.SOUL_STONE_ITEM || ($.KEY_ITEMS && $.KEY_ITEMS.indexOf(item.id) >= 0)) return false;
+    if ($.DOUBLE_FIND_NOT.indexOf(item.id) >= 0) return false;
+    var d = item.damage || {};
+    if ((item.scope >= 1 && item.scope <= 6) || d.type === 1 || d.type === 5) return false;
+    var heals = d.type === 3 || d.type === 4, effects = item.effects || [];
+    for (var i = 0; i < effects.length; i++) {
+        var e = effects[i];
+        if (e.code === 21 && $.DOUBLE_FIND_BUFFS.indexOf(e.dataId) >= 0) return false;
+        if (e.code === 31) return false; // add buff
+        if (e.code === 11 || e.code === 12 || e.code === 22) heals = true;
+        if (e.code === 21 && $.DOUBLE_FIND_HEAL_STATES.indexOf(e.dataId) >= 0) heals = true;
+        if (e.code === 44 && $.DOUBLE_FIND_FOOD_CES.indexOf(e.dataId) >= 0) heals = true;
+    }
+    return heals;
+};
+
+var _makeDropItemsDouble = Game_Enemy.prototype.makeDropItems;
+Game_Enemy.prototype.makeDropItems = function() {
+    var list = _makeDropItemsDouble.call(this);
+    if (!$.coopSetting('doubleFinds')) return list;
+    var out = [];
+    list.forEach(function(item) {
+        out.push(item);
+        if ($.doubleFindItem(item)) out.push(item);
+    });
+    return out;
+};
+
+$.commonEventList = function(list) {
+    if (!list || !$dataCommonEvents) return false;
+    if (list._fhCommon !== undefined) return list._fhCommon;
+    var found = $dataCommonEvents.some(function(ce) { return !!ce && ce.list === list; });
+    try {
+        Object.defineProperty(list, '_fhCommon', { value: found, enumerable: false, configurable: true });
+    } catch (e) { /* (a frozen list: asked again next time) */ }
+    return found;
+};
+
+var _command126Double = Game_Interpreter.prototype.command126;
+Game_Interpreter.prototype.command126 = function() {
+    var p = this._params;
+    var item = p && $dataItems[p[0]];
+    var twice = !!p && p[1] === 0 && this._eventId > 0 && !$gameParty.inBattle() && $.coopSetting('doubleFinds') &&
+        $.doubleFindItem(item) && !$.commonEventList(this._list);
+    var out = _command126Double.call(this);
+    if (twice) {
+        var n = this.operateValue(p[1], p[2], p[3]);
+        if (n > 0) {
+            $gameParty.gainItem(item, n);
+            $.dlog('double finds:', item.name, '+' + n);
+        }
+    }
+    return out;
+};
+
+//=============================================================================
+// Co-op: no sanity drift while standing still or in a menu (user 2026-11-06)
+//=============================================================================
+// Original: most maps' parallel EV28 waits 400 frames and calls CE372
+// SANITY_OUTSIDE / CE373 _INSIDE / CE374 _ALTERNATIVE, which take 1 mind
+// from the party (312, by difficulty: every time in hard mode, every few
+// times otherwise). Alone the game stands still in a menu and there is
+// little waiting. In co-op the world goes on in a menu and players wait for
+// each other ("too hard to keep the mind up"). Now in a co-op game that drift
+// (only those common events' Change MP) skips while this PC's player is in a
+// menu or has not moved for IDLE_SANITY_MS. Scenes and fights still take
+// mind as in the original.
+$.SANITY_DRIFT_CES = [372, 373, 374];
+$.IDLE_SANITY_MS = 3000;
+$.lastMoveAt = 0;
+$.lastMoveKey = '';
+
+$.trackPlayerMove = function() {
+    var p = $.realPlayer || $gamePlayer;
+    if (!p || !$gameMap) return;
+    var key = $gameMap.mapId() + ':' + p.x + ',' + p.y;
+    if (key !== $.lastMoveKey || p.isMoving()) {
+        $.lastMoveKey = key;
+        $.lastMoveAt = $.clockMs();
+    }
+};
+var _sceneMapUpdateIdle = Scene_Map.prototype.update;
+Scene_Map.prototype.update = function() {
+    _sceneMapUpdateIdle.call(this);
+    if ($.role) $.trackPlayerMove();
+};
+
+$.playerIdle = function() {
+    if (!(SceneManager._scene instanceof Scene_Map)) return true; // a menu (the world goes on)
+    return $.clockMs() - $.lastMoveAt >= $.IDLE_SANITY_MS;
+};
+
+$.isSanityDrift = function(list) {
+    return !!list && $.SANITY_DRIFT_CES.some(function(id) {
+        return !!$dataCommonEvents[id] && $dataCommonEvents[id].list === list;
+    });
+};
+
+var _command312Idle = Game_Interpreter.prototype.command312;
+Game_Interpreter.prototype.command312 = function() {
+    var p = this._params;
+    if ($.role && !this._fhOwner && !$.ctx && p[2] === 1 && !$gameParty.inBattle() && $.sessionActive &&
+            $.sessionActive() && $.isSanityDrift(this._list) && $.playerIdle()) {
+        if (!$.idleSanityLogged || $.clockMs() - $.idleSanityLogged > 60000) {
+            $.idleSanityLogged = $.clockMs();
+            $.dlog('sanity drift skipped: standing still or in a menu');
+        }
+        return true;
+    }
+    return _command312Idle.call(this);
+};
+
+//=============================================================================
+// The yellow mage's dance turned on by a guest on its own map (FH_CoopWorld)
+//=============================================================================
+// A guest running its own map turns the dance on there: its world writes come
+// as a wDelta (straight into the data, no setValue), so the host did not know
+// who - and a guest that lost to Mastermind came back to the host's map with
+// the dance on: its Hurting went on the host, a limb every two seconds (play
+// test 2026-11-06, Map080).
+var _wDeltaYellowMage = $.hostHandlers.wDelta;
+$.hostHandlers.wDelta = function(conn, msg) {
+    var on = !!(msg && msg.sw && msg.sw[$.YM_DANCE_SWITCH]);
+    var was = !!$gameSwitches._data[$.YM_DANCE_SWITCH];
+    _wDeltaYellowMage(conn, msg);
+    var now = !!$gameSwitches._data[$.YM_DANCE_SWITCH];
+    if (on && !was && now && conn && conn.guestId) {
+        $.ymTarget = conn.guestId;
+        $.dlog('yellow mage: sees', $.playerLabel ? $.playerLabel(conn.guestId) : conn.guestId, 'first (its own map)');
+    } else if (was && !now) {
+        $.ymTarget = null;
+    }
+};
+
+//=============================================================================
 // A new game, a load, leaving: nothing of the game before (review 0.6.0)
 //=============================================================================
 // Kept by this PC across games, none of it in the save: a drop-off of the
@@ -17844,6 +19723,14 @@ $.freshGameState = function(why) {
     $.arrivedOn = 0;
     $.soulWait = {};
     $.lastSoulOn = null;
+    $.tourneyHold = null;
+    $.towerChill = null;
+    $.testichSeen = {};
+    $.testichMe = '';
+    if ($.hostWatch) $.hostWatchStop('a new game or a load');
+    $.ewWant = false;
+    $.towerReadyNow = false;
+    ($.clients || []).forEach(function(c) { c._ghostStay = false; }); // (a new world: everyone in it)
     $.dlog("this PC's state of the game before dropped (" + why + ')');
 };
 

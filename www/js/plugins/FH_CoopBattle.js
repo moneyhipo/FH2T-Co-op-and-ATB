@@ -2,7 +2,7 @@
 // FH_CoopBattle.js
 //=============================================================================
 /*:
- * @plugindesc v0.6.0 Co-op battles: battles run on the PC of whoever started
+ * @plugindesc v1.0.0 Co-op battles: battles run on the PC of whoever started
  * them, other players can join, downed players, betrayal duel. Below
  * FH_CoopWorld.
  * @author FH2 Co-op Mod
@@ -244,6 +244,7 @@ $.onPlayerDefeated = function(id) {
     $.downs[id] = { end: $.clockMs() + $.downMs };
     $.dlog('player down', $.playerLabel(id));
     $.broadcastState(id);
+    delete $.downAsks[id]; // (a new fall: no answer from an old box is awaited)
     var text = $.playerLabel(id) + ' is down! Revive them with OK (' + Math.round($.downMs / 1000) + ' s)';
     $.broadcastToast(text);
     $.checkEveryoneDown();
@@ -792,7 +793,7 @@ Game_Event.prototype.checkEventTriggerTouch = function(x, y) {
     var downHere = $.isHost() ? $.sessionActive() && $.isDown('host') : $.isGuest() && !!$.myState && !$.solo;
     var me = $.realPlayer || $gamePlayer;
     if (downHere && me.pos(x, y) && !me._fhRemoteId &&
-            !($.remotePlayerAt && $.remotePlayerAt(x, y))) return;
+            !($.standingRemoteAt && $.standingRemoteAt(x, y))) return;
     _checkTouchDownHost.call(this, x, y);
 };
 
@@ -879,7 +880,7 @@ $.updateDownTimer = function() {
             'white-space:pre;text-align:center;';
         document.body.appendChild(el);
     }
-    el.textContent = text;
+    el.textContent = $.ko(text);
     el.style.display = text ? 'block' : 'none';
 };
 
@@ -928,9 +929,130 @@ $.actHooks.push(function(conn, msg) {
     if (msg.tr.indexOf(0) < 0) return false;
     var target = $.downPlayerAt(msg.x, msg.y);
     if (!target || target === conn.guestId) return false;
-    $.revive(target, conn.guestId);
+    $.reviveOrAsk(target, conn.guestId);
     return true;
 });
+
+// Revive or kill (user 2026-11-09): once every contestant left is a player
+// (the NPC ones all dead: the tower door's condition), OK on a down player
+// asks the one who pressed it - "Revive <name>" (the one picked at first, so
+// a quick OK never kills) or "Kill <name>" (the original's "Beat" on a body,
+// CE319, then that player is dead: a contestant's body, as a duel's loser).
+// Before that, OK revives at once as always. The host decides; the box is on
+// the presser's PC.
+$.DOWN_ASK_TITLE = '%1 is down.';
+$.DOWN_ASK_CHOICES = ['Revive %1', 'Kill %1'];
+$.downAsks = {}; // host: down player id -> the one asked
+
+$.onlyPlayersLeft = function() {
+    if (!$.isHost() || !$.sessionActive() || ($.tutorialOver && !$.tutorialOver())) return false;
+    var left = $gameVariables.value($.CHARACTERS_LEFT_VAR); // (0: not counted yet)
+    return left > 0 && left <= $.towerLiving().length + $.towerOffline().length;
+};
+
+$.reviveOrAsk = function(target, byId) {
+    if (!$.onlyPlayersLeft()) {
+        $.revive(target, byId);
+        return;
+    }
+    if (!$.downs[target] || $.downAsks[target] === byId) return; // (asked already: its box is up)
+    $.downAsks[target] = byId;
+    $.dlog('down', $.playerLabel(target), ': revive or kill? asked', $.playerLabel(byId));
+    var msg = { t: 'downAsk', id: target, name: $.playerLabel(target) };
+    if (byId === 'host') $.guestHandlers.downAsk(msg);
+    else $.sendTo(byId, msg);
+};
+
+// The presser's PC: the box (Esc / X: neither).
+$.guestHandlers.downAsk = function(msg) {
+    if (!msg || !msg.id) return;
+    var name = msg.name || '';
+    var choices = $.DOWN_ASK_CHOICES.map(function(c) { return c.replace('%1', name); });
+    $.showPickBox($.DOWN_ASK_TITLE.replace('%1', name), choices, function(i) {
+        var ans = { t: 'downAnswer', id: msg.id, by: $.myPlayerId(), kill: i === 1, none: i !== 0 && i !== 1 };
+        if ($.isHost()) $.hostHandlers.downAnswer(null, ans);
+        else if ($.conn) $.conn.send(ans);
+    }, 2);
+};
+
+$.hostHandlers.downAnswer = function(conn, msg) {
+    if (!msg || !msg.id) return;
+    var by = msg.by || (conn ? conn.guestId : 'host');
+    // (one of a sub-host's guests answers through it)
+    var from = conn ? conn.guestId : 'host';
+    var sub = by !== from ? $.clientById(by) : null;
+    if (by !== from && !(sub && sub.subOf === from)) return;
+    if ($.downAsks[msg.id] !== by) return;
+    delete $.downAsks[msg.id];
+    if (msg.none || !$.downs[msg.id] || $.isDown(by)) return;
+    if (msg.kill) $.killDown(msg.id, by);
+    else $.revive(msg.id, by);
+};
+
+// A down player killed by another: the original's "Beat" on the killer's PC,
+// one line for everyone, then dead for good as a duel's loser (its body the
+// contestant's, its SELECT off).
+$.killDown = function(id, byId) {
+    if (!$.downs[id]) return;
+    $.dlog('down', $.playerLabel(id), 'killed by', $.playerLabel(byId));
+    var killer = $.actorOfPlayer(byId);
+    var beat = { t: 'beatMotion', a: killer ? killer.actorId() : 0 };
+    if (byId === 'host') $.guestHandlers.beatMotion(beat);
+    else $.sendTo(byId, beat);
+    $.broadcastToast($.playerLabel(byId) + ' killed ' + $.playerLabel(id) + '.');
+    $.duelLoserDies({ lethal: true }, id);
+};
+
+// CE319 BEAT_THE_ENEMY, that character's part only: two blows, its sprite's
+// strike frame and the sound (a character without the arms for it: the
+// sound alone, as there). Its switch commands are left out (world flags).
+$.BEAT_CE = 319;
+$.beatInterp = null;
+$.beatList = function(actorId) {
+    var ce = $dataCommonEvents && $dataCommonEvents[$.BEAT_CE];
+    if (!ce) return null;
+    var list = ce.list, out = null;
+    for (var i = 0; i < list.length && !out; i++) {
+        if (list[i].indent !== 0 || list[i].code !== 111) continue;
+        var end = i + 1;
+        while (end < list.length && list[end].indent > 0) end++;
+        var block = list.slice(i + 1, end);
+        var mine = block.some(function(c) {
+            var m = c.code === 355 && /actor\(0*(\d+)\)/.exec(String(c.parameters[0]));
+            return m && Number(m[1]) === actorId;
+        });
+        if (!mine) continue;
+        out = [];
+        block.forEach(function(c) {
+            if (c.code === 121) return;
+            out.push({ code: c.code, indent: c.indent - 1, parameters: c.parameters });
+            if (c.code === 355) out.push({ code: 355, indent: c.indent - 1, parameters: ['$gamePlayer.refresh();'] });
+        });
+        out.push({ code: 0, indent: 0, parameters: [] });
+    }
+    return out;
+};
+
+$.guestHandlers.beatMotion = function(msg) {
+    var list = msg && $.beatList(Number(msg.a) || 0);
+    if (!list) return;
+    $.beatInterp = new Game_Interpreter();
+    $.beatInterp.setup(list, 0);
+};
+
+var _sceneMapUpdateBeat = Scene_Map.prototype.update;
+Scene_Map.prototype.update = function() {
+    _sceneMapUpdateBeat.call(this);
+    var it = $.beatInterp;
+    if (!it) return;
+    try {
+        it.update();
+        if (!it.isRunning()) $.beatInterp = null;
+    } catch (e) {
+        $.beatInterp = null;
+        $.dlog('beat motion skipped', String(e && e.message || e));
+    }
+};
 
 var _triggerButtonAction = Game_Player.prototype.triggerButtonAction;
 Game_Player.prototype.triggerButtonAction = function() {
@@ -939,7 +1061,7 @@ Game_Player.prototype.triggerButtonAction = function() {
         var y = $gameMap.roundYWithDirection(this.y, this.direction());
         var target = $.downPlayerAt(x, y);
         if (target && target !== 'host') {
-            $.revive(target, 'host');
+            $.reviveOrAsk(target, 'host');
             return true;
         }
         var joined = $.battleAtTile(x, y);
@@ -1267,6 +1389,10 @@ Game_Interpreter.prototype.fhDelegateBattle = function() {
     this._fhBattleWait = bid;
     this.setWaitMode('fhBattle');
     var me = $.meData(conn);
+    // the bag its PC fights with: what the fight changed is counted from it at
+    // the end, so what this PC put in meanwhile stays (audit 2026-11-10)
+    var startActor = $gameActors.actor(conn.actorId);
+    conn._battleBase = { bid: bid, hp: startActor ? startActor.hp : 0, inv: JSON.parse(JSON.stringify(me.inv)) };
     $.dlog('delegate battle', conn.name, 'troop', troopId);
     conn.send({
         t: 'battle', bid: bid, troopId: troopId, ce: !!this._params[2], cl: false, // no "can lose" in co-op
@@ -1420,14 +1546,17 @@ $.applyMeAfterBattle = function() {
 // Whose PC reports this battle's end: its owner's; a duel's, both players'
 // (each runs its own battle).
 $.reportsFor = function(b, id) {
-    return !!b && (b.owner === id || (!!b.pvp && (b.attackerId === id || b.foeId === id)));
+    return !!b && (b.owner === id || (!!b.pvp && $.duelIds(b).indexOf(id) >= 0));
 };
 
 $.hostHandlers.battleEnd = function(conn, msg) {
     var b = $.battles[msg.bid];
     // a duel already settled by the other side's report: this PC gets its
     // character as the host has it now (healed winner, restored test duel)
-    if (!b && $.settledDuels && $.settledDuels[msg.bid]) {
+    // (a free-for-all: one already taken out of it too)
+    var outOfMelee = !!b && !!b.melee && $.duelIds(b).indexOf(conn.guestId) >= 0 &&
+        b.alive.indexOf(conn.guestId) < 0;
+    if ((!b && $.settledDuels && $.settledDuels[msg.bid]) || outOfMelee) {
         // (only its mark of this duel: not one of a fight that began since)
         if (!conn.inBattle || String(conn.inBattle) === String(msg.bid) || !$.battles[conn.inBattle]) conn.inBattle = 0;
         conn._lastMeKey = null;
@@ -1449,6 +1578,14 @@ $.hostHandlers.battleEnd = function(conn, msg) {
         if (d[1] === null) delete $gameSelfSwitches._data[d[0]]; else $gameSelfSwitches._data[d[0]] = d[1];
     });
     $gameMap.requestRefresh();
+    // A fight this PC handed it: the change from its start bag, not the bag whole
+    // (a refund or a sub-host's last report that came meanwhile was lost - audit
+    // 2026-11-10; organs gone after a fight, gallery report 2026-11-09)
+    var start = conn._battleBase;
+    conn._battleBase = null;
+    if (!b.pvp && start && String(start.bid) === String(msg.bid) && !conn._menuBase && msg.inv) {
+        conn._menuBase = { hp: start.hp, inv: start.inv, at: $.clockMs ? $.clockMs() : 0 };
+    }
     $.hostHandlers.syncMe(conn, { actorId: conn.actorId, actor: msg.actor, inv: msg.inv });
     $.applyJoinerResults(b, msg.joiners || []);
     var interp = b.interp;
@@ -1561,7 +1698,8 @@ $.markDeadConn = function(conn, text) {
 $.onGuestClosedBattle = function(conn) {
     Object.keys($.battles).forEach(function(bid) {
         var b = $.battles[bid];
-        if (b.pvp && (b.attackerId === conn.guestId || b.foeId === conn.guestId)) {
+        if (b.pvp && $.duelIds(b).indexOf(conn.guestId) >= 0) {
+            if (b.melee && b.alive.indexOf(conn.guestId) < 0) return; // (out already)
             // a duelist left: it loses (and dies), the other one wins (a
             // test duel: nobody dies, leaving it either)
             // (a duel to the death: its one line, "<winner> killed <it>.", is
@@ -1600,14 +1738,27 @@ $.onGuestClosedBattle = function(conn) {
         left[conn.name] = Math.max(1000, $.downLeftMs(conn.guestId));
     }
     delete $.downs[conn.guestId];
+    // (its box of "Revive / Kill" is gone with it; one asked about it is answered in vain)
+    Object.keys($.downAsks).forEach(function(id) {
+        if (id === conn.guestId || $.downAsks[id] === conn.guestId) delete $.downAsks[id];
+    });
     if ($.owned[conn.guestId]) $.finishOwned(conn.guestId);
     // the last one standing left while the host is down: the game is over
     // now, not when the host's 60 seconds run out (final review D B5)
+    // A dead host (a ghost) waits for it instead (user 2026-11-06: a crash
+    // or a lost line of the last one alive - a winner in the tower too -
+    // ended the whole game with "the host died"); the host may still quit.
     if ($.hostInGame && $.isDown('host') && $.othersAlive(conn.guestId).length === 0) {
+        if ($.isDead('host')) {
+            $.dlog('the last player standing left (' + conn.name + ') - the dead host waits for them to come back');
+            $.toast($.LAST_ALIVE_LEFT_TEXT.replace('%1', conn.name || 'The last one alive'));
+            return;
+        }
         $.dlog('the last player standing left - everyone is down');
         $.hostDies();
     }
 };
+$.LAST_ALIVE_LEFT_TEXT = 'Co-op: %1 left. Waiting for them to come back.';
 
 var _sendAssignDown = $.sendAssign;
 $.sendAssign = function(conn, actorId) {
@@ -1843,11 +1994,12 @@ $.joinersAlive = function() {
 // Small battle message (the same box as "the needles waltz towards you").
 $.battleGab = function(text, local) {
     var scene = SceneManager._scene;
+    var shown = $.ko(text); // (the Korean patch: in Korean; the joiners translate their own)
     if (scene && scene._gabWindow) {
         try {
             var interp = new Game_Interpreter();
             // unwrapped: the 'gab' broadcast below already reaches the joiners
-            _pluginCommand.call(interp, 'GabText', String(text).split(' '));
+            _pluginCommand.call(interp, 'GabText', String(shown).split(' '));
             _pluginCommand.call(interp, 'ShowGab', []);
         } catch (e) {
             $.toast('Co-op: ' + text);
@@ -1870,7 +2022,11 @@ Game_Interpreter.prototype.pluginCommand = function(command, args) {
 // Animations, damage numbers, collapse effects shown on the joiners' PCs.
 // $.fxEcho: an effect replayed here from another PC (a duel) is not sent on.
 $.fxEcho = false;
+// (a free-for-all duel: ['e', its place among its player's parts, that
+// player] - $.duelFxRef; the third goes as 'o')
 $.battlerRef = function(battler) {
+    var duel = $.duelFxRef ? $.duelFxRef(battler) : null;
+    if (duel) return duel;
     if (battler.isEnemy()) return ['e', $gameTroop.members().indexOf(battler)];
     return ['a', battler.actorId()]; // party order differs between PCs
 };
@@ -1880,7 +2036,7 @@ Game_Battler.prototype.startAnimation = function(animationId, mirror, delay) {
     _startAnimation.call(this, animationId, mirror, delay);
     if ($.authBattle && $.battleViewers().length && $gameParty.inBattle() && !$.puppet && !$.fxEcho) {
         var ref = $.battlerRef(this);
-        $.battleBroadcast({ t: 'bFx', k: 'anim', s: ref[0], i: ref[1], a: animationId, m: mirror, d: delay });
+        $.battleBroadcast({ t: 'bFx', k: 'anim', s: ref[0], i: ref[1], o: ref[2], a: animationId, m: mirror, d: delay });
     }
 };
 
@@ -1904,7 +2060,7 @@ Game_Battler.prototype.startDamagePopup = function() {
     if ($.authBattle && $.battleViewers().length && $gameParty.inBattle() && !$.puppet && !$.fxEcho) {
         var ref = $.battlerRef(this);
         var r = this.result();
-        $.battleBroadcast({ t: 'bFx', k: 'pop', s: ref[0], i: ref[1], r: {
+        $.battleBroadcast({ t: 'bFx', k: 'pop', s: ref[0], i: ref[1], o: ref[2], r: {
             used: r.used, missed: r.missed, evaded: r.evaded, critical: r.critical,
             hpAffected: r.hpAffected, hpDamage: r.hpDamage, mpDamage: r.mpDamage
         } });
@@ -1938,7 +2094,7 @@ $.PERF_FX.forEach(function(entry) {
         base.apply(this, arguments);
         if ($.authBattle && $.battleViewers().length && $gameParty.inBattle() && !$.puppet && !$.fxEcho) {
             var ref = $.battlerRef(this);
-            var msg = { t: 'bFx', k: 'perf', f: name, s: ref[0], i: ref[1] };
+            var msg = { t: 'bFx', k: 'perf', f: name, s: ref[0], i: ref[1], o: ref[2] };
             if (name === 'performDamage') msg.act = $.perfActionRef();
             $.battleBroadcast(msg);
         }
@@ -1956,7 +2112,9 @@ $.perfActionRef = function() {
     var item = act && act.item && act.item();
     if (!subject || !item) return null;
     var ref = $.battlerRef(subject);
-    return [ref[0], ref[1], act.isSkill() ? 1 : 0, item.id];
+    var out = [ref[0], ref[1], act.isSkill() ? 1 : 0, item.id];
+    if (ref[2]) out.push(ref[2]); // (a free-for-all: whose part)
+    return out;
 };
 
 // subjectOf(kind, i): the subject on this PC (a duel turns the sides round).
@@ -2173,13 +2331,15 @@ BattleManager.atbChoosing = function() {
     });
 };
 
-// A joiner at the time-stop speed stops time while it chooses (FH_ATB).
+// A joiner at the time-stop speed stops time while it chooses (FH_ATB), and
+// any joiner choosing when the host's Mod Settings say "Time stops on your
+// turn" (atbHoldsTime).
 var _atbTimeStopJoiners = BattleManager.atbTimeStopChoosing;
 BattleManager.atbTimeStopChoosing = function() {
     if (_atbTimeStopJoiners.call(this)) return true;
     var bm = this;
     return !!$.authBattle && !$.puppet && $gameParty.battleMembers().some(function(a) {
-        return !!a._fhJoiner && !!a._fhAwait && bm.atbStopsTime(a);
+        return !!a._fhJoiner && !!a._fhAwait && bm.atbHoldsTime(a);
     });
 };
 
@@ -3012,7 +3172,7 @@ var _executeHpDamage = Game_Action.prototype.executeHpDamage;
 Game_Action.prototype.executeHpDamage = function(target, value) {
     var previousDamageContext = _pvpDamageContext;
     if ($.pvpBattle && value > 0 && target && target._fhPvpFoe) {
-        _pvpDamageContext = { target: target, bodyRate: $.pvpAoeBodyDamageRate(this) };
+        _pvpDamageContext = { target: target, bodyRate: $.pvpAoeBodyDamageRate(this, target) };
     }
     try {
         _executeHpDamage.call(this, target, value);
@@ -3121,14 +3281,16 @@ $.PVP_TROOP = { 1: 108, 3: 106, 4: 103, 5: 96, 6: 109, 13: 97, 14: 105, 15: 98 }
 // round(mhp * body / bodyMax) (body / 10 while the max HP stays), at least 1
 // while body > 0. Body 0 (or the head 0): defeated. A limb at 0: cut. Limbs
 // and the head never heal. See $.pvpPartPools, $.duelSyncSelfHp.
-// Damage (user decision 2026-10-20): every hit goes through a compression
+// Damage (user decision 2026-10-20; since 2026-11-09 the higher of two curves,
+// which meet at raw 500: 3000 raw takes about half): every hit goes through a compression
 // curve ($.pvpCurve), each hit of a multi-hit skill on its own:
-//   on the body = round(K * log2(1 + raw / B)), K 25, B 50, at least 1
-//   raw 10 -> 7, 100 -> 40, 500 -> 86, 1000 -> 110, 2000 -> 134, 3000 -> 148
-// so strong weapons still hurt more, but nothing one-shots (100 HP, raw 100
-// on a leg: leg 500 -> 460, body 1000 -> 960, 96 HP). Guards and the Salmonsnake
+//   on the body = round(max(52 * log2(1 + raw / 50), 180 * log2(1 + raw / 500))), at least 1
+//   raw 10 -> 14, 100 -> 82, 500 -> 180, 1000 -> 285, 2000 -> 418, 3000 -> 505
+// so strong weapons still hurt more, and no hit on one part one-shots (100 HP,
+// raw 100 on a leg: leg 500 -> 418, body 1000 -> 918, 92 HP). A pipe bomb (raw
+// 500 on all five parts) from full: 900, 10 HP left. Guards and the Salmonsnake
 // rune halve limb damage after the curve. Healing takes the same curve on
-// the healed amount (a heal of 100 HP: +40 on the body, then the real HP is
+// the healed amount (a heal of 100 HP: +82 on the body, then the real HP is
 // the body's share again); so does any other change of a duelist's own HP
 // on its own PC (poison, a skill's HP cost). What the character drains or
 // life-steals is the curved hit itself: its body gains as much.
@@ -3136,8 +3298,10 @@ $.PVP_TROOP = { 1: 108, 3: 106, 4: 103, 5: 96, 6: 109, 13: 97, 14: 105, 15: 98 }
 // - the plugin parameter 'PvP Damage Rate', removed in 0.38.3 - a leg of 38
 // HP with 100 HP. Before that the enemy versions' own proportions: a leg was
 // 11 HP and went with one 10-damage hit, play test 2026-10-19.)
-$.PVP_CURVE_K = 25;
+$.PVP_CURVE_K = 52;
 $.PVP_CURVE_B = 50;
+$.PVP_CURVE_K2 = 180; // the one for big hits: the higher of the two counts
+$.PVP_CURVE_B2 = 500;
 $.PVP_BODY_PER_HP = 10;
 $.PVP_PART_SHARE = {
     head: 0.1,
@@ -3219,8 +3383,8 @@ $.pvpPartPools = function(actorId, mhp) {
 $.pvpCurve = function(raw) {
     raw = Math.abs(Number(raw) || 0);
     if (!raw) return 0;
-    var log2 = Math.log2 ? Math.log2(1 + raw / $.PVP_CURVE_B) : Math.log(1 + raw / $.PVP_CURVE_B) / Math.LN2;
-    return Math.max(1, Math.round($.PVP_CURVE_K * log2));
+    var curve = function(k, b) { return k * Math.log(1 + raw / b) / Math.LN2; };
+    return Math.max(1, Math.round(Math.max(curve($.PVP_CURVE_K, $.PVP_CURVE_B), curve($.PVP_CURVE_K2, $.PVP_CURVE_B2))));
 };
 
 // Real HP <-> the body (both PCs, the same rounding). bodyMax: the whole
@@ -3247,7 +3411,7 @@ $.duelBodyOfHp = function(hp, mhp, bodyMax) {
 };
 
 // A change of X real HP (a heal, poison) -> the change on the body: the
-// curve of X, signed (a heal of 100: +40; poison of 10: -7).
+// curve of X, signed (a heal of 100: +82; a loss of 10: -14).
 $.duelBodyDelta = function(dHp) {
     var d = $.pvpCurve(dHp);
     return dHp > 0 ? d : -d;
@@ -3260,26 +3424,44 @@ $.pvpCutText = function(name, kind) {
     return text ? name + text : '';
 };
 
+// (each foe its own: its parts still standing)
 $.updatePvpAoeBodyRate = function() {
     if (!$.pvpBattle) return;
-    var count = $gameTroop.members().filter(function(e) {
-        return e._fhPvpFoe && e.isAlive() && !e.isHidden() && !e._fhPvpHeadLocked &&
-            (e._fhPart === 'torso' || e._fhPart === 'head' || $.isPvpLimb(e._fhPart));
-    }).length;
-    $.pvpBattle.aoeBodyRate = Math.max(1, $.PVP_AOE_REFERENCE_TARGETS / Math.max(1, count));
+    var members = $gameTroop.members();
+    $.duelFoes().forEach(function(rec) {
+        var count = members.filter(function(e) {
+            return e._fhPvpFoe && $.duelRecOf(e) === rec && e.isAlive() && !e.isHidden() && !e._fhPvpHeadLocked &&
+                (e._fhPart === 'torso' || e._fhPart === 'head' || $.isPvpLimb(e._fhPart));
+        }).length;
+        rec.aoeBodyRate = Math.max(1, $.PVP_AOE_REFERENCE_TARGETS / Math.max(1, count));
+    });
 };
 
-$.pvpAoeBodyDamageRate = function(action) {
+// target: the part hit (its foe's share; none: the first foe's).
+$.pvpAoeBodyDamageRate = function(action, target) {
     if (!$.pvpBattle || !action || !action.isForAll || !action.isForAll()) return 1;
-    if (typeof action._fhPvpAoeBodyRate === 'number') return action._fhPvpAoeBodyRate;
-    return $.pvpBattle.aoeBodyRate || 1;
+    var rec = target ? $.duelRecOf(target) : $.duelFoes()[0];
+    var kept = action._fhPvpAoeBodyRate;
+    if (typeof kept === 'number') return kept;
+    if (kept && rec && typeof kept[rec.foeId] === 'number') return kept[rec.foeId];
+    return (rec && rec.aoeBodyRate) || 1;
 };
 
+// The share each foe had when the action began (one foe: a number, as before).
 var _makeTargetsPvpAoe = Game_Action.prototype.makeTargets;
 Game_Action.prototype.makeTargets = function() {
     var targets = _makeTargetsPvpAoe.call(this);
-    this._fhPvpAoeBodyRate = $.pvpBattle && this.isForAll && this.isForAll()
-        ? ($.pvpBattle.aoeBodyRate || 1) : 1;
+    if ($.pvpBattle && this.isForAll && this.isForAll()) {
+        if ($.isMelee()) {
+            var rates = {};
+            $.duelFoes().forEach(function(rec) { rates[rec.foeId] = rec.aoeBodyRate || 1; });
+            this._fhPvpAoeBodyRate = rates;
+        } else {
+            this._fhPvpAoeBodyRate = $.pvpBattle.aoeBodyRate || 1;
+        }
+    } else {
+        this._fhPvpAoeBodyRate = 1;
+    }
     return targets;
 };
 
@@ -3302,9 +3484,11 @@ $.pvpHasGuard = function(actor, kind) {
 
 // A leg at 0 HP is gone even while it still stands: the battle's own hit
 // leaves it standing until the action ends (YEP's IMMORTAL on the targets).
-$.pvpLegsDestroyed = function() {
+// rec: that foe's legs (none given: the first foe's - one against one, all).
+$.pvpLegsDestroyed = function(rec) {
+    rec = rec || $.duelFoes()[0];
     var legs = $gameTroop.members().filter(function(e) {
-        return e._fhPvpFoe && $.isPvpLeg(e._fhPart);
+        return e._fhPvpFoe && $.isPvpLeg(e._fhPart) && $.duelRecOf(e) === rec;
     });
     return legs.length > 0 && legs.every(function(e) { return e.isDead() || e.isHidden() || e.hp <= 0; });
 };
@@ -3320,9 +3504,12 @@ $.pvpLegsDestroyed = function() {
 // the enemy window for good (play test 0.38.3-pre3, O'saa against Marina).
 // True: a head's lock changed.
 $.updatePvpHead = function() {
-    var unlocked = $.pvpLegsDestroyed(), changed = false;
+    var changed = false, open = {};
     $gameTroop.members().forEach(function(e) {
         if (!e._fhPvpFoe || e._fhPart !== 'head') return;
+        var rec = $.duelRecOf(e), key = rec ? $.duelFoes().indexOf(rec) : 0;
+        if (open[key] === undefined) open[key] = $.pvpLegsDestroyed(rec);
+        var unlocked = open[key];
         if (!!e._fhPvpHeadLocked !== !unlocked) changed = true;
         e._fhPvpHeadLocked = !unlocked;
     });
@@ -3430,9 +3617,11 @@ $.eventStartHooks.push(function(conn, ev, page) {
     return $.tryBetrayal(conn.guestId, ev, page);
 });
 
+// (also with every other player away: its only partner gone, the original
+// door counted that one alive (V201) and never opened - review 2026-11-06)
 var _startForHost = Game_Event.prototype.start;
 Game_Event.prototype.start = function() {
-    if ($.isHost() && $.sessionActive() && !$gamePlayer._fhRemoteId && this.page() &&
+    if ($.isHost() && ($.sessionActive() || $.towerOffline().length > 0) && !$gamePlayer._fhRemoteId && this.page() &&
             $.tryBetrayal('host', this, this.page())) {
         return;
     }
@@ -3472,17 +3661,63 @@ $.startPvp = function(attackerId, foeId) {
     // the guest first: the host's own battle opens at once (sendTo 'host')
     var sides = [[attackerId, foeId, 'atk'], [foeId, attackerId, 'def']];
     if (attackerId === 'host') sides.reverse();
+    $.battles[bid].ids = [attackerId, foeId];
     sides.forEach(function(s) { $.sendTo(s[0], $.duelStartMsg(bid, s[0], s[1], s[2])); });
+    return bid;
+};
+
+// Three or four at once (a free-for-all, $.meleeReport): every PC gets 'pvp'
+// with all the others as its foes (in the order of ids, without itself).
+// Two: the duel above.
+$.startMelee = function(ids) {
+    ids = (ids || []).slice();
+    if (ids.length < 3) return ids.length === 2 ? $.startPvp(ids[0], ids[1]) : 0;
+    var ok = ids.every(function(id) {
+        var a = $.actorOfPlayer(id);
+        return !!a && !!$.PVP_TROOP[a.actorId()];
+    });
+    if (!ok) return 0;
+    var bid = $.newBid();
+    $.battles[bid] = {
+        bid: bid, owner: ids[0], troopId: 0, eventId: $.TOWER_EVENT, mapId: $gameMap.mapId(),
+        joiners: [], pvp: true, melee: true, ids: ids.slice(), alive: ids.slice(),
+        attackerId: ids[0], foeId: ids[1], opened: {}, reports: {}
+    };
+    ids.forEach(function(id) {
+        var c = id === 'host' ? null : $.clientById(id);
+        if (c) c.inBattle = bid;
+    });
+    $.broadcastToast('Everyone for themselves: ' + ids.map($.playerLabel).join(', ') + '!');
+    $.dlog('betrayal free-for-all', ids.map($.playerLabel).join(' vs '));
+    // the guests first: the host's own battle opens at once (sendTo 'host')
+    var order = ids.filter(function(id) { return id !== 'host'; }).concat(ids.indexOf('host') >= 0 ? ['host'] : []);
+    order.forEach(function(id) {
+        var others = ids.filter(function(o) { return o !== id; });
+        $.sendTo(id, $.duelStartMsg(bid, id, others[0], 'atk', others));
+    });
+    return bid;
+};
+
+// Everyone in a duel (the two of one against one, or all of a free-for-all).
+$.duelIds = function(b) {
+    return b ? (b.ids || [b.attackerId, b.foeId]).filter(function(id) { return !!id; }) : [];
 };
 
 // What a duelist's PC needs: its foe's character and limbs, its own limbs,
 // and for a guest its character, bag and the world (it runs the battle).
-$.duelStartMsg = function(bid, id, foeId, role) {
+// others: every foe of a free-for-all (foeId is the first of them).
+$.duelStartMsg = function(bid, id, foeId, role, others) {
     var mine = $.actorOfPlayer(id), foe = $.actorOfPlayer(foeId);
     var msg = {
         t: 'pvp', bid: bid, role: role, foeId: foeId, foeName: $.playerLabel(foeId),
         foeActor: $.actorJson(foe), limbs: $.limbState(foe.actorId()), myLimbs: $.limbState(mine.actorId())
     };
+    if (others && others.length > 1) {
+        msg.foes = others.map(function(f) {
+            var a = $.actorOfPlayer(f);
+            return { id: f, name: $.playerLabel(f), actor: $.actorJson(a), limbs: $.limbState(a.actorId()) };
+        });
+    }
     var conn = id === 'host' ? null : $.clientById(id);
     if (conn) {
         var data = $.meData(conn);
@@ -3497,18 +3732,169 @@ $.duelStartMsg = function(bid, id, foeId, role) {
 
 $.PVP_TROOP_ID = 0;
 
-$.buildPvpTroop = function(foeActorId, limbs) {
+// The duel's troop: the duel form of each other player (one, or more in a
+// free-for-all), its parts in troop order, one after the other
+// (troop.fhFoes: [{ first, count }] per foe, in the order given). The index
+// of a part within its own foe's parts is the same on every PC.
+$.buildPvpTroop = function(foeActorIds) {
     if (!$.PVP_TROOP_ID) $.PVP_TROOP_ID = $dataTroops.length;
-    var members = $.pvpTroopMembers(foeActorId)
-        .map(function(m) { return { enemyId: m.enemyId, x: m.x, y: m.y, hidden: false }; });
-    $dataTroops[$.PVP_TROOP_ID] = {
-        id: $.PVP_TROOP_ID, name: 'FH Co-op duel', members: members,
-        pages: [{ conditions: {
-            actorHp: 50, actorId: 1, actorValid: false, enemyHp: 50, enemyIndex: 0, enemyValid: false,
-            switchId: 1, switchValid: false, turnA: 0, turnB: 0, turnEnding: false, turnValid: false
-        }, list: [{ code: 0, indent: 0, parameters: [] }], span: 0 }]
-    };
+    var ids = Array.isArray(foeActorIds) ? foeActorIds : [foeActorIds];
+    var members = [], fhFoes = [];
+    ids.forEach(function(actorId) {
+        var first = members.length;
+        $.pvpTroopMembers(actorId).forEach(function(m) {
+            members.push({ enemyId: m.enemyId, x: m.x, y: m.y, hidden: false });
+        });
+        fhFoes.push({ first: first, count: members.length - first });
+    });
+    // more than one: side by side, each body on its share of the screen (as
+    // the grab fights put contestants together: FH_CoopRoam $.grabTroop)
+    if (ids.length > 1) {
+        var w = $.GRAB_WIDTH || Graphics.boxWidth;
+        fhFoes.forEach(function(f, g) {
+            if (!f.count) return;
+            var mid = 0;
+            for (var i = f.first; i < f.first + f.count; i++) mid += members[i].x;
+            mid /= f.count;
+            var dx = Math.round(w * (g + 1) / (ids.length + 1) - mid);
+            for (var j = f.first; j < f.first + f.count; j++) {
+                members[j].x = Math.max(24, Math.min(w - 24, members[j].x + dx));
+            }
+        });
+    }
+    var pages = [{ conditions: {
+        actorHp: 50, actorId: 1, actorValid: false, enemyHp: 50, enemyIndex: 0, enemyValid: false,
+        switchId: 1, switchValid: false, turnA: 0, turnB: 0, turnEnding: false, turnValid: false
+    }, list: [{ code: 0, indent: 0, parameters: [] }], span: 0 }];
+    // The gasoline canister (user 2026-11-09), after the parts: their indexes
+    // stay the same on both PCs. One against one it stands on the PC of the
+    // one who set it down; in a free-for-all everyone sees it (the middle of
+    // the screen) and it spares the one who blows it up ($.meleeCanister).
+    var src = $dataTroops[$.PVP_TROOP[ids[0]]];
+    var can = src ? src.members.filter(function(m) { return m.enemyId === $.CANISTER_ENEMY; })[0] : null;
+    if (can) {
+        var x = ids.length > 1 ? Math.round(($.GRAB_WIDTH || Graphics.boxWidth) / 2) : can.x;
+        members.push({ enemyId: can.enemyId, x: x, y: can.y, hidden: true });
+        pages = pages.concat($.duelCanisterPages(src, src.members.indexOf(can), members.length - 1));
+    }
+    pages.push($.duelBloodWeaponPage());
+    $dataTroops[$.PVP_TROOP_ID] = { id: $.PVP_TROOP_ID, name: 'FH Co-op duel', members: members, pages: pages,
+        fhFoes: fhFoes };
     return $.PVP_TROOP_ID;
+};
+
+// Each other player in this PC's duel has a record (one against one: one).
+// rec: { foeId, foeName, foe (a copy of its character), limbs (cut before),
+// first / count (its parts in the troop), ctl (its torso here), cut,
+// foeDown, out (the host took it out of a free-for-all), hitsOut / hitsIn
+// (hits sent to it / taken from it), waitFoe (its battle is not up yet), and
+// what its stream brings: foeParams, foeX, foeS, foeEl, foeGuts, foeCut,
+// foeEq, foeHoldAt, agi; per action: surviveTurn, gutsHit, gutsUsed;
+// aoeBodyRate }. A duel state without foes (an older form, the tests) is
+// its own one record.
+$.DUEL_FOE_FIELDS = ['foe', 'foeId', 'foeName', 'limbs', 'ctl', 'cut', 'foeDown', 'foeParams', 'foeX', 'foeS',
+    'foeEl', 'foeGuts', 'foeCut', 'foeEq', 'foeHoldAt', 'aoeBodyRate', 'hitsOut', 'hitsIn', 'surviveTurn',
+    'gutsHit', 'gutsUsed', 'toldBack'];
+
+$.duelFoes = function(pb) {
+    pb = pb || $.pvpBattle;
+    return pb ? (pb.foes || [pb]) : [];
+};
+
+// The ones still fighting here.
+$.duelLiveFoes = function(pb) {
+    return $.duelFoes(pb).filter(function(r) { return !r.foeDown && !r.out; });
+};
+
+$.duelRecById = function(pb, id) {
+    return $.duelFoes(pb).filter(function(r) { return r.foeId === id; })[0] || null;
+};
+
+// The record a part (or anything of the troop) belongs to.
+$.duelRecOf = function(e) {
+    if (e && e._fhDuelRec) return e._fhDuelRec;
+    return $.duelFoes()[0] || null;
+};
+
+$.isMelee = function(pb) {
+    pb = pb || $.pvpBattle;
+    return !!pb && !!pb.foes && pb.foes.length > 1;
+};
+
+// This PC's duel state. The single-foe names (pb.ctl, pb.foe, pb.foeId ...)
+// read and write the first record: a duel against one player reads as before.
+$.makeDuelState = function(base, recs) {
+    var pb = base;
+    pb.foes = recs;
+    $.DUEL_FOE_FIELDS.forEach(function(k) {
+        Object.defineProperty(pb, k, {
+            configurable: true, enumerable: true,
+            get: function() { return recs[0] ? recs[0][k] : undefined; },
+            set: function(v) { if (recs[0]) recs[0][k] = v; }
+        });
+    });
+    Object.defineProperty(pb, 'waitFoe', {
+        configurable: true, enumerable: true,
+        get: function() { return recs.some(function(r) { return r.waitFoe && !r.out; }); },
+        set: function(v) { recs.forEach(function(r) { r.waitFoe = !!v; }); }
+    });
+    return pb;
+};
+
+// Blood sword and Longinus (user 2026-11-09): the original's "SpecialSkills"
+// page calls CE482 (the line, the weapon in hand); the duel's troop runs that
+// part of it. The original's after-battle event takes the weapons away; a duel
+// runs none ($.duelBloodEnd).
+$.BLOOD_WEAPONS = [33, 34];
+$.BLOOD_SWITCHES = [1267, 1268]; // SKILL_blood_sword, SKILL_blood_spear
+$.duelBloodWeaponPage = function() {
+    return { conditions: {
+        actorHp: 50, actorId: 1, actorValid: false, enemyHp: 50, enemyIndex: 0, enemyValid: false,
+        switchId: 200, switchValid: true, turnA: 0, turnB: 0, turnEnding: false, turnValid: false
+    }, span: 1, list: [
+        { code: 117, indent: 0, parameters: [482] },
+        { code: 121, indent: 0, parameters: [200, 200, 1] },
+        { code: 0, indent: 0, parameters: [] }
+    ] };
+};
+$.duelBloodEnd = function() {
+    $.BLOOD_SWITCHES.forEach(function(id) { $gameSwitches.setValue(id, false); });
+    $gameSwitches.setValue($.ROT_SWITCH, false); // (Rot's event turned it on; no page here turns it off)
+    $gameSwitches.setValue($.ROT_SWITCH, false); // (Rot's event turned it on; no page here turns it off)
+    $.BLOOD_WEAPONS.forEach(function(id) { $gameParty.loseItem($dataWeapons[id], 999, true); });
+};
+
+// The original's two canister pages of the character's own troop (the item
+// turns SW2930 on: it appears; hit, it burns the troop's side), for its place
+// in the duel's troop. SW2931 "used" stays on until the battle's after-event,
+// which a duel does not run: cleared at the duel's end.
+$.CANISTER_ENEMY = 84;
+$.CANISTER_SWITCHES = [2930, 2931]; // gasoline_canister, gasoline_used
+$.CANISTER_TEXT = 'A gasoline canister was set down!';
+$.duelCanisterPages = function(src, from, at) {
+    var pages = src.pages.filter(function(p) {
+        var c = p.conditions;
+        return (c.switchValid && c.switchId === $.CANISTER_SWITCHES[0]) || (c.enemyValid && c.enemyIndex === from);
+    });
+    return JSON.parse(JSON.stringify(pages)).map(function(p) {
+        if (p.conditions.enemyValid) p.conditions.enemyIndex = at;
+        p.list.forEach(function(c) {
+            var first = [331, 333, 335].indexOf(c.code) >= 0 && c.parameters[0] === from;
+            if (first) c.parameters[0] = at;
+            if (c.code === 339 && c.parameters[0] === 0 && c.parameters[1] === from) c.parameters[1] = at;
+        });
+        return p;
+    });
+};
+
+// The other player is told: only the one who set it down has it on its screen.
+var _appearCanister = Game_Enemy.prototype.appear;
+Game_Enemy.prototype.appear = function() {
+    var was = this.isHidden();
+    _appearCanister.call(this);
+    if (was && !this.isHidden() && this.enemyId() === $.CANISTER_ENEMY && $.pvpBattle && !$.puppet) {
+        $.battleGab($.CANISTER_TEXT);
+    }
 };
 
 // This PC's duel: { bid, role ('atk' / 'def'), foeId, foeName, foe (a copy of
@@ -3555,8 +3941,14 @@ $.guestHandlers.pvp = function(msg) {
             $.duelSnap = $.copyInv($.partyInv(), $gameActors.actor($.myActorId));
         }
     }
-    var foe = JsonEx.parse(msg.foeActor);
-    var troopId = $.buildPvpTroop(foe.actorId(), msg.limbs);
+    var foes = msg.foes && msg.foes.length ? msg.foes :
+        [{ id: msg.foeId, name: msg.foeName, actor: msg.foeActor, limbs: msg.limbs }];
+    var recs = foes.map(function(f) {
+        var copy = JsonEx.parse(f.actor);
+        return { foeId: f.id, foeName: f.name || copy.name(), foe: copy, limbs: f.limbs, ctl: null, cut: {},
+            hitsOut: 0, hitsIn: 0, waitFoe: true };
+    });
+    var troopId = $.buildPvpTroop(recs.map(function(r) { return r.foe.actorId(); }));
     var myId = $.isHost() ? $.hostActorId() : $.myActorId;
     var mine = $gameActors.actor(myId);
     // The party is this player's own character, whatever the party was (a
@@ -3577,20 +3969,22 @@ $.guestHandlers.pvp = function(msg) {
     if (($.isHost() || guestKeeps) && myId && mine && partyBefore.join() !== String(myId)) {
         $.authBattle.restoreActors = partyBefore;
     }
-    $.pvpBattle = {
-        bid: msg.bid, role: msg.role || 'atk', foeId: msg.foeId, foeName: msg.foeName || foe.name(), foe: foe,
-        limbs: msg.limbs, ctl: null, cut: {},
+    $.pvpBattle = $.makeDuelState({
+        bid: msg.bid, role: msg.role || 'atk',
         self: $.duelSelfBody(myId, mine ? mine.hp : 1, mine ? mine.mhp : 1, msg.myLimbs),
-        hitsOut: 0, hitsIn: 0, waitFoe: true, openedAt: $.clockMs()
-    };
+        openedAt: $.clockMs()
+    }, recs);
+    if ($gameActors.actor(myId)) $gameActors.actor(myId).removeState($.PHOBIA_STATE); // (none comes along)
     BattleManager.setup(troopId, false, false);
     BattleManager.setEventCallback(function(n) {
         if ($.localBattle) $.localBattle.result = n;
     });
     $.setupPvpEnemies();
     SceneManager.push(Scene_Battle);
-    $.dlog('duel: my battle opens', msg.bid, msg.role, 'against', $.pvpBattle.foeName);
-    if (msg.role === 'def') $.toast('Co-op: ' + $.pvpBattle.foeName + ' betrayed you - fight!');
+    var names = recs.map(function(r) { return r.foeName; }).join(', ');
+    $.dlog('duel: my battle opens', msg.bid, msg.role, 'against', names);
+    if (recs.length > 1) $.toast('Co-op: everyone for themselves - fight!');
+    else if (msg.role === 'def') $.toast('Co-op: ' + $.pvpBattle.foeName + ' betrayed you - fight!');
 };
 
 // A limb cut before the duel ([right arm, left arm, right leg, left leg]).
@@ -3606,31 +4000,54 @@ $.limbCutBefore = function(kind, limbs) {
 // starts at the character's HP share (60 of 100 HP: 600 of 1000).
 $.setupPvpEnemies = function() {
     var pb = $.pvpBattle;
-    var foe = pb.foe;
-    var pools = $.pvpPartPools(foe.actorId(), foe.mhp);
-    $gameTroop.members().forEach(function(e, i) {
-        e._fhPvpFoe = foe;
-        e._fhPvpAppliedStates = {};
-        var kind = $.partKind(e.originalName());
-        e._fhPart = kind;
-        var pool = pools[i] && pools[i].enemyId === e.enemyId() ? pools[i] :
-            pools.filter(function(p) { return p.enemyId === e.enemyId(); })[0];
-        if (pool) {
-            e._fhPvpMaxHp = pool.mhp;
-            e.refresh();
-            e.setHp(pool.body ? Math.max(1, Math.min(e.mhp, $.duelBodyOfHp(foe.hp, foe.mhp, pool.mhp))) : e.mhp);
+    var recs = $.duelFoes(pb);
+    var troop = $gameTroop.troop ? $gameTroop.troop() : null;
+    var spans = (troop && troop.fhFoes) || [{ first: 0, count: $gameTroop.members().length }];
+    var members = $gameTroop.members();
+    recs.forEach(function(rec, k) {
+        var span = spans[k] || { first: 0, count: members.length };
+        var foe = rec.foe;
+        var pools = $.pvpPartPools(foe.actorId(), foe.mhp);
+        rec.first = span.first;
+        rec.count = span.count;
+        rec.ctl = null;
+        for (var i = span.first; i < span.first + span.count && i < members.length; i++) {
+            var e = members[i], at = i - span.first;
+            if ($.NOT_PARTS.indexOf(e.enemyId()) >= 0) continue; // the canister
+            e._fhPvpFoe = foe;
+            e._fhDuelRec = rec;
+            e._fhPvpAppliedStates = {};
+            var kind = $.partKind(e.originalName());
+            e._fhPart = kind;
+            var pool = pools[at] && pools[at].enemyId === e.enemyId() ? pools[at] :
+                pools.filter(function(p) { return p.enemyId === e.enemyId(); })[0];
+            if (pool) {
+                e._fhPvpMaxHp = pool.mhp;
+                e.refresh();
+                e.setHp(pool.body ? Math.max(1, Math.min(e.mhp, $.duelBodyOfHp(foe.hp, foe.mhp, pool.mhp))) : e.mhp);
+            }
+            e._mp = Math.min(foe.mp, e.mmp); // the other player's own MP
+            if (kind === 'torso') {
+                e._fhPvpCtl = true;
+                rec.ctl = e;
+            }
+            if ($.limbCutBefore(kind, rec.limbs)) e.hide();
         }
-        e._mp = Math.min(foe.mp, e.mmp); // the other player's own MP
-        if (kind === 'torso') {
-            e._fhPvpCtl = true;
-            pb.ctl = e;
-        }
-        if ($.limbCutBefore(kind, pb.limbs)) e.hide();
+        if (!rec.ctl) rec.ctl = members[span.first] || null;
+        if (rec.ctl) rec.ctl._fhPvpCtl = true;
     });
-    if (!pb.ctl) pb.ctl = $gameTroop.members()[0];
-    if (pb.ctl) pb.ctl._fhPvpCtl = true;
     $.updatePvpHead();
     $.updatePvpAoeBodyRate();
+};
+
+// The troop index of a foe's part (at: its index among that foe's parts).
+$.duelPartAt = function(rec, at) {
+    return $gameTroop.members()[(rec.first || 0) + at] || null;
+};
+
+// The parts of one foe here.
+$.duelPartsOf = function(rec) {
+    return $gameTroop.members().filter(function(e) { return e._fhPvpFoe && $.duelRecOf(e) === rec; });
 };
 
 // The duel enemy fights with the other player's own stats.
@@ -3650,14 +4067,51 @@ Game_Enemy.prototype.paramBase = function(paramId) {
 var _enemyParamPvp = Game_Enemy.prototype.param;
 Game_Enemy.prototype.param = function(paramId) {
     if (this._fhPvpMaxHp && paramId === 0) return this._fhPvpMaxHp;
+    // as they are on the other player's PC now (dv.pr: its buffs, stance and
+    // gear; the copy from the duel's start does not change, and its states
+    // would count twice with the ones the stream puts on the parts)
+    var rec = this._fhPvpFoe && paramId >= 1 && $.pvpBattle ? $.duelRecOf(this) : null;
+    var live = rec && rec.foeParams;
+    if (live && typeof live[paramId - 1] === 'number') return live[paramId - 1];
     return _enemyParamPvp.call(this, paramId);
 };
 
+// The playable character's numbers as they are (user 2026-11-09), not the
+// enemy version's data (a head's EVA 0.8, physical damage x1.2): dodging,
+// critical evasion, damage rates and element resists come from the other
+// player's own PC (dv.xp, dv.sp, dv.el: its gear and states now); until the
+// first stream, from the copy of its character.
+$.duelFoeTrait = function(enemy, key, id, method) {
+    var rec = $.pvpBattle ? $.duelRecOf(enemy) : null, live = rec && rec[key];
+    return live && typeof live[id] === 'number' ? live[id] : enemy._fhPvpFoe[method](id);
+};
+
+var _enemyXparamPvp = Game_Enemy.prototype.xparam;
+Game_Enemy.prototype.xparam = function(xparamId) {
+    return this._fhPvpFoe ? $.duelFoeTrait(this, 'foeX', xparamId, 'xparam') : _enemyXparamPvp.call(this, xparamId);
+};
+
+var _enemySparamPvp = Game_Enemy.prototype.sparam;
+Game_Enemy.prototype.sparam = function(sparamId) {
+    return this._fhPvpFoe ? $.duelFoeTrait(this, 'foeS', sparamId, 'sparam') : _enemySparamPvp.call(this, sparamId);
+};
+
+var _enemyElementRatePvp = Game_Enemy.prototype.elementRate;
+Game_Enemy.prototype.elementRate = function(elementId) {
+    return this._fhPvpFoe ? $.duelFoeTrait(this, 'foeEl', elementId, 'elementRate') : _enemyElementRatePvp.call(this, elementId);
+};
+
+// Reflection of an element (the Beheaded wizard: a note on the armor, which
+// the enemy version's part does not have).
+var _enemyElementReflectPvp = Game_Enemy.prototype.elementReflectRate;
+Game_Enemy.prototype.elementReflectRate = function(elementId) {
+    return this._fhPvpFoe ? this._fhPvpFoe.elementReflectRate(elementId) : _enemyElementReflectPvp.call(this, elementId);
+};
+
+// (its states are kept up on the copy: applyDuelFoeBody)
 var _enemyStateRatePvp = Game_Enemy.prototype.stateRate;
 Game_Enemy.prototype.stateRate = function(stateId) {
-    var rate = _enemyStateRatePvp.call(this, stateId);
-    if (this._fhPvpFoe) rate *= this._fhPvpFoe.stateRate(stateId);
-    return rate;
+    return this._fhPvpFoe ? this._fhPvpFoe.stateRate(stateId) : _enemyStateRatePvp.call(this, stateId);
 };
 
 var _enemyIsStateResistPvp = Game_Enemy.prototype.isStateResist;
@@ -3728,18 +4182,112 @@ Game_Action.prototype.makeDamageValue = function(target, critical) {
     var value = _makeDamageValue.call(this, target, critical);
     if ($.pvpBattle && target && target._fhPvpFoe) {
         var kind = target._fhPart;
-        if (kind === 'head' && !$.pvpLegsDestroyed()) return 0;
+        var rec = $.duelRecOf(target);
+        if (kind === 'head' && !$.pvpLegsDestroyed(rec)) return 0;
         var hp = this.isHpEffect();
         if (value < 0) {
             if (!target._fhPvpCtl) return 0;
             return hp ? -$.pvpCurve(value) : value;
         }
         if (value > 0 && hp) value = $.pvpCurve(value);
+        // an attack on one (user 2026-11-09): a little harder, x1.2, in every duel
+        if (value > 0 && hp && this.isForOpponent() && this.isForOne()) {
+            value = Math.max(1, Math.round(value * $.DUEL_SINGLE_DAMAGE_RATE));
+        }
         if (value > 0 && $.isPvpLimb(kind) && $.pvpHasGuard(target._fhPvpFoe, kind)) {
             value = Math.max(1, Math.round(value * 0.5));
         }
+        // a free-for-all: an attack on all enemies hits everyone, less hard
+        if (value > 0 && hp && $.isMelee() && this.isForOpponent() && this.isForAll()) {
+            value = Math.max(1, Math.round(value * $.MELEE_AOE_DAMAGE_RATE));
+        }
+        // Last defense (a passive of the Guardian cameo and the One-winged
+        // necklace under half HP: 40% off), the other PC's to know (dv.cu)
+        if (value > 0 && hp && rec && rec.foeCut) value = Math.max(1, Math.round(value * $.LAST_DEFENSE_RATE));
+        // ($.duelHitBy: a real hit, not an estimate of what it would do)
+        if (value > 0 && hp && $.duelHitBy) value = $.duelLastStand(this, target, value);
     }
     return value;
+};
+
+// A blow that would end the duel (user 2026-11-09): first what the character
+// has for that (Guts, state 145: the Hardened heart, Sisu), last a coin toss,
+// as often as it comes to that. Guts holds that one hit; a coin that lands
+// nothing takes it below 1 for the rest of that action. The PC that hits
+// decides, as it does for the hit: both PCs see the same result. Guts is
+// worked out here and not by the plugin on the parts: their HP is not the
+// character's, and a passive state is not on them. (A blow only the other PC
+// finds lethal: bDuelHit, $.duelLastStandHere.)
+// After the curve (user 2026-11-09): an attack on one enemy (one picked or
+// one at random) x1.2 in every duel; in a free-for-all (3+) an attack on all
+// enemies hits everyone at half (a pipe bomb from full: 90 a part, 45% where
+// one against one takes 90%).
+$.DUEL_SINGLE_DAMAGE_RATE = 1.2;
+$.MELEE_AOE_DAMAGE_RATE = 0.5;
+
+$.GUTS_STATE = 145;
+$.LAST_DEFENSE_STATE = 146;
+$.LAST_DEFENSE_RATE = 0.6;
+$.DUEL_COIN_CHANCE = 0.5;
+$.DUEL_COIN_TEXT = 'Barely held on!';
+$.duelCoinToss = function() {
+    return Math.random() < $.DUEL_COIN_CHANCE;
+};
+$.duelCoin = function() {
+    if (!$.duelCoinToss()) return false;
+    $.dlog('duel: the coin toss held');
+    $.battleGab($.DUEL_COIN_TEXT);
+    return true;
+};
+$.hasGuts = function(battler) {
+    return battler.states().some(function(s) { return s.id === $.GUTS_STATE; });
+};
+
+// (each foe on its own: the foe the part belongs to)
+$.duelLastStand = function(action, target, value) {
+    var pb = $.pvpBattle, rec = $.duelRecOf(target), body = rec && rec.ctl;
+    if (!body || rec.foeDown || rec.out) return value;
+    var rate = Math.max(1, $.pvpAoeBodyDamageRate(action, target));
+    var fit = Math.floor(Math.max(0, body.hp - 1) / rate); // the most the body can take and stay up
+    if (target._fhPart === 'head') fit = Math.min(fit, Math.max(0, target.hp - 1));
+    if (value <= fit) return value;
+    if (rec.surviveTurn) return fit;
+    // Guts holds one hit (user 2026-11-09: a multi-hit attack goes through it
+    // from its second hit on, as in the original). An attack on all parts is
+    // one hit: the n-th time any part is hit in this action is the n-th hit.
+    var hit = (pb.hitCount && pb.hitCount[$gameTroop.members().indexOf(target)]) || 1;
+    if (rec.gutsHit && hit <= rec.gutsHit) return fit;
+    // (Guts does not work at exactly 1 HP, as in the plugin)
+    if (rec.foeGuts && $.duelHpOfBody(body.hp, rec.foe.mhp, body.mhp) > 1) {
+        rec.gutsUsed = true;
+        rec.gutsHit = hit;
+        return fit;
+    }
+    if (!$.duelCoin()) return value;
+    rec.surviveTurn = true;
+    return fit;
+};
+
+// The action is over: the next blow is looked at again.
+var _endActionLastStand = BattleManager.endAction;
+BattleManager.endAction = function() {
+    if ($.pvpBattle) {
+        $.duelFoes().forEach(function(rec) {
+            rec.surviveTurn = false;
+            rec.gutsHit = 0;
+        });
+        $.pvpBattle.hitCount = null;
+    }
+    _endActionLastStand.call(this);
+};
+
+// This PC's own body could not take a blow the other PC did not see as lethal.
+$.duelLastStandHere = function(me) {
+    if (me.hp > 1 && $.hasGuts(me)) {
+        me.removeState($.GUTS_STATE); // (a passive one stays, as in the plugin)
+        return true;
+    }
+    return $.duelCoin();
 };
 
 // Limbs and the head cannot regain HP. Damage on any proxy part also reduces
@@ -3760,7 +4308,8 @@ Game_Battler.prototype.gainHp = function(value) {
     if (!$.pvpBattle || !this._fhPvpFoe) return;
 
     var damage = Math.max(0, -value);
-    var body = $.pvpBattle.ctl;
+    var rec = $.duelRecOf(this);
+    var body = rec ? rec.ctl : null;
     var damageContext = _pvpDamageContext && _pvpDamageContext.target === this
         ? _pvpDamageContext : null;
     var bodyRate = damageContext ? damageContext.bodyRate : 1;
@@ -3797,12 +4346,17 @@ Game_Action.prototype.itemEffectRecoverHp = function(target, effect) {
 // A foe part fell: a limb is cut, the head lock and the AoE share are looked
 // at again. Torso or head destroyed: the other player has lost, every part
 // falls (pb.foeDown; the parts that fall with it are not cut).
+// In a free-for-all only that foe falls, and the host hears it from here
+// too ($.duelKo: the hitter's word, as one against one).
 $.checkPvpParts = function(target) {
     var pb = $.pvpBattle;
     if (!pb || !target.isEnemy() || !target._fhPvpFoe || !target.isDead()) return;
     var kind = target._fhPart;
-    if (!pb.foeDown) {
-        pb.cut[kind] = true;
+    var rec = $.duelRecOf(target);
+    if (!rec) return;
+    if (!rec.foeDown) {
+        rec.cut = rec.cut || {};
+        rec.cut[kind] = true;
         if ($.isPvpLimb(kind) && !target._fhCutTold) {
             target._fhCutTold = true;
             $.battleGab($.pvpCutText(target._fhPvpFoe.name(), kind), true);
@@ -3810,20 +4364,48 @@ $.checkPvpParts = function(target) {
     }
     $.updatePvpHead();
     $.updatePvpAoeBodyRate();
-    if ((kind === 'torso' || kind === 'head') && !pb.foeDown) $.pvpFoeFalls();
+    if ((kind === 'torso' || kind === 'head') && !rec.foeDown) {
+        if ($.isMelee(pb)) {
+            $.pvpFoeFalls(rec);
+            $.duelKo(rec);
+        } else {
+            $.pvpFoeFalls();
+        }
+    }
 };
 
-// The foe lost: every part of it falls here. A part the battle keeps
-// standing for the rest of an action (YEP's IMMORTAL on its targets) too.
-$.pvpFoeFalls = function() {
-    if ($.pvpBattle) $.pvpBattle.foeDown = true;
+// A foe lost: every part of it falls here (rec: that foe alone; none: all of
+// them, the canister too). A part the battle keeps standing for the rest of
+// an action (YEP's IMMORTAL on its targets) too.
+$.pvpFoeFalls = function(rec) {
+    var pb = $.pvpBattle;
+    if (rec) rec.foeDown = true;
+    else $.duelFoes(pb).forEach(function(r) { r.foeDown = true; });
+    // the last one: the canister goes too (the battle is won)
+    if (rec && $.duelFoes(pb).every(function(r) { return r.foeDown || r.out; })) rec = null;
     $gameTroop.members().forEach(function(e) {
+        if (rec && (!e._fhPvpFoe || $.duelRecOf(e) !== rec)) return;
         if (e.isImmortal && e.isImmortal() && e.removeImmortal) e.removeImmortal();
         if (e.isAlive()) {
             e.addState(e.deathStateId());
             e.performCollapse();
         }
     });
+    if (rec) {
+        $.updatePvpAoeBodyRate();
+        $.duelAverageFoeAgi();
+    }
+};
+
+// A foe broken on this PC in a free-for-all: the host takes it out.
+$.duelKo = function(rec) {
+    var pb = $.pvpBattle;
+    if (!pb || !rec || rec.koSent || rec.out) return;
+    rec.koSent = true;
+    $.dlog('duel: I broke', rec.foeName, pb.bid);
+    var msg = { t: 'duelKo', bid: pb.bid, id: rec.foeId };
+    if ($.isHost()) $.hostHandlers.duelKo(null, msg);
+    else if ($.conn) $.conn.send(msg);
 };
 
 // A foe part that falls, however it fell: in its own hit (gainHp), when the
@@ -3853,13 +4435,15 @@ $.duelFoePartsFrame = function() {
     var pb = $.pvpBattle;
     if (!pb) return;
     if ($.updatePvpHead()) $.updatePvpAoeBodyRate();
-    if (pb.foeDown && $gameTroop.members().some(function(e) { return e._fhPvpFoe && e.isAlive(); })) {
-        $.pvpFoeFalls();
-    }
+    $.duelFoes(pb).forEach(function(rec) {
+        if (!rec.foeDown && !rec.out) return;
+        var up = $gameTroop.members().some(function(e) { return e._fhPvpFoe && $.duelRecOf(e) === rec && e.isAlive(); });
+        if (up) $.pvpFoeFalls($.isMelee(pb) ? rec : null);
+    });
 };
 
 $.pvpFoeCuts = function() {
-    return $.pvpBattle ? Object.keys($.pvpBattle.cut) : [];
+    return $.pvpBattle && $.pvpBattle.cut ? Object.keys($.pvpBattle.cut) : [];
 };
 
 // False-flag exceptions: opponent-only states and wiki-listed battle states.
@@ -3923,6 +4507,11 @@ $.finishPvp = function(b, msg) {
     // (a loser that left: the name it had - its connection is gone by now)
     var label = function(id) { return (b.names && b.names[id]) || $.playerLabel(id); };
     $.broadcastToast(b.lethal ? label(winner) + ' killed ' + label(loser) + '.' : label(winner) + ' won the duel.');
+    $.duelLoserDies(b, loser);
+};
+
+// A duel's loser dies (a free-for-all: each one taken out of it).
+$.duelLoserDies = function(b, loser) {
     $.quietDeath = !!b.lethal; // (no second line for that death: killPlayer, hostDeadWatch)
     // its body is a contestant's (FH_CoopRoam "Bodies as events"): the actor
     // that died in a duel, the tower's or one to the death
@@ -3964,7 +4553,7 @@ $.applyDuelCuts = function(id, kinds) {
 // Both duelists: the duel is over (win: that one won; without a winner the
 // battle just ends, e.g. a duel called off).
 $.sendDuelEnd = function(b, winner) {
-    [b.attackerId, b.foeId].forEach(function(id) {
+    $.duelIds(b).forEach(function(id) {
         var msg = { t: 'pvpEnd', bid: b.bid };
         if (winner) msg.win = id === winner;
         $.sendTo(id, msg);
@@ -3977,6 +4566,8 @@ var _endBattlePvp = BattleManager.endBattle;
 BattleManager.endBattle = function(result) {
     var pb = $.pvpBattle;
     var cuts = pb ? $.duelSelfCuts() : [];
+    if (pb) $.CANISTER_SWITCHES.forEach(function(id) { $gameSwitches.setValue(id, false); });
+    if (pb) $.duelBloodEnd();
     if (pb && $.isHost()) $.sendDuelBody();
     _endBattlePvp.call(this, result);
     if ($.isHost() && pb && !$.localBattle) {
@@ -4003,7 +4594,8 @@ $.canUseInDuel = function(actor, skill) {
 $.pickQueue = [];
 $.pickShown = null;
 $.showPickBox = function(title, options, done, cancelIndex) {
-    var entry = { title: title, options: options, done: done, cancelIndex: cancelIndex, close: null };
+    // (the Korean patch: in Korean)
+    var entry = { title: $.ko(title), options: (options || []).map($.ko), done: done, cancelIndex: cancelIndex, close: null };
     $.pickQueue.push(entry);
     if (!$.pickShown) $.nextPickBox();
     return function() {
@@ -4102,8 +4694,15 @@ $.TOWER_TINT_FRAMES = 80;                   // the original's tints, both ways
 // 144 Hz screen - 0.4 review A6)
 $.DUEL_DARK_MS = 1400;       // to black (80 frames), then everyone in its seat
 $.DUEL_LIGHT_MS = 1400;      // back from black (80 frames), then the heads held
-$.DUEL_POSE_MS = 2600;       // the heartbeat (CE457, about 1.6 s) and a moment more
-$.DUEL_INTRO_MS = 5600;      // the first duel starts after this
+// The heads held (user 2026-11-09: "it went by in a flash"): 5 s, three
+// heartbeats (CE457 each, about 1.6 s at 60 fps - its own waits are frames,
+// faster on a fast screen, so each beat starts at its own time here); after
+// the second the line (TOURNEY_GAB), after the third the fight.
+$.DUEL_POSE_MS = 5000;
+$.DUEL_BEATS = 3;
+$.DUEL_BEAT_MS = 5000 / 3;   // one beat starts every this
+$.DUEL_GAB_AFTER_BEAT = 2;
+$.DUEL_INTRO_MS = 1400 + 1400 + 5000 + 200; // the first duel starts after this (the scene and a moment)
 $.TOWER_TELL_MS = 1000;      // the door's message, at most this often per player
 
 // The heartbeat of the Eye of Rher (CE456 HEARTBEAT2, hard mode) without its
@@ -4289,23 +4888,30 @@ $.startTourney = function(ids) {
         var actor = $.actorOfPlayer(id);
         actors[id] = actor ? actor.actorId() : 0;
     });
+    // one match of everyone (user 2026-11-09): two, a duel; more, a free-for-all
     $.tourney = {
-        players: order.slice(), round: order, next: [], cur: null,
+        players: order.slice(), cur: null, winner: null, over: false,
         introUntil: $.clockMs() + $.DUEL_INTRO_MS, nextAt: 0, duels: 0
     };
     $.dlog('betrayal tournament', order.join(' '));
     var msg = { t: 'tourneyIntro', ids: order, text: $.TOURNEY_GAB, actors: actors };
     $.activeGuests().forEach(function(c) { c.send(msg); });
     $.guestHandlers.tourneyIntro(msg);
-    $.broadcastToast($.bracketText(order));
+    $.broadcastToast(order.length > 2 ? 'Everyone fights at once: ' + order.map($.playerLabel).join(', ') + '.' :
+        $.bracketText(order));
 };
 
-// Every PC: the gab, then the original scene (each PC seats its own player
-// and the avatars it draws: a roaming guest's spot reaches the host as any
-// step does).
+// Every PC: the original scene (each PC seats its own player and the avatars
+// it draws: a roaming guest's spot reaches the host as any step does), its
+// line after the second heartbeat. A PC not at the tower: the line at once.
 $.guestHandlers.tourneyIntro = function(msg) {
-    if ($.fieldGab) $.fieldGab(msg.text); else $.toast(msg.text);
-    $.playDuelIntro(msg.ids || [], msg.actors || {});
+    if ($.playDuelIntro(msg.ids || [], msg.actors || {}, msg.text)) return;
+    $.duelIntroGab(msg.text);
+};
+
+$.duelIntroGab = function(text) {
+    if (!text) return;
+    if ($.fieldGab) $.fieldGab(text); else $.toast(text);
 };
 
 // Each player in its character's seat (once the screen is black). The host
@@ -4345,14 +4951,17 @@ Game_Player.prototype.canMove = function() {
     return _canMoveDuelIntro.call(this);
 };
 
-// EV617 page 0: to black. The rest goes on in $.updateDuelIntro.
-$.playDuelIntro = function(ids, actors) {
-    if (!$gameMap || $gameMap.mapId() !== $.TOWER_MAP) return; // e.g. a dead host watching elsewhere
+// EV617 page 0: to black. The rest goes on in $.updateDuelIntro. True: it
+// plays (text: its line, after the second heartbeat).
+$.playDuelIntro = function(ids, actors, text) {
+    if (!$gameMap || $gameMap.mapId() !== $.TOWER_MAP) return false; // e.g. a dead host watching elsewhere
     var now = $.clockMs();
     $.duelIntro = { seatAt: now + $.DUEL_DARK_MS, poseAt: now + $.DUEL_DARK_MS + $.DUEL_LIGHT_MS,
         until: now + $.DUEL_DARK_MS + $.DUEL_LIGHT_MS + $.DUEL_POSE_MS,
-        tone: $gameScreen.tone().slice(), seated: false, heart: null, chars: [], ids: ids, actors: actors || {} };
+        tone: $gameScreen.tone().slice(), seated: false, heart: null, beats: 0, told: false, text: text || '',
+        chars: [], ids: ids, actors: actors || {} };
     $gameScreen.startTint($.TOWER_DARK_TONE, $.TOWER_TINT_FRAMES);
+    return true;
 };
 
 // EV617 page 1: everyone holds its head (its seat event's pose) to CE457.
@@ -4366,6 +4975,12 @@ $.showDuelPoses = function(d) {
         ch._fhPose = seat.pose;
         d.chars.push(ch);
     });
+    $.startDuelBeat(d);
+};
+
+// One heartbeat (CE457 as it is).
+$.startDuelBeat = function(d) {
+    d.beats++;
     d.heart = new Game_Interpreter();
     d.heart.setup($.towerHeartList(), 0);
 };
@@ -4414,7 +5029,14 @@ $.updateDuelIntro = function() {
             $.stopDuelHeart(d);
         }
     }
+    // the line once the second beat is over; the next beat at its own time
+    if (!d.heart && !d.told && d.beats >= $.DUEL_GAB_AFTER_BEAT) {
+        d.told = true;
+        $.duelIntroGab(d.text);
+    }
+    if (!d.heart && d.beats < $.DUEL_BEATS && now >= d.poseAt + d.beats * $.DUEL_BEAT_MS) $.startDuelBeat(d);
     if (now < d.until) return;
+    if (!d.told) $.duelIntroGab(d.text); // (cut short: still said once)
     $.endDuelIntro(true);
 };
 
@@ -4677,19 +5299,28 @@ $.guestHandlers.duelWon = function() {
     if ($.isRoaming && $.isRoaming() && $.sendRoamMe) $.sendRoamMe(true);
 };
 
-// The duel of cur is over (or one side is out): the bracket goes on.
+// The match is over (or everyone but one is out): the winner is healed and
+// the tournament ends ($.tourneyUpdate). One match only (user 2026-11-09).
 $.tourneyMatchDone = function(winner, loser) {
     var t = $.tourney;
     var cur = t && t.cur;
     if (!cur) return;
     t.cur = null;
     t.duels++;
+    t.over = true;
     t.nextAt = $.clockMs() + $.DUEL_GAP_MS;
-    $.dlog('tournament duel over', winner, 'beat', loser);
-    if ($.tourneyOut(winner)) return;
+    $.dlog('tournament match over, winner', winner, loser ? '(last beaten: ' + loser + ')' : '');
+    if (!winner || $.tourneyOut(winner)) return;
+    t.winner = winner;
     $.duelHeal(winner, cur.snap ? cur.snap[winner] : null);
-    t.next.push(winner);
     $.broadcastToast($.playerLabel(winner) + ' recovers fully.');
+};
+
+// A free-for-all of the tournament ended ($.meleeWin).
+$.tourneyMeleeDone = function(b, winner) {
+    var t = $.tourney;
+    if (!t || !t.cur || t.cur.bid !== b.bid) return;
+    $.tourneyMatchDone(winner, null);
 };
 
 // A participant left the session: it forfeits and dies.
@@ -4698,47 +5329,40 @@ $.tourneyForfeit = function(conn) {
     var id = conn.guestId;
     if (!t || t.players.indexOf(id) < 0) return;
     $.markDeadConn(conn, conn.name + ' left the duels and died.');
-    var keep = function(other) { return other !== id; };
-    t.round = t.round.filter(keep);
-    t.next = t.next.filter(keep);
     var cur = t.cur;
-    if (!cur || (cur.a !== id && cur.b !== id)) return;
-    // it left a running duel: that duel was settled already (the other one
-    // won, finishPvp)
+    if (!cur || cur.ids.indexOf(id) < 0) return;
+    // it left a running match: that was settled for it already (onGuestClosedBattle)
     if (cur.bid && $.battles[cur.bid]) return;
-    $.tourneyMatchDone(cur.a === id ? cur.b : cur.a, id);
+    cur.ids = cur.ids.filter(function(other) { return other !== id; });
+    if (cur.ids.length === 1) $.tourneyMatchDone(cur.ids[0], id);
 };
 
 $.tryStartDuel = function() {
     var t = $.tourney;
     var cur = t.cur;
-    if (!$.duelReady(cur.a) || !$.duelReady(cur.b)) {
+    var waiting = cur.ids.filter(function(id) { return !$.duelReady(id); });
+    if (waiting.length) {
         if ($.clockMs() - (cur.toldAt || 0) >= $.DUEL_WAIT_TELL_MS) {
             cur.toldAt = $.clockMs();
-            var waiting = [cur.a, cur.b].filter(function(id) { return !$.duelReady(id); });
             $.broadcastToast('the next duel waits for ' + waiting.map($.playerLabel).join(' and ') +
                 ' (free, at the tower).');
         }
         return;
     }
     if ($.clockMs() < (cur.retryAt || 0)) return;
-    // both fight in a battle scene: each may use its bag
+    // everyone fights in a battle scene: each may use its bag
     cur.snap = {};
-    cur.snap[cur.a] = $.duelInvSnapshot(cur.a);
-    cur.snap[cur.b] = $.duelInvSnapshot(cur.b);
-    $.startPvp(cur.a, cur.b);
-    Object.keys($.battles).forEach(function(k) {
-        var b = $.battles[k];
-        if (b.pvp && b.attackerId === cur.a && b.foeId === cur.b) cur.bid = b.bid;
-    });
-    if (!cur.bid) {
+    cur.ids.forEach(function(id) { cur.snap[id] = $.duelInvSnapshot(id); });
+    cur.bid = (cur.ids.length > 2 ? $.startMelee(cur.ids) : $.startPvp(cur.ids[0], cur.ids[1])) || 0;
+    if (!cur.bid || !$.battles[cur.bid]) {
+        cur.bid = 0;
         cur.retryAt = $.clockMs() + $.DUEL_RETRY_MS;
-        $.dlog('ERROR tournament duel could not start', cur.a, cur.b);
+        $.dlog('ERROR tournament duel could not start', cur.ids.join(' '));
         return;
     }
     cur.startedAt = $.clockMs();
     $.battles[cur.bid].openBy = $.clockMs() + $.DUEL_OPEN_MS;
-    [cur.a, cur.b].forEach(function(id) { if (id !== 'host') $.sendTo(id, { t: 'duelStart' }); });
+    cur.ids.forEach(function(id) { if (id !== 'host') $.sendTo(id, { t: 'duelStart' }); });
 };
 
 // A duel whose battle is not open on both PCs after a while (one player
@@ -4749,7 +5373,7 @@ $.tryStartDuel = function() {
 $.checkDuelOpen = function(b) {
     if (!b || !b.openBy || $.clockMs() <= b.openBy) return false;
     var opened = b.opened || {}, waiting = b.waiting || {};
-    var ids = [b.attackerId, b.foeId];
+    var ids = $.duelIds(b).filter(function(id) { return !b.melee || b.alive.indexOf(id) >= 0; });
     if (ids.every(function(id) { return opened[id]; })) {
         b.openBy = 0;
         return false;
@@ -4770,17 +5394,27 @@ $.duelSilent = function(id) {
     return !conn || $.clockMs() - (conn._fhHeardAt || 0) > $.DUEL_SILENT_MS;
 };
 
+// A match that goes on and on: the ones silent for long are out (the others
+// heard from fight on, or win). All silent: wait.
 $.checkDuelTimeout = function() {
     var cur = $.tourney.cur;
     var b = $.battles[cur.bid];
-    if ($.clockMs() - (cur.startedAt || 0) < $.DUEL_TIMEOUT_MS) return;
-    var silentA = $.duelSilent(cur.a), silentB = $.duelSilent(cur.b);
-    if (silentA === silentB) return; // a long duel (or both silent): wait
-    var winner = silentA ? cur.b : cur.a, loser = silentA ? cur.a : cur.b;
+    if (!b || $.clockMs() - (cur.startedAt || 0) < $.DUEL_TIMEOUT_MS) return;
+    var ids = b.melee ? b.alive.slice() : $.duelIds(b);
+    var silent = ids.filter($.duelSilent);
+    if (!silent.length || silent.length === ids.length) return; // a long duel (or all silent): wait
+    if (b.melee) {
+        silent.forEach(function(id) {
+            $.dlog('tournament free-for-all:', id, 'silent - out');
+            $.meleeOut(b, id);
+        });
+        return;
+    }
+    var loser = silent[0], winner = ids.filter(function(id) { return id !== loser; })[0];
     $.dlog('tournament duel timed out:', loser, 'silent,', winner, 'wins');
     delete $.battles[cur.bid];
     $.unfreezeBattle(b);
-    [cur.a, cur.b].forEach(function(id) {
+    ids.forEach(function(id) {
         var c = $.clientById(id);
         if (c) c.inBattle = 0;
     });
@@ -4797,48 +5431,44 @@ $.tourneyUpdate = function() {
     var now = $.clockMs();
     if (now < t.introUntil || now < (t.nextAt || 0)) return;
     var keep = function(id) { return !$.tourneyOut(id); };
-    t.round = t.round.filter(keep);
-    t.next = t.next.filter(keep);
     var cur = t.cur;
     if (cur) {
-        if (cur.bid && $.battles[cur.bid]) { // the duel runs
-            $.closeDuelMenus([cur.a, cur.b], cur); // (its battle waits for a menu)
-            if (!$.checkDuelOpen($.battles[cur.bid])) $.checkDuelTimeout();
+        if (cur.bid && $.battles[cur.bid]) { // the match runs
+            var b = $.battles[cur.bid];
+            $.closeDuelMenus(b.melee ? b.alive : cur.ids, cur); // (its battle waits for a menu)
+            if (!$.checkDuelOpen(b)) $.checkDuelTimeout();
             return;
         }
         if (cur.bid) cur.bid = 0; // gone without a result: again
-        var outA = $.tourneyOut(cur.a), outB = $.tourneyOut(cur.b);
-        if (outA || outB) {
-            if (outA && outB) t.cur = null;
-            else $.tourneyMatchDone(outA ? cur.b : cur.a, outA ? cur.a : cur.b);
+        cur.ids = cur.ids.filter(keep);
+        if (cur.ids.length < 2) {
+            if (cur.ids.length) $.tourneyMatchDone(cur.ids[0], null);
+            else t.cur = null;
+            t.over = true;
             return;
         }
-        $.closeDuelMenus([cur.a, cur.b], cur);
+        $.closeDuelMenus(cur.ids, cur);
         $.tryStartDuel();
         return;
     }
-    if (t.round.length >= 2) {
-        var isFinal = t.round.length === 2 && t.next.length === 0;
-        t.cur = { a: t.round.shift(), b: t.round.shift(), bid: 0, toldAt: now, since: now, menuSince: {} };
-        $.closeDuelMenus([t.cur.a, t.cur.b], t.cur); // (notes who is in a menu now)
-        $.broadcastToast((isFinal ? 'Final: ' : 'Duel ' + (t.duels + 1) + ': ') +
-            $.playerLabel(t.cur.a) + ' vs ' + $.playerLabel(t.cur.b) + '!');
+    var living = t.players.filter(keep);
+    if (!t.over && living.length >= 2) {
+        t.cur = { ids: living, bid: 0, toldAt: now, since: now, menuSince: {} };
+        $.closeDuelMenus(t.cur.ids, t.cur); // (notes who is in a menu now)
+        $.broadcastToast(living.length > 2 ? 'Everyone for themselves: ' + living.map($.playerLabel).join(', ') + '!' :
+            'Final: ' + $.playerLabel(living[0]) + ' vs ' + $.playerLabel(living[1]) + '!');
         $.tryStartDuel();
-        return;
-    }
-    if (t.round.length === 1) t.next.push(t.round.shift()); // the bye
-    if (t.next.length >= 2) {
-        t.round = t.next;
-        t.next = [];
         return;
     }
     $.tourney = null;
-    if (t.next[0]) {
+    if ($.tourneyOver) $.tourneyOver('over'); // (everyone free again: FH_CoopRoam "The duels hold")
+    var last = t.winner && !$.tourneyOut(t.winner) ? t.winner : (living.length === 1 ? living[0] : null);
+    if (last) {
         // the last participant: the original door opens for it (a death whose
         // switch was already on did not lower V201)
         $gameVariables.setValue($.CHARACTERS_LEFT_VAR, 1);
-        $.dlog('tournament won by', t.next[0]);
-        $.broadcastToast($.playerLabel(t.next[0]) + ' is the last one standing. The tower door awaits.');
+        $.dlog('tournament won by', last);
+        $.broadcastToast($.playerLabel(last) + ' is the last one standing. The tower door awaits.');
     }
 };
 
@@ -6887,13 +7517,15 @@ $.isOtherPlayerActor = function(actor) {
 $.PLAYER_COLLISION = true;
 $.WAVE_BALLOON = 1; // "!"
 
+// (a down player blocks too, user 2026-11-09: walked over, it was hard to
+// stand in front of it to revive it; a ghost does not)
 $.remoteBlocks = function(id, r) {
     if (!r || r._transparent) return false;
     if ($.isHost()) {
         var conn = $.clientById(id);
-        return !!conn && $.guestOnMap(conn) && !$.isDown(id);
+        return !!conn && $.guestOnMap(conn) && !$.isDead(id);
     }
-    return !$.downIds[id] && !$.deadIds[id];
+    return !$.deadIds[id];
 };
 
 $.remotePlayerAt = function(x, y) {
@@ -6903,6 +7535,14 @@ $.remotePlayerAt = function(x, y) {
         if (r.pos(x, y) && $.remoteBlocks(ids[i], r)) return ids[i];
     }
     return null;
+};
+
+// A player up and standing there (one lying down blocks, but is not "someone there").
+$.standingRemoteAt = function(x, y) {
+    return Object.keys($.remotes || {}).some(function(id) {
+        var r = $.remotes[id];
+        return r.pos(x, y) && $.remoteBlocks(id, r) && !($.isHost() ? $.isDown(id) : $.downIds[id]);
+    });
 };
 
 var _isCollidedPlayers = Game_Player.prototype.isCollidedWithCharacters;
@@ -7029,8 +7669,16 @@ $.guestHandlers.pAct = function(msg) {
     var opts = [];
     if (trade) opts.push('Trade');
     skills.forEach(function(s) { opts.push(s.name); });
-    opts.push('Wave', 'Cancel');
+    opts.push('Wave');
+    // mind 0 ("Mind 0: a duel to the death"): one more button, never the first
+    var attack = !!$.lethalOpen && $.lethalOpen() && !$.isDead(msg.id) && !($.deadIds && $.deadIds[msg.id]);
+    if (attack) opts.push('Attack ' + (msg.name || 'Player'));
+    opts.push('Cancel');
     $.showPickBox(msg.name || 'Player', opts, function(i) {
+        if (attack && i === opts.length - 2) {
+            $.askLethalDuel(msg.id);
+            return;
+        }
         if (trade && i === 0) {
             $.tradeWith = msg.id;
             SceneManager.push(Scene_FHTrade);
@@ -7351,7 +7999,7 @@ $.guestHandlers.pvp = function(msg) {
 $.hostHandlers.pvpIn = function(conn, msg) {
     var b = msg && $.battles[msg.bid];
     var id = conn ? conn.guestId : 'host';
-    if (!b || !b.pvp || (b.attackerId !== id && b.foeId !== id)) return;
+    if (!b || !b.pvp || $.duelIds(b).indexOf(id) < 0) return;
     b.opened = b.opened || {};
     b.waiting = b.waiting || {};
     if (msg.wait) {
@@ -7379,7 +8027,7 @@ $.abortDuel = function(b, why) {
     delete $.battles[b.bid];
     $.unfreezeBattle(b); // (a guest's duel holds its event like any fight of a guest)
     $.settledDuels[b.bid] = true; // a report that still comes only resyncs that PC
-    [b.attackerId, b.foeId].forEach(function(id) {
+    $.duelIds(b).forEach(function(id) {
         var c = id === 'host' ? null : $.clientById(id);
         if (c) c.inBattle = 0;
         $.sendTo(id, { t: 'pvpCancel', bid: b.bid });
@@ -7442,17 +8090,16 @@ $.worldExtras.push(function() {
 // save (coopData().stench: name -> true; the host '#host'): a re-join and a
 // load keep it, a load from before it has it off again. Down or dead (a
 // ghost) at that moment: nothing.
-// Where the MP falls: every PC that changes a player's character reports it
-// (Game_BattlerBase.setMp and paySkillCost - a spell's cost goes straight to
-// _mp - on the PC's own copy in $gameActors: the host's
-// copies of the thin guests' characters in their events and in the host's
-// fights, a guest PC's fight with its joiners, a roaming guest's own world,
-// a sub-host's guests). The host names the player by its character and
-// decides once; the same fall seen on two PCs counts once. Views of a fight
-// (a joiner, a watching ghost) set MP directly, not through setMp.
-// OK in front of a living player then gives "Attack <name>" / "Leave" (in
-// place of Trade / Wave; trading stays in the menu). Attack opens the tower
-// duel's battle ($.startPvp) between the two; the other one cannot say no.
+// When (user 2026-11-06): not the moment the mind falls (mid-fight that was
+// unfair) but when the original's panophobia comes - CE140 PANOPHOBIA, a
+// parallel common event on the map, adds state 67 to a party member at 0
+// mind. The PC whose own character gets it reports it ($.panoWatch on its
+// copy in $gameActors); the host names the player by its character and
+// decides once; the same seen on two PCs counts once.
+// OK in front of a living player then gives the usual talk box with one more
+// button, "Attack <name>", above Cancel (user 2026-11-06: a button in the
+// talk box, not a fight on every talk). Attack opens the tower duel's battle
+// ($.startPvp) between the two; the other one cannot say no.
 // The loser dies like a tower duel loser (finishPvp: a ghost, its death
 // switch, V201 - 1, its SELECT off; its soul as there: nobody takes it).
 // Unlike the tower duel and the test duel the winner keeps what the duel did
@@ -7526,31 +8173,25 @@ $.guestHandlers.stench = function(msg) {
     if (msg && msg.line) $.stenchLine();
 };
 
-// A player's character on this PC went from above 0 mind to 0.
-$.mindWatch = function(battler, before) {
-    if ($.role && before > 0 && battler._mp <= 0 && battler instanceof Game_Actor &&
+
+// (the engine's setMp - YEP_CoreEngine is off in this game; gainMp and the
+// Change MP command go through it)
+// (user 2026-11-06: not the moment the mind falls - in a fight that was
+// unfair - but when the original's panophobia comes: CE140 PANOPHOBIA, a
+// parallel common event on the map, every 100 frames, adds state 67 to a
+// party member with 0 mind. Every PC runs it for its own character.)
+$.PANOPHOBIA_STATE = 67;
+$.panoWatch = function(battler, had) {
+    if ($.role && !had && battler.isStateAffected($.PANOPHOBIA_STATE) && battler instanceof Game_Actor &&
             $gameActors && $gameActors._data[battler._actorId] === battler && $.PLAYABLE.contains(battler._actorId)) {
         $.mindHitZero(battler);
     }
 };
-
-// (the engine's setMp - YEP_CoreEngine is off in this game; gainMp and the
-// Change MP command go through it)
-var _setMpStench = Game_BattlerBase.prototype.setMp;
-Game_BattlerBase.prototype.setMp = function(mp) {
-    var before = this._mp;
-    _setMpStench.call(this, mp);
-    $.mindWatch(this, before);
-};
-
-// A spell's mind cost (the engine takes it off _mp directly, no setMp; the
-// YEP and Olivia wrappers call the engine's): spending the last of the mind
-// is 0 too, in a fight or from the menu.
-var _paySkillCostStench = Game_BattlerBase.prototype.paySkillCost;
-Game_BattlerBase.prototype.paySkillCost = function(skill) {
-    var before = this._mp;
-    _paySkillCostStench.call(this, skill);
-    $.mindWatch(this, before);
+var _addStateStench = Game_Battler.prototype.addState;
+Game_Battler.prototype.addState = function(stateId) {
+    var had = stateId === $.PANOPHOBIA_STATE && this.isStateAffected(stateId);
+    _addStateStench.call(this, stateId);
+    if (stateId === $.PANOPHOBIA_STATE) $.panoWatch(this, had);
 };
 
 // A guest learns its own with its character (a re-join) and with each
@@ -7589,17 +8230,13 @@ $.lethalOpen = function() {
     return $.isHost() ? !!$.stenchData()[$.nameOf('host')] : !!$.myStench;
 };
 
-var _pActLethal = $.guestHandlers.pAct;
-$.guestHandlers.pAct = function(msg) {
-    if (!msg || !$.lethalOpen()) return _pActLethal(msg);
-    if (!(SceneManager._scene instanceof Scene_Map) || $gameMessage.isBusy() || $.pickOpen()) return;
-    var name = msg.name || 'Player';
-    $.showPickBox(name, ['Attack ' + name, 'Leave'], function(i) {
-        if (i !== 0) return;
-        var ask = { t: 'lethalDuel', to: msg.id };
-        if ($.isHost()) $.hostHandlers.lethalDuel(null, ask);
-        else if ($.conn) $.conn.send(ask);
-    }, 1);
+// The talk box's "Attack <name>" (user 2026-11-06: a button in the talk box,
+// not a fight on every talk - the player who only wanted to hand over a drink
+// was in a duel).
+$.askLethalDuel = function(id) {
+    var ask = { t: 'lethalDuel', to: id };
+    if ($.isHost()) $.hostHandlers.lethalDuel(null, ask);
+    else if ($.conn) $.conn.send(ask);
 };
 
 // '' or why not (the test duel's refusals first).
@@ -7727,11 +8364,15 @@ $.lethalBagLocked = function(conn) {
 var _battleEndLethal = $.hostHandlers.battleEnd;
 $.hostHandlers.battleEnd = function(conn, msg) {
     var settled = !!msg && !!conn && !!conn.actorId && !$.battles[msg.bid];
+    // (a free-for-all goes on without the one already out of it)
+    var b = msg && $.battles[msg.bid];
+    var outOfMelee = !!conn && !!conn.actorId && !!b && !!b.melee && $.duelIds(b).indexOf(conn.guestId) >= 0 &&
+        b.alive.indexOf(conn.guestId) < 0;
     var rec = settled ? $.lethalSettled[msg.bid] : null;
     if (rec && (!rec.late || rec.late === conn.guestId)) {
         delete $.lethalSettled[msg.bid];
         $.lethalLateReport(conn, msg, rec);
-    } else if (settled && !rec && $.settledDuels[msg.bid] && msg.inv && $.isDead(conn.guestId) &&
+    } else if (((settled && !rec && $.settledDuels[msg.bid]) || outOfMelee) && msg.inv && $.isDead(conn.guestId) &&
             !$.lethalBagLocked(conn)) {
         var bag = $.inventoryOf(conn), now = $.copyBag(msg.inv);
         bag.i = now.i;
@@ -7872,6 +8513,10 @@ $.duelReport = function(b, id, pvp) {
     pvp = pvp || {};
     b.reports = b.reports || {};
     b.reports[id] = { won: !!pvp.won, cuts: pvp.cuts || [] };
+    if (b.melee) {
+        $.meleeReport(b, id, pvp);
+        return;
+    }
     var other = id === b.attackerId ? b.foeId : b.attackerId;
     var winner = pvp.won ? id : other;
     $.dlog('duel', b.bid, 'reported by', $.playerLabel(id), pvp.gone ? '(left)' : '', '- winner:', $.playerLabel(winner));
@@ -7886,6 +8531,61 @@ $.settleDuel = function(b, winner) {
     var cuts = {};
     Object.keys(b.reports || {}).forEach(function(id) { cuts[id] = b.reports[id].cuts; });
     $.finishPvp(b, { pvp: { won: winner === b.attackerId, cuts: cuts } });
+};
+
+// Free-for-all (user 2026-11-09: the tower's duels as one fight of everyone
+// left). b.ids: everyone in it, b.alive: the ones still in it. Each PC runs
+// its own battle against all the others (their parts side by side). One is
+// out when its own PC says it lost, when it leaves, or when a PC that broke
+// its torso or head says so ($.duelKo: the hitter's word, as one against
+// one); the others are told (pvpOut) and fight on. The last one wins.
+$.meleeReport = function(b, id, pvp) {
+    if (b.alive.indexOf(id) < 0) return;
+    $.dlog('duel', b.bid, 'reported by', $.playerLabel(id), pvp.gone ? '(left)' : '', pvp.won ? '- won' : '- lost');
+    if (!pvp.won) {
+        $.meleeOut(b, id);
+        return;
+    }
+    // its PC saw every other one fall
+    b.alive.slice().forEach(function(other) { if (other !== id && $.battles[b.bid]) $.meleeOut(b, other); });
+};
+
+$.hostHandlers.duelKo = function(conn, msg) {
+    var by = conn ? conn.guestId : 'host';
+    var b = msg && $.battles[msg.bid];
+    if (!b || !b.melee || b.alive.indexOf(by) < 0 || b.alive.indexOf(msg.id) < 0 || by === msg.id) return;
+    $.dlog('duel', b.bid, $.playerLabel(by), 'broke', $.playerLabel(msg.id));
+    $.meleeOut(b, msg.id);
+};
+
+// One is out: it dies (as a duel's loser), the others go on without it.
+$.meleeOut = function(b, id) {
+    var at = b.alive.indexOf(id);
+    if (at < 0 || !$.battles[b.bid]) return;
+    b.alive.splice(at, 1);
+    var c = id === 'host' ? null : $.clientById(id);
+    if (c && String(c.inBattle) === String(b.bid)) c.inBattle = 0;
+    $.applyDuelCuts(id, b.reports && b.reports[id] && b.reports[id].cuts);
+    $.sendTo(id, { t: 'pvpEnd', bid: b.bid, win: false });
+    b.alive.forEach(function(other) { $.sendTo(other, { t: 'pvpOut', bid: b.bid, id: id }); });
+    $.broadcastToast($.playerLabel(id) + ' fell.');
+    $.duelLoserDies(b, id);
+    if (b.alive.length <= 1) $.meleeWin(b, b.alive[0] || null);
+};
+
+$.meleeWin = function(b, winner) {
+    if (!$.battles[b.bid]) return;
+    delete $.battles[b.bid];
+    $.settledDuels[b.bid] = true;
+    $.unfreezeBattle(b);
+    if (winner) {
+        var c = winner === 'host' ? null : $.clientById(winner);
+        if (c) c.inBattle = 0;
+        $.sendTo(winner, { t: 'pvpEnd', bid: b.bid, win: true });
+        $.broadcastToast($.playerLabel(winner) + ' won the duel.');
+    }
+    $.dlog('duel', b.bid, 'over - winner:', winner ? $.playerLabel(winner) : 'nobody');
+    if ($.tourneyMeleeDone) $.tourneyMeleeDone(b, winner);
 };
 
 // This player's character in its duel.
@@ -7954,7 +8654,7 @@ $.duelOwnsHp = function(battler) {
 };
 
 // A change of X HP on this player's own character (a potion, poison, a
-// skill's HP cost): the curve of X on its body (a heal of 100: +40); what it
+// skill's HP cost): the curve of X on its body (a heal of 100: +82); what it
 // drains or life-steals from the foe ($.duelHitBy): the curved hit it dealt,
 // as it is. The real HP is the body's share again. The number shown is the
 // body's, as for the other player's hits on it.
@@ -7967,10 +8667,101 @@ $.duelGainOwnBody = function(me, value) {
         try { me.gainHp(value); } finally { $.duelHpThrough = false; }
         return;
     }
-    var d = value > 0 && $.duelHitBy === me ? Math.round(value) : $.duelBodyDelta(value);
+    if ($.duelCounterPart && value < 0) {
+        $.duelCounterBlow(me, value, torso, $.duelCounterPart);
+        return;
+    }
+    var d = value > 0 && $.duelHitBy === me ? Math.round(value) :
+        $.duelRegenerating ? Math.round(value * torso.mhp / me.mhp) : $.duelBodyDelta(value);
     torso.hp = Math.max(0, Math.min(torso.mhp, torso.hp + d));
     me._result.hpDamage = -d;
     me._result.hpAffected = true;
+    me.setHp($.duelHpOfBody(torso.hp, me.mhp, torso.mhp));
+    pb.self.hp = me.hp;
+    pb.self.mhp = me.mhp;
+};
+
+// A counter from the other player's body (the Counter ring) lands on one of
+// this player's parts at random, as a hit does (user 2026-11-09: it took the
+// body alone): the part's pool and the body, a guard halves it on a limb, the
+// head only once the legs are gone, and a blow that would end the duel comes
+// to Guts and the coin. It runs on this PC, the attacker's: the other PC sees
+// the parts in the stream.
+$.duelCounterPart = null;
+$.duelCounterTarget = function(pb) {
+    var parts = pb.self.parts;
+    var legsGone = parts.filter(function(p) { return $.isPvpLeg(p.kind); }).every(function(p) { return p.cut; });
+    var list = parts.filter(function(p) { return !p.cut && (p.kind !== 'head' || legsGone); });
+    return list[Math.floor(Math.random() * list.length)] || $.duelSelfTorso(pb);
+};
+
+$.duelCounterBlow = function(me, value, torso, part) {
+    var pb = $.pvpBattle;
+    var hit = $.pvpCurve(value);
+    if ($.isPvpLimb(part.kind) && $.pvpHasGuard(me, part.kind)) hit = Math.max(1, Math.round(hit * 0.5));
+    var fatal = hit >= torso.hp || (part.kind === 'head' && hit >= part.hp);
+    var dies = fatal && !$.duelLastStandHere(me);
+    if (fatal && !dies) {
+        hit = Math.min(hit, Math.max(0, torso.hp - 1));
+        if (part.kind === 'head') hit = Math.min(hit, Math.max(0, part.hp - 1));
+    }
+    if (part !== torso) {
+        part.hp = Math.max(0, part.hp - hit);
+        if (part.hp <= 0 && !part.cut) {
+            part.cut = true;
+            part.cutNow = true;
+            if ($.isPvpLimb(part.kind)) $.battleGab($.pvpCutText(me.name(), part.kind), true);
+        }
+    }
+    torso.hp = Math.max(0, torso.hp - hit);
+    me._result.hpDamage = hit;
+    me._result.hpAffected = true;
+    if (dies) {
+        $.duelDie('counter');
+        return;
+    }
+    me.setHp($.duelHpOfBody(torso.hp, me.mhp, torso.mhp));
+    pb.self.hp = me.hp;
+    pb.self.mhp = me.mhp;
+};
+
+// What a state takes or gives each turn (burning and poison 5%, bleeding 2%,
+// toxic 15%) is that share of the real HP (user 2026-11-09: "the lantern does
+// not seem to set anyone on fire"): through the curve a burn of 5 HP was 7 on a
+// body of 1000, under 1 HP a turn. The curve is for the size of a hit.
+$.duelRegenerating = false;
+var _regenerateHpDuel = Game_Battler.prototype.regenerateHp;
+Game_Battler.prototype.regenerateHp = function() {
+    var own = $.duelOwnsHp(this);
+    if (own) $.duelRegenerating = true;
+    try {
+        _regenerateHpDuel.call(this);
+    } finally {
+        if (own) $.duelRegenerating = false;
+    }
+};
+
+// Rot (user 2026-11-09): in the original its troop page turns the enemy's torso
+// into one with less HP; a duelist has no such form, so it is Fracture (state
+// 19, max HP x 0.8) on the one it hits. The body shrinks with it: a body that
+// kept its size would only show a smaller number, as tough as before.
+$.DUEL_ROT_SKILLS = [294, 692, 714, 732];
+$.ROT_SWITCH = 25;
+$.FRACTURE_STATE = 19;
+$.FRACTURE_BODY_RATE = 0.8;
+$.DUEL_ROT_TEXT = 'The skin begins to rot...';
+$.duelRotHit = function(action, target) {
+    var rec = $.duelRecOf(target), ctl = rec && rec.ctl;
+    if (!ctl || !action.isSkill() || $.DUEL_ROT_SKILLS.indexOf(action.item().id) < 0 || !target.result().isHit()) return;
+    if (ctl.isStateAffected($.FRACTURE_STATE)) return;
+    ctl.addState($.FRACTURE_STATE);
+    $.battleGab($.DUEL_ROT_TEXT);
+};
+$.duelFractureBody = function(me) {
+    var pb = $.pvpBattle, torso = $.duelSelfTorso(pb);
+    if (!torso) return;
+    torso.mhp = Math.max(1, Math.round(torso.mhp * $.FRACTURE_BODY_RATE));
+    torso.hp = Math.max(1, Math.min(torso.mhp, Math.round(torso.hp * $.FRACTURE_BODY_RATE)));
     me.setHp($.duelHpOfBody(torso.hp, me.mhp, torso.mhp));
     pb.self.hp = me.hp;
     pb.self.mhp = me.mhp;
@@ -7984,13 +8775,16 @@ $.duelSelfCuts = function() {
         .map(function(p) { return p.kind; });
 };
 
-// The other duelist gets this PC's battle stream and effects.
+// The other duelists get this PC's battle stream and effects (in a
+// free-for-all the ones still in it).
 var _battleViewersDuel = $.battleViewers;
 $.battleViewers = function() {
     var list = _battleViewersDuel();
     var ab = $.authBattle, pb = $.pvpBattle;
-    if (ab && ab.pvp && pb && pb.bid === ab.bid && pb.foeId && list.indexOf(pb.foeId) < 0) {
-        list = list.concat([pb.foeId]);
+    if (ab && ab.pvp && pb && pb.bid === ab.bid) {
+        $.duelFoes(pb).forEach(function(rec) {
+            if (rec.foeId && !rec.out && list.indexOf(rec.foeId) < 0) list = list.concat([rec.foeId]);
+        });
     }
     return list;
 };
@@ -8003,12 +8797,23 @@ $.battleStateData = function() {
     var st = _battleStateDataDuel();
     if (duel) {
         var me = $.duelMe();
+        // the hits taken from each foe (ak: by player id; ack: one against one)
+        var ak = {};
+        $.duelFoes(pb).forEach(function(rec) { ak[rec.foeId] = rec.hitsIn || 0; });
         st.dv = {
-            id: me ? me.actorId() : 0, ack: pb.hitsIn,
+            id: me ? me.actorId() : 0, ack: pb.hitsIn, ak: ak,
             hp: pb.self.parts.map(function(p) { return p.hp; }), // the body (torso) too, on the body's scale
             mx: pb.self.parts.map(function(p) { return p.mhp; }), // its pools: the other PC takes these
             cut: pb.self.parts.map(function(p) { return p.cut ? 1 : 0; }),
-            dead: !me || me.isDead() || pb.selfDead ? 1 : 0
+            dead: !me || me.isDead() || pb.selfDead ? 1 : 0,
+            h: $.duelHoldsFoe() ? 1 : 0, // the other's gauge waits for this player's turn
+            pr: me ? [1, 2, 3, 4, 5, 6, 7].map(function(id) { return me.param(id); }) : null, // MP..LUK as they are now
+            eq: me ? me._equips.map(function(g) { return [g._dataClass, g._itemId]; }) : null, // an equip change in battle
+            xp: me ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(function(id) { return me.xparam(id); }) : null, // HIT, EVA, ...
+            sp: me ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(function(id) { return me.sparam(id); }) : null, // TGR ... PDR, MDR ...
+            el: me ? $dataSystem.elements.map(function(n, id) { return me.elementRate(id); }) : null,
+            gu: me && $.hasGuts(me) ? 1 : 0, // Guts, a passive one too (not in the states of the row)
+            cu: me && me.states().some(function(s) { return s.id === $.LAST_DEFENSE_STATE; }) ? 1 : 0
         };
     }
     return st;
@@ -8018,7 +8823,10 @@ $.battleStateData = function() {
 $.sendDuelBody = function() {
     var pb = $.pvpBattle;
     if (!pb || !pb.foeId || !$.authBattle || !pb.self) return;
-    $.bSend(pb.foeId, { t: 'bState', bid: pb.bid, st: $.battleStateData() });
+    var st = $.battleStateData();
+    $.duelFoes(pb).forEach(function(rec) {
+        if (rec.foeId && !rec.out) $.bSend(rec.foeId, { t: 'bState', bid: pb.bid, st: st });
+    });
 };
 
 // Hits ----------------------------------------------------------------------
@@ -8038,53 +8846,74 @@ Game_Action.prototype.apply = function(target) {
     var pb = $.pvpBattle;
     var track = !!pb && !!target && !!target._fhPvpFoe && target.isEnemy() && $gameParty.inBattle();
     var before = track ? $.duelFoeSnap() : null;
+    if (track) { // which hit of this action on this part ($.duelLastStand)
+        var counts = pb.hitCount = pb.hitCount || {}, at = $gameTroop.members().indexOf(target);
+        counts[at] = (counts[at] || 0) + 1;
+    }
     var hitBy = $.duelHitBy;
     if (track) $.duelHitBy = this.subject();
+    // (a foe part acts here only in a counter)
+    var countered = !!pb && !!pb.self && $gameParty.inBattle() && target === $.duelMe() && !!this.subject()._fhPvpFoe;
+    if (countered) $.duelCounterPart = $.duelCounterTarget(pb);
     try {
         _applyDuelHit.call(this, target);
     } finally {
         $.duelHitBy = hitBy;
+        if (countered) $.duelCounterPart = null;
     }
-    if (track && $.pvpBattle === pb) $.sendDuelHit(before, $.duelFoeSnap());
+    if (track && $.pvpBattle === pb) {
+        $.duelRotHit(this, target);
+        $.sendDuelHit(before, $.duelFoeSnap());
+    }
 };
 
+// One message per foe whose parts changed (a part's index: its place among
+// that foe's parts, the same as in the body on its PC).
 $.sendDuelHit = function(before, after) {
     var pb = $.pvpBattle;
     var members = $gameTroop.members();
     var death = members.length ? members[0].deathStateId() : 1;
-    var hit = { t: 'bDuelHit', bid: pb.bid, d: [], st: [], rs: [], mp: 0, bf: [], kill: 0 };
-    after.forEach(function(now, i) {
-        var was = before[i];
-        if (!was) return;
-        if (now.hp !== was.hp) hit.d.push([i, now.hp - was.hp]);
-        now.st.forEach(function(id) {
-            if (id !== death && was.st.indexOf(id) < 0 && hit.st.indexOf(id) < 0) hit.st.push(id);
+    $.duelFoes(pb).forEach(function(rec) {
+        var first = rec.first || 0;
+        var hit = { t: 'bDuelHit', bid: pb.bid, d: [], st: [], rs: [], mp: 0, bf: [], kill: 0 };
+        after.forEach(function(now, i) {
+            var was = before[i];
+            if (!was || !members[i]._fhPvpFoe || $.duelRecOf(members[i]) !== rec) return; // (the canister is no part)
+            if (now.hp !== was.hp) hit.d.push([i - first, now.hp - was.hp]);
+            now.st.forEach(function(id) {
+                if (id !== death && was.st.indexOf(id) < 0 && hit.st.indexOf(id) < 0) hit.st.push(id);
+            });
+            var kind = members[i]._fhPart;
+            // (at 0 HP it is broken even while the battle keeps it standing to
+            // the end of the action - YEP immortal - and it falls here then)
+            if ((kind === 'torso' || kind === 'head') && (now.dead || now.hp <= 0) && !was.dead && was.hp > 0) hit.kill = 1;
         });
-        var kind = members[i]._fhPart;
-        // (at 0 HP it is broken even while the battle keeps it standing to
-        // the end of the action - YEP immortal - and it falls here then)
-        if ((kind === 'torso' || kind === 'head') && (now.dead || now.hp <= 0) && !was.dead && was.hp > 0) hit.kill = 1;
+        var at = members.indexOf(rec.ctl);
+        var tw = before[at], tn = after[at];
+        if (tw && tn) {
+            hit.mp = tn.mp - tw.mp;
+            tw.st.forEach(function(id) { if (id !== death && tn.st.indexOf(id) < 0) hit.rs.push(id); });
+            tn.bf.forEach(function(level, i) {
+                if (level !== tw.bf[i]) hit.bf.push([i, level - tw.bf[i], tn.bt[i] || 0]);
+            });
+        }
+        if (rec.gutsUsed) {
+            hit.gu = 1;
+            rec.gutsUsed = false;
+        }
+        if (!hit.d.length && !hit.st.length && !hit.rs.length && !hit.mp && !hit.bf.length && !hit.kill && !hit.gu) return;
+        hit.n = rec.hitsOut = (rec.hitsOut || 0) + 1;
+        $.bSend(rec.foeId, hit);
     });
-    var at = members.indexOf(pb.ctl);
-    var tw = before[at], tn = after[at];
-    if (tw && tn) {
-        hit.mp = tn.mp - tw.mp;
-        tw.st.forEach(function(id) { if (id !== death && tn.st.indexOf(id) < 0) hit.rs.push(id); });
-        tn.bf.forEach(function(level, i) {
-            if (level !== tw.bf[i]) hit.bf.push([i, level - tw.bf[i], tn.bt[i] || 0]);
-        });
-    }
-    if (!hit.d.length && !hit.st.length && !hit.rs.length && !hit.mp && !hit.bf.length && !hit.kill) return;
-    hit.n = ++pb.hitsOut;
-    $.bSend(pb.foeId, hit);
 };
 
 // The other player hit this one (on its PC, with the same rules).
 $.guestHandlers.bDuelHit = function(msg) {
     var pb = $.pvpBattle;
-    if (!pb || !msg || msg.bid !== pb.bid || (msg.from || 'host') !== pb.foeId) return;
-    if (!(msg.n > pb.hitsIn)) return;
-    pb.hitsIn = msg.n;
+    var rec = pb && msg && msg.bid === pb.bid ? $.duelRecById(pb, msg.from || 'host') : null;
+    if (!rec || rec.out) return; // (one out of a free-for-all: a hit still on its way does not land)
+    if (!(msg.n > (rec.hitsIn || 0))) return;
+    rec.hitsIn = msg.n;
     var me = $.duelMe();
     // (won: the host settled it for this player; a hit still on its way
     // from the other battle does not undo that, nor one after this PC's own
@@ -8114,6 +8943,20 @@ $.guestHandlers.bDuelHit = function(msg) {
         if (part.kind === 'head') headGone = true;
         else $.battleGab($.pvpCutText(me.name(), part.kind), true);
     });
+    if (msg.gu) me.removeState($.GUTS_STATE); // (Sisu's is spent; a passive one stays)
+    // lethal only here (its view of this body was a step old)
+    if ((headGone || (body && body.hp + torso <= 0)) && $.duelLastStandHere(me)) {
+        if (headGone) {
+            pb.self.parts.forEach(function(p) {
+                if (p.kind !== 'head') return;
+                p.hp = 1;
+                p.cut = false;
+                p.cutNow = false;
+            });
+            headGone = false;
+        }
+        if (body && body.hp + torso <= 0) torso = 1 - body.hp;
+    }
     if (msg.mp) me.gainMp(msg.mp);
     (msg.st || []).forEach(function(id) { if ($dataStates[id]) $.duelAddState(me, id); });
     (msg.rs || []).forEach(function(id) {
@@ -8126,7 +8969,7 @@ $.guestHandlers.bDuelHit = function(msg) {
         }
     });
     // the body took the hit on its scale; the real HP is its share
-    // (100 HP, raw 100 on a leg: 40, body 1000 -> 960, 96 HP)
+    // (100 HP, raw 100 on a leg: 82, body 1000 -> 918, 92 HP)
     if (body) {
         if (torso) body.hp = Math.max(0, Math.min(body.mhp, body.hp + torso));
         var real = $.duelHpOfBody(body.hp, me.mhp, body.mhp);
@@ -8151,7 +8994,9 @@ $.guestHandlers.bDuelHit = function(msg) {
 $.duelAddState = function(me, id) {
     var pb = $.pvpBattle, state = $dataStates[id];
     if (!state || state.restriction <= 0) {
+        var had = me.isStateAffected(id);
         me.addState(id);
+        if (id === $.FRACTURE_STATE && !had && me.isStateAffected(id)) $.duelFractureBody(me);
         return;
     }
     if ($.duelTalkOwnTurn()) {
@@ -8234,29 +9079,83 @@ $.duelWinNow = function(bid) {
 
 // The body ------------------------------------------------------------------
 
-// The other player's body, as its PC streams it, on its parts here.
-$.applyDuelFoeBody = function(st) {
+// Its gear as its PC has it: the guards on its limbs and its state resists
+// read the copy (an equip change in battle costs a turn, it is allowed).
+$.applyDuelFoeEquips = function(eq, rec) {
+    var pb = $.pvpBattle;
+    rec = rec || $.duelFoes(pb)[0];
+    if (!pb || !eq || !rec) return;
+    var key = JSON.stringify(eq);
+    if (rec.foeEq === key) return;
+    rec.foeEq = key;
+    (rec.foe._equips || []).forEach(function(g, i) {
+        if (!eq[i]) return;
+        g._dataClass = eq[i][0];
+        g._itemId = eq[i][1];
+    });
+    rec.foe._fhParamCache = null;
+};
+
+// The speed this player's gauge compares with: the foes' AGI now (several:
+// their average, the ones still in it).
+$.duelAverageFoeAgi = function() {
+    var list = $.duelLiveFoes().map(function(r) { return r.agi || 0; }).filter(function(v) { return v > 0; });
+    if (list.length) BattleManager._atbFoeAvgAgi = list.reduce(function(s, v) { return s + v; }, 0) / list.length;
+};
+
+// Another player's body, as its PC streams it, on its parts here (rec: that
+// player; none given: the first, one against one).
+$.applyDuelFoeBody = function(st, rec) {
     var pb = $.pvpBattle;
     if (!pb || !st || !st.dv || !$gameParty.inBattle()) return;
+    rec = rec || $.duelFoes(pb)[0];
+    if (!rec || rec.out) return;
     var dv = st.dv;
-    if (pb.waitFoe) {
-        pb.waitFoe = false;
-        $.dlog('duel: both battles are up', pb.bid);
-        if (pb.toldWait) $.battleGab(pb.foeName + ' is here. Fight!', true);
+    if (rec.waitFoe) {
+        rec.waitFoe = false;
+        $.dlog('duel: both battles are up', pb.bid, rec.foeName);
+        if (pb.toldWait) $.battleGab(rec.foeName + ' is here. Fight!', true);
     }
+    rec.foeHoldAt = dv.h ? $.clockMs() : 0;
     var row = (st.a || []).filter(function(r) { return r[0] === dv.id; })[0];
     var members = $gameTroop.members();
-    if (row) members.forEach(function(e) { e._fhMirrorGauge = Number(row[4]) || 0; });
+    var mine = function(e) { return e._fhPvpFoe && $.duelRecOf(e) === rec; };
+    if (row) members.forEach(function(e) { if (mine(e)) e._fhMirrorGauge = Number(row[4]) || 0; });
     if (dv.dead) {
-        $.duelWinNow(pb.bid);
+        if ($.isMelee(pb)) {
+            if (!rec.foeDown) $.pvpFoeFalls(rec); // (the host takes it out: pvpOut)
+        } else {
+            $.duelWinNow(pb.bid);
+        }
         return;
     }
-    if ((dv.ack || 0) < pb.hitsOut) return; // my last hit is not in it yet
+    var ack = dv.ak && typeof dv.ak[$.myPlayerId()] === 'number' ? dv.ak[$.myPlayerId()] : (dv.ack || 0);
+    if (ack < (rec.hitsOut || 0)) return; // my last hit is not in it yet
+    if (dv.pr) {
+        rec.foeParams = dv.pr;
+        // the speed both PCs compare with: its AGI now, not the copy's
+        if (dv.pr[5] > 0) {
+            rec.agi = dv.pr[5];
+            $.duelAverageFoeAgi();
+        }
+    }
+    $.applyDuelFoeEquips(dv.eq, rec);
+    if (dv.xp) rec.foeX = dv.xp;
+    if (dv.sp) rec.foeS = dv.sp;
+    if (dv.el) rec.foeEl = dv.el;
+    rec.foeGuts = !!dv.gu;
+    rec.foeCut = !!dv.cu;
     var death = members.length ? members[0].deathStateId() : 1;
-    var states = row ? (row[3] || []).filter(function(id) { return id !== death && $dataStates[id]; }) : null;
+    // (Guts is not put on the parts: $.duelLastStand)
+    var states = row ? (row[3] || []).filter(function(id) {
+        return id !== death && id !== $.GUTS_STATE && $dataStates[id];
+    }) : null;
+    if (states) rec.foe._states = states.slice();
     var changed = false;
-    members.forEach(function(e, i) {
-        if (!e._fhPvpFoe || e.isHidden() || e.isDead()) return;
+    var first = rec.first || 0;
+    members.forEach(function(e, n) {
+        if (!mine(e) || e.isHidden() || e.isDead()) return;
+        var i = n - first; // (its place in that player's body)
         // its pools as its own PC set them at its start (the copy of its
         // character here may be a step older: another max HP)
         var mx = dv.mx ? Number(dv.mx[i]) : 0;
@@ -8265,10 +9164,10 @@ $.applyDuelFoeBody = function(st) {
             e._hp = Math.min(e._hp, mx);
             changed = true;
         }
-        if (e === pb.ctl) {
+        if (e === rec.ctl) {
             // the body on its scale (an older PC sent -1: its real HP's share)
             var body = dv.hp && dv.hp[i] >= 0 ? Number(dv.hp[i]) :
-                row ? $.duelBodyOfHp(Number(row[1]) || 0, pb.foe.mhp, e.mhp) : e._hp;
+                row ? $.duelBodyOfHp(Number(row[1]) || 0, rec.foe.mhp, e.mhp) : e._hp;
             e._hp = Math.max(1, Math.min(e.mhp, body || 0));
             if (row) e._mp = Math.max(0, Math.min(e.mmp, Number(row[2]) || 0));
         } else if (dv.cut && dv.cut[i]) {
@@ -8301,7 +9200,8 @@ var _bStateDuelSide = $.guestHandlers.bState;
 $.guestHandlers.bState = function(msg) {
     var pb = $.pvpBattle;
     if (pb && msg && msg.bid === pb.bid && !$.puppet) {
-        if ((msg.from || 'host') === pb.foeId) $.applyDuelFoeBody(msg.st);
+        var rec = $.duelRecById(pb, msg.from || 'host');
+        if (rec) $.applyDuelFoeBody(msg.st, rec);
         return;
     }
     _bStateDuelSide(msg);
@@ -8309,10 +9209,39 @@ $.guestHandlers.bState = function(msg) {
 
 // Effects -------------------------------------------------------------------
 
-// There 'e' is this player's body, 'a' the other player's character.
-$.playDuelFx = function(msg) {
+// The sender's own enemy side, as this PC has it: ['e', i, o] - o the player
+// whose part it is (in a free-for-all; '#can' the canister), i its place
+// among that player's parts.
+$.duelFxRef = function(battler) {
     var pb = $.pvpBattle;
-    var target = msg.s === 'e' ? $.duelMe() : msg.s === 'a' ? pb.ctl : null;
+    if (!$.isMelee(pb) || !battler || !battler.isEnemy || !battler.isEnemy()) return null;
+    if (battler.enemyId() === $.CANISTER_ENEMY && !battler._fhPvpFoe) return ['e', 0, '#can'];
+    var rec = battler._fhPvpFoe ? $.duelRecOf(battler) : null;
+    if (!rec) return null;
+    return ['e', $gameTroop.members().indexOf(battler) - (rec.first || 0), rec.foeId];
+};
+
+// What a sender's ref is on this PC (rec: the sender's record here).
+$.duelFxTarget = function(rec, s, i, o) {
+    if (s === 'a') return rec ? rec.ctl : null;
+    if (s !== 'e') return null;
+    if (o === '#can') return $.meleeCanister();
+    if (o && o !== $.myPlayerId()) {
+        var other = $.duelRecById($.pvpBattle, o);
+        return other && !other.out ? $.duelPartAt(other, i) : null;
+    }
+    // (the canister's own numbers there are no hit on this player)
+    if (i >= $.pvpBattle.self.parts.length) return null;
+    return $.duelMe();
+};
+
+// There 'e' is this player's body (or, in a free-for-all, another player's
+// part: o), 'a' the sender's character.
+$.playDuelFx = function(msg, rec) {
+    var pb = $.pvpBattle;
+    rec = rec || $.duelFoes(pb)[0];
+    var target = $.duelFxTarget(rec, msg.s, msg.i, msg.o);
+    if (msg.s === 'e' && !target) return;
     $.fxEcho = true;
     try {
         switch (msg.k) {
@@ -8330,8 +9259,8 @@ $.playDuelFx = function(msg) {
             }
             break;
         case 'perf':
-            if (target) $.playPerf(target, msg.f, $.perfAction(msg.act, function(kind) {
-                return kind === 'e' ? $.duelMe() : kind === 'a' ? pb.ctl : null;
+            if (target) $.playPerf(target, msg.f, $.perfAction(msg.act, function(kind, i) {
+                return $.duelFxTarget(rec, kind, i, msg.act && msg.act[4]);
             }));
             break;
         case 'gab':
@@ -8354,7 +9283,8 @@ var _bFxDuelSide = $.guestHandlers.bFx;
 $.guestHandlers.bFx = function(msg) {
     var pb = $.pvpBattle;
     if (pb && msg && msg.bid === pb.bid && !$.puppet) {
-        if ((msg.from || 'host') === pb.foeId && $gameParty.inBattle()) $.playDuelFx(msg);
+        var rec = $.duelRecById(pb, msg.from || 'host');
+        if (rec && !rec.out && $gameParty.inBattle()) $.playDuelFx(msg, rec);
         return;
     }
     return _bFxDuelSide(msg);
@@ -8375,11 +9305,70 @@ Game_Battler.prototype.atbGauge = function() {
     return _atbGaugeDuel.call(this);
 };
 
-// Nothing moves until the other battle is up too.
+// The slower duelist (user 2026-11-09, a duel of Karin AGI 15 against Marina
+// AGI 44: "the gauge does not fill at all"). Against monsters a slower player
+// loses 20% a point, compounding: fine for the few points they differ by; two
+// players can differ by 29, 0.8^29 = 0.15% speed, 48 minutes a turn.
+// Both duelists are players, each rated against the other, so a curve on each
+// side counts the speed twice (user 2026-11-09: AGI 34 against 26, 1.54 and
+// 0.65, "two more turns" for a small gap). In a duel the faster one takes
+// 1 + 2 ln(ratio) turns per turn of the slower one, as against a monster: half
+// of that (the square root) on each side. 34 / 26: 1.24 and 0.81, 1.54 turns.
+// The Mod Settings turn cap limits that ratio.
+var _atbRateDuel = Game_Battler.prototype.atbRate;
+Game_Battler.prototype.atbRate = function(avgAgi) {
+    if (this.isActor() && $.inDuelBattle()) {
+        var mine = this.agi, foe = BattleManager.atbEnemyAverageAgi();
+        if (mine > 0 && foe > 0 && mine !== foe) {
+            var ratio = FH.ATB.actorRate(Math.max(mine, foe), Math.min(mine, foe));
+            var cap = FH.ATB.actorRateCap();
+            if (cap > 0) ratio = Math.min(ratio, cap);
+            return Math.pow(ratio, mine > foe ? 0.5 : -0.5);
+        }
+    }
+    return _atbRateDuel.call(this, avgAgi);
+};
+
+// While one duelist takes its turn the other's gauge stands still (user
+// 2026-11-09: "my turn, and its gauge still fills"). Each PC runs its own
+// battle, so an action or a choice here stopped nothing there. As against a
+// monster: an action stops the clock, a choice costs the other at most Choosing
+// Max Delay Seconds (3; here all at once). A time stop or "Time stops on your
+// turn" holds it longer, but not for good: the one waiting has no other way
+// out of a duel with a player who has left the keyboard. The stream carries it
+// (dv.h); if it stops coming the hold ends by itself. Whatever stops this PC's
+// clock counts as an action: a round end, a message, a battle event (the
+// canister's explosion).
+$.DUEL_HOLD_STALE_MS = 2500; // (the stream repeats at least once a second)
+$.DUEL_TIME_STOP_HOLD_MS = 30000;
+$.duelHoldsFoe = function() {
+    var pb = $.pvpBattle, bm = BattleManager;
+    if (!pb || !$.inDuelBattle()) return false;
+    var now = $.clockMs();
+    var busy = bm._phase === 'action' || bm._phase === 'turn' || bm._phase === 'turnEnd' ||
+        $gameMessage.isBusy() || $gameTroop.isEventRunning();
+    var choosing = !busy && bm._phase === 'input' && !!bm._atbInputActor;
+    pb.busyFrom = busy ? (pb.busyFrom || now) : 0;
+    pb.chooseFrom = choosing ? (pb.chooseFrom || now) : 0;
+    if (busy) return now - pb.busyFrom < $.DUEL_TIME_STOP_HOLD_MS;
+    if (!choosing) return false;
+    var limit = bm.atbTimeStopChoosing() ? $.DUEL_TIME_STOP_HOLD_MS : FH.ATB.choosingMaxDelaySec * 1000;
+    return now - pb.chooseFrom < limit;
+};
+
+// Nothing moves until the other battles are up too; any other duelist's turn
+// holds it (a free-for-all: each of the ones still in it).
+$.duelFoeHolds = function(pb) {
+    var now = $.clockMs();
+    return $.duelFoes(pb).some(function(rec) {
+        return !rec.out && !rec.foeDown && rec.foeHoldAt && now - rec.foeHoldAt < $.DUEL_HOLD_STALE_MS;
+    });
+};
+
 var _canTickAtbDuel = BattleManager.canTickAtb;
 BattleManager.canTickAtb = function() {
     var pb = $.pvpBattle;
-    if (pb && pb.waitFoe && !$.puppet) return false;
+    if (pb && !$.puppet && (pb.waitFoe || $.duelFoeHolds(pb))) return false;
     return _canTickAtbDuel.call(this);
 };
 
@@ -8396,7 +9385,9 @@ Scene_Battle.prototype.update = function() {
     if (pb && pb.waitFoe && !pb.toldWait && !$.puppet &&
             $.clockMs() - (pb.openedAt || 0) >= $.DUEL_WAIT_TELL_AFTER_MS) {
         pb.toldWait = true;
-        $.battleGab('Waiting for ' + pb.foeName + '...', true);
+        var late = $.duelFoes(pb).filter(function(r) { return r.waitFoe && !r.out; })
+            .map(function(r) { return r.foeName; });
+        $.battleGab('Waiting for ' + late.join(', ') + '...', true);
     }
 };
 
@@ -8440,6 +9431,23 @@ $.guestHandlers.pvpEnd = function(msg) {
         $.duelWinNow(pb.bid);
     } else if (msg.win === false) $.duelDie('the host says so');
     else BattleManager.abort();
+};
+
+// Free-for-all: the host took another player out (its parts fall here, its
+// stream and hits are no longer taken). The fight goes on.
+$.guestHandlers.pvpOut = function(msg) {
+    var pb = $.pvpBattle;
+    if (!pb || !msg || msg.bid !== pb.bid) return;
+    var rec = $.duelRecById(pb, msg.id);
+    if (!rec || rec.out) return;
+    rec.out = true;
+    rec.waitFoe = false;
+    $.dlog('duel:', rec.foeName, 'is out', pb.bid);
+    if ($.duelTalkAsk && $.duelTalkAsk.from === rec.foeId) $.duelTalkClose();
+    if (!$gameParty.inBattle()) return;
+    if (!rec.foeDown) $.pvpFoeFalls(rec);
+    $.duelAverageFoeAgi();
+    if ($.refreshDuelFoeWindow) $.refreshDuelFoeWindow();
 };
 
 //=============================================================================
@@ -9355,7 +10363,7 @@ $.updateWatchHint = function() {
             'border-radius:3px;pointer-events:none;white-space:nowrap;';
         document.body.appendChild(el);
     }
-    el.textContent = text;
+    el.textContent = $.ko(text);
     el.style.display = text ? 'block' : 'none';
 };
 
@@ -9687,8 +10695,17 @@ $.doomSweepFight = function() {
     if (!$.role || !$gameParty.inBattle() || $.puppet || $gameTroop.isEventRunning() ||
             $gameTemp.isCommonEventReserved() || BattleManager._subject) return;
     $gameParty.battleMembers().forEach(function(a) {
-        if ($.doomOf(a) && a.isAlive()) $.doomFall(a);
+        if ($.doomOf(a) && a.isAlive() && !$.snapHeld(a)) $.doomFall(a);
     });
+};
+
+// A SNAP NECK loser waits standing for its execution on the map (its scene's
+// game over is its death): the sweeps leave it (play test 2026-11-06: the
+// host lost Poe's toss, the world sweep killed it first, its execution then
+// ended at once - no scene, a black screen).
+$.snapHeld = function(actor) {
+    var id = actor && actor.actorId ? actor.actorId() : 0;
+    return !!id && ((!!$.snapPending && $.snapPending.actorId === id) || $.snapRun === id);
 };
 
 var _battleManagerUpdateDoom = BattleManager.update;
@@ -9704,7 +10721,7 @@ $.doomSweepWorld = function() {
     ['host'].concat($.clients.map(function(c) { return c.guestId; })).forEach(function(id) {
         var c = id === 'host' ? null : $.clientById(id);
         if (c && (c.solo || c.inBattle || !c.actorId)) return;
-        if ($.isDead(id) || !$.doomOf($.actorOfPlayer(id))) return;
+        if ($.isDead(id) || !$.doomOf($.actorOfPlayer(id)) || $.snapHeld($.actorOfPlayer(id))) return;
         $.onPlayerDefeated(id);
     });
 };
@@ -9825,6 +10842,11 @@ $.isMineList = function(list) {
 // this PC's player.
 $.doomActorFor = function(interp) {
     if (interp._fhOwner && $.runsWorld && $.runsWorld()) return $.actorOfPlayer(interp._fhOwner);
+    // A thin guest's execution: its first page is that guest's, the autorun
+    // pages it turns on run on the host's own map, its game over among them.
+    if ($.snapRun && $.isHost() && !$gameParty.inBattle() && $.snapChainEvent($gameMap.event(interp.eventId()))) {
+        return $gameActors.actor($.snapRun);
+    }
     return $.ownActor();
 };
 
@@ -9841,6 +10863,7 @@ Game_Interpreter.prototype.command353 = function() {
         actor = $.doomActorFor(this);
     }
     if (!actor || !$.doomCounts(actor)) return _command353Doom.call(this);
+    if (doom === 'moonscorch' && $.isHost() && !this._fhOwner) $.sceneTakesGuests(actor);
     $.markDoom(actor, doom);
     // The mold bed's V1013 stays 3 after its game over (the original loads a
     // save): its autorun pages (Map071 EV173 p2, Map075 EV222 p2 - the same
@@ -9858,6 +10881,13 @@ Game_Interpreter.prototype.command353 = function() {
         $.doomFall(actor);
         // a joiner lost: the fight goes on for the others
         if (actor !== $.ownActor()) return true;
+    }
+    // the host's map played a guest's execution: that guest's game over, not
+    // the host's (its last page started again for good, play flow Z-15)
+    if ($.isHost() && !this._fhOwner && actor !== $.ownActor()) {
+        $.onPlayerDefeated($.playerOfActor(actor.actorId()));
+        this._index = this._list.length;
+        return true;
     }
     return _command353Doom.call(this);
 };
@@ -9924,9 +10954,39 @@ Game_Interpreter.prototype.command353 = function() {
     return result;
 };
 
+// The time-up scene (user 2026-11-08, "day 4 time-up death repeats forever"):
+// waking after the third day moves the host to Map141 / Map132, a scene map
+// with no exit whose autorun has no condition (so it is not spent, above) and
+// ends in a game over. The guests on the host's map were moved with it and
+// are moonscorched too, before the host (so the last one's death is the game
+// over). A ghost left on such a map does not start the scene again.
+$.livingGuestsHere = function() {
+    return $.clients.filter(function(c) {
+        return c.actorId && c.inGame && !c.solo && !$.isDead(c.guestId) && $.guestOnMap(c);
+    });
+};
+
+$.sceneTakesGuests = function(actor) {
+    if (actor !== $.ownActor()) return;
+    $.livingGuestsHere().forEach(function(c) {
+        var other = $.actorOfPlayer(c.guestId);
+        if (!other || !$.doomCounts(other)) return;
+        $.markDoom(other, 'moonscorch');
+        $.doomDies(c.guestId, 'moonscorch');
+    });
+};
+
+$.sceneOverForGhost = function(ev) {
+    if (!$.isGhostMe() || !ev || ev._mapId !== $gameMap.mapId()) return false;
+    var page = ev.page(), c = page && page.conditions;
+    if (!$.pageEndsGame(page) || c.selfSwitchValid || c.switch1Valid || c.switch2Valid || c.variableValid ||
+            c.itemValid || c.actorValid) return false;
+    return !$.isHost() || !$.livingGuestsHere().length;
+};
+
 var _checkEventTriggerAutoSpent = Game_Event.prototype.checkEventTriggerAuto;
 Game_Event.prototype.checkEventTriggerAuto = function() {
-    if (this._trigger === 3 && $.isSpentPage(this)) return;
+    if (this._trigger === 3 && ($.isSpentPage(this) || $.sceneOverForGhost(this))) return;
     _checkEventTriggerAutoSpent.call(this);
 };
 
@@ -10056,10 +11116,11 @@ $.snapEnd = function() {
     var id = $.isHost() ? $.playerOfActor($.snapRun) : 'self';
     $.snapRun = 0;
     var interp = $gameMap._interpreter;
-    if ((id === 'host' || id === 'self') && interp.isRunning() && $.snapChainEvent($gameMap.event(interp.eventId()))) {
-        interp.clear();
-    } else if (id && $.owned[id] && $.snapChainEvent($.owned[id].ev)) {
-        $.finishOwned(id);
+    if (interp.isRunning() && $.snapChainEvent($gameMap.event(interp.eventId()))) interp.clear();
+    if (id && id !== 'self' && $.owned[id] && $.snapChainEvent($.owned[id].ev)) $.finishOwned(id);
+    // (a guest's execution tinted the host's screen black on the way)
+    if ($.isHost() && id !== 'host' && $gameScreen.tone().slice(0, 3).every(function(c) { return c <= -255; })) {
+        $gameScreen.startTint([0, 0, 0, 0], 30);
     }
     $.snapReset();
 };
@@ -10343,12 +11404,16 @@ BattleManager.canTickAtb = function() {
 // Duel skills (user 2026-10-26): the duel's troop has no pages ($.buildPvpTroop),
 // so the skills that work through the original troop pages - the "SpecialSkills"
 // page on SW200, Talk's SW52, Run's SW215 - only cost a turn there. Run, Steal,
-// Analyze, Leg sweep and Scorched earth are off in a duel. Talk is a trick:
+// Leg sweep and Scorched earth are off in a duel; Analyze lowers the other
+// player's DEF instead ($.duelAnalyze). Talk is a trick:
 // "<name>: I'm sorry! I give up, please stop!" and the other player picks
 // "Really?" (its character loses a turn: state 115 "Can't do shit - one turn")
 // or "Shut up" (nothing). No answer in time: "Shut up". While the question is
 // up both duelists' gauges stand still (user 2026-10-26).
-$.DUEL_OFF_SKILLS = [40, 31, 70, 473, 369, 136, 504]; // Run, Steal x3, Analyze, Leg sweep, Scorched earth
+$.DUEL_OFF_SKILLS = [40, 31, 70, 473, 136, 504, 686, 708, 726, // Run, Steal x3, Leg sweep, Scorched earth (x4)
+    // the same kind (user 2026-11-09: off for now): Blood golem; Counter-magic
+    // and Order, Charge! (their switches: nothing in a duel reads them)
+    51, 103, 684, 706, 724, 115, 476];
 $.DUEL_TALK_SKILL = 11;
 $.DUEL_TALK_STATE = 115;
 $.DUEL_TALK_MS = 10000; // real time ($.clockMs)
@@ -10357,6 +11422,16 @@ $.DUEL_TALK_CHOICES = ['Really?', 'Shut up'];
 
 $.inDuelBattle = function() {
     return !!$.pvpBattle && !$.puppet && $gameParty.inBattle();
+};
+
+// No phobia in a duel (user 2026-11-09): state 63 comes from CE485 on the
+// original troops' pages, which the duel's troop does not have; this holds
+// whatever else would add it. (The phobias a character has, 65-71, are only marks.)
+$.PHOBIA_STATE = 63;
+var _isStateAddableDuel = Game_Battler.prototype.isStateAddable;
+Game_Battler.prototype.isStateAddable = function(stateId) {
+    if (stateId === $.PHOBIA_STATE && $.inDuelBattle()) return false;
+    return _isStateAddableDuel.call(this, stateId);
 };
 
 var _meetsSkillConditionsDuel = Game_BattlerBase.prototype.meetsSkillConditions;
@@ -10369,28 +11444,87 @@ Game_BattlerBase.prototype.meetsSkillConditions = function(skill) {
 var _applyGlobalDuelTalk = Game_Action.prototype.applyGlobal;
 Game_Action.prototype.applyGlobal = function() {
     var item = this.item();
+    if (item && DataManager.isSkill(item) && item.id === $.DUEL_ANALYZE_SKILL && $.inDuelBattle() &&
+            this.subject() === $.duelMe()) {
+        $.duelAnalyze($.duelActionFoe(this));
+        return;
+    }
     if (item && DataManager.isSkill(item) && item.id === $.DUEL_TALK_SKILL && $.inDuelBattle() &&
             this.subject() === $.duelMe()) {
-        $.duelTalk(this.subject());
+        $.duelTalk(this.subject(), $.duelActionFoe(this));
         return;
     }
     _applyGlobalDuelTalk.call(this);
 };
 
-$.duelTalk = function(me) {
-    var pb = $.pvpBattle;
-    $.battleGab($.DUEL_TALK_TEXT.replace('%1', me.name())); // (both screens: the other duelist views this battle)
-    $.bSend(pb.foeId, { t: 'bDuelTalk', bid: pb.bid, name: me.name() });
-    $.dlog('duel: talk - begs', pb.foeName, 'to stop');
+// Analyze (user 2026-11-09): its original use reads the troop pages, which a
+// duel has none of. Here it puts on the other player the reverse of the
+// original's Defense Buff (192) and M.Defense Buff (197), together: DEF and
+// MDF x 0.7, Blunt / Slashing / Piercing / Fire / Otherwordly damage x 1.3,
+// 5 turns; used again it starts over, no stacking. A state of its own, made
+// with the database on every PC (a state id nobody knows would break the one
+// who sees it); the plugins read its notes with the others'. dv.pr and dv.el
+// bring its numbers back to the attacker.
+$.DUEL_ANALYZE_SKILL = 369;
+$.DUEL_ANALYZE_BUFFS = [192, 197];
+$.DUEL_ANALYZE_ICON_STATE = 191; // (defence_drop: the "DEF" down arrow; Defence down, 89, shows SPD)
+$.DUEL_ANALYZE_STATE = 0;
+$.DUEL_ANALYZE_TEXT = 'A weak point is exposed! Defense down.';
+var _onLoadDuelAnalyze = DataManager.onLoad;
+DataManager.onLoad = function(object) {
+    _onLoadDuelAnalyze.call(this, object);
+    if (!object || object !== $dataStates) return;
+    var traits = [];
+    $.DUEL_ANALYZE_BUFFS.forEach(function(id) {
+        object[id].traits.forEach(function(t) {
+            traits.push({ code: t.code, dataId: t.dataId, value: Math.round((2 - t.value) * 100) / 100 });
+        });
+    });
+    var state = JSON.parse(JSON.stringify(object[$.DUEL_ANALYZE_BUFFS[0]]));
+    state.id = object.length;
+    state.name = 'Analyzed';
+    state.iconIndex = object[$.DUEL_ANALYZE_ICON_STATE].iconIndex;
+    state.traits = traits;
+    object.push(state);
+    $.DUEL_ANALYZE_STATE = state.id;
 };
 
-// The other player begs: believe it or not. One question at a time, asked
+// The foe an action of this player is for: the one picked by name (a
+// free-for-all), else the first one still in it.
+$.duelActionFoe = function(action) {
+    var pb = $.pvpBattle;
+    var rec = action && action._fhDuelFoe ? $.duelRecById(pb, action._fhDuelFoe) : null;
+    if (rec && !rec.out && !rec.foeDown) return rec;
+    return $.duelLiveFoes(pb)[0] || $.duelFoes(pb)[0] || null;
+};
+
+$.duelAnalyze = function(rec) {
+    var pb = $.pvpBattle;
+    rec = rec || $.duelFoes(pb)[0];
+    if (!rec) return;
+    $.battleGab($.isMelee(pb) ? rec.foeName + ': ' + $.DUEL_ANALYZE_TEXT : $.DUEL_ANALYZE_TEXT);
+    rec.hitsOut = (rec.hitsOut || 0) + 1;
+    $.bSend(rec.foeId, { t: 'bDuelHit', bid: pb.bid, d: [], st: [$.DUEL_ANALYZE_STATE], rs: [], mp: 0, bf: [], kill: 0,
+        n: rec.hitsOut });
+};
+
+$.duelTalk = function(me, rec) {
+    var pb = $.pvpBattle;
+    rec = rec || $.duelFoes(pb)[0];
+    if (!rec) return;
+    $.battleGab($.DUEL_TALK_TEXT.replace('%1', me.name())); // (both screens: the other duelist views this battle)
+    $.bSend(rec.foeId, { t: 'bDuelTalk', bid: pb.bid, name: me.name() });
+    $.dlog('duel: talk - begs', rec.foeName, 'to stop');
+};
+
+// Another player begs: believe it or not. One question at a time, asked
 // outside this player's own turn (a state added in its own turn would cost
 // that turn and the next: FH_ATB finishAtbTurn); the gauges here stand still
 // while it is up.
 $.guestHandlers.bDuelTalk = function(msg) {
     var pb = $.pvpBattle;
-    if (!pb || !msg || msg.bid !== pb.bid || (msg.from || 'host') !== pb.foeId) return;
+    var rec = pb && msg && msg.bid === pb.bid ? $.duelRecById(pb, msg.from || 'host') : null;
+    if (!rec || rec.out) return;
     if (pb.talkAsk || pb.talkWait || !$.inDuelBattle() || pb.selfDead || pb.won) return;
     pb.talkWait = msg;
     $.duelTalkFrame();
@@ -10402,7 +11536,9 @@ $.duelTalkOwnTurn = function() {
 };
 
 $.duelTalkOpen = function(pb, msg) {
-    var ask = pb.talkAsk = $.duelTalkAsk = { pb: pb, at: $.clockMs(), close: null, done: false };
+    var from = msg.from || 'host';
+    var rec = $.duelRecById(pb, from) || $.duelFoes(pb)[0];
+    var ask = pb.talkAsk = $.duelTalkAsk = { pb: pb, at: $.clockMs(), close: null, done: false, from: from };
     var answer = function(i) {
         if (ask.done) return;
         ask.done = true;
@@ -10412,15 +11548,15 @@ $.duelTalkOpen = function(pb, msg) {
         var me = $.duelMe();
         var fell = i === 0 && !!me && me.isAlive() && $.inDuelBattle();
         if (fell) me.addState($.DUEL_TALK_STATE);
-        $.dlog('duel: talk from', pb.foeName, '-', fell ? 'believed it (a turn lost)' : 'not believed');
-        $.bSend(pb.foeId, { t: 'bDuelTalkAns', bid: pb.bid, fell: fell });
+        $.dlog('duel: talk from', rec.foeName, '-', fell ? 'believed it (a turn lost)' : 'not believed');
+        $.bSend(rec.foeId, { t: 'bDuelTalkAns', bid: pb.bid, fell: fell });
         $.battleGab(fell ? 'It was a lie!' : 'Shut up!', true);
     };
     ask.answer = answer;
-    var text = $.DUEL_TALK_TEXT.replace('%1', msg.name || pb.foeName);
+    var text = $.DUEL_TALK_TEXT.replace('%1', msg.name || rec.foeName);
     ask.close = $.showPickBox(text, $.DUEL_TALK_CHOICES, answer, 1);
     // the one who talked stands still too while it is up (user 2026-10-26)
-    $.bSend(pb.foeId, { t: 'bDuelTalkUp', bid: pb.bid });
+    $.bSend(rec.foeId, { t: 'bDuelTalkUp', bid: pb.bid });
 };
 
 // The talker's PC: both duelists' gauges stop while the question is up, until
@@ -10429,7 +11565,7 @@ $.duelTalkOpen = function(pb, msg) {
 $.DUEL_TALK_HOLD_SLACK_MS = 3000;
 $.guestHandlers.bDuelTalkUp = function(msg) {
     var pb = $.pvpBattle;
-    if (!pb || !msg || msg.bid !== pb.bid || (msg.from || 'host') !== pb.foeId) return;
+    if (!pb || !msg || msg.bid !== pb.bid || !$.duelRecById(pb, msg.from || 'host')) return;
     pb.talkHeld = $.clockMs();
 };
 
@@ -10445,9 +11581,10 @@ $.duelTalkHeld = function() {
 
 $.guestHandlers.bDuelTalkAns = function(msg) {
     var pb = $.pvpBattle;
-    if (!pb || !msg || msg.bid !== pb.bid || (msg.from || 'host') !== pb.foeId) return;
+    var rec = pb && msg && msg.bid === pb.bid ? $.duelRecById(pb, msg.from || 'host') : null;
+    if (!rec) return;
     pb.talkHeld = 0;
-    $.battleGab(msg.fell ? pb.foeName + ' fell for it!' : pb.foeName + ': "Shut up!"', true);
+    $.battleGab(msg.fell ? rec.foeName + ' fell for it!' : rec.foeName + ': "Shut up!"', true);
 };
 
 // No answer in time: "Shut up". Its duel is over: the box just closes.
@@ -10503,6 +11640,318 @@ var _endBattleDuelTalk = BattleManager.endBattle;
 BattleManager.endBattle = function(result) {
     $.duelTalkClose();
     _endBattleDuelTalk.call(this, result);
+};
+
+//-----------------------------------------------------------------------------
+// Free-for-all: whom to hit (user 2026-11-09)
+//-----------------------------------------------------------------------------
+// Three or four bodies make 15 parts and more: Attack (and every skill or
+// item for one enemy, Talk, Analyze) first asks whom, by name (the
+// characters' names); then the part window lists only that one's parts. Back
+// from the part window: the name window again. An attack on all enemies hits
+// every part of everyone, at a lower rate (user 2026-11-09:
+// half the damage, $.MELEE_AOE_DAMAGE_RATE). A random target is any part of
+// anyone (Rot, the rats). One foe left: no name to pick. One against one:
+// as before.
+
+function Window_DuelFoe() {
+    this.initialize.apply(this, arguments);
+}
+Window_DuelFoe.prototype = Object.create(Window_Command.prototype);
+Window_DuelFoe.prototype.constructor = Window_DuelFoe;
+
+Window_DuelFoe.prototype.initialize = function() {
+    Window_Command.prototype.initialize.call(this, 0, 0);
+    this.x = Math.round((Graphics.boxWidth - this.width) / 2);
+    this.y = 72;
+    this.openness = 0;
+    this.deactivate();
+    this.hide();
+};
+
+Window_DuelFoe.prototype.windowWidth = function() {
+    return 300;
+};
+
+Window_DuelFoe.prototype.numVisibleRows = function() {
+    return Math.max(1, Math.min(4, this.maxItems()));
+};
+
+// (made while nobody is listed: its height follows the names each time)
+Window_DuelFoe.prototype.refresh = function() {
+    this.clearCommandList();
+    this.makeCommandList();
+    var h = this.fittingHeight(this.numVisibleRows());
+    if (this.height !== h) this.height = h;
+    this.createContents();
+    Window_Selectable.prototype.refresh.call(this);
+};
+
+// The ones still in it, by name (no HP: the game shows none).
+Window_DuelFoe.prototype.makeCommandList = function() {
+    var self = this;
+    $.duelLiveFoes().forEach(function(rec) {
+        self.addCommand(rec.foeName, 'foe', true, rec.foeId);
+    });
+};
+
+$.Window_DuelFoe = Window_DuelFoe;
+
+// This action asks whom first: one enemy, Talk and Analyze. An attack on all
+// enemies hits everyone (user 2026-11-09), at a lower rate
+// ($.MELEE_AOE_DAMAGE_RATE).
+$.duelPicksFoe = function(action) {
+    if (!$.isMelee() || !$.inDuelBattle() || !action || !action.item()) return false;
+    if (!action.subject() || action.subject() !== $.duelMe()) return false;
+    if (action.isSkill() && [$.DUEL_ANALYZE_SKILL, $.DUEL_TALK_SKILL].indexOf(action.item().id) >= 0) return true;
+    return action.isForOpponent() && action.isForOne() && !action.isForRandom();
+};
+
+var _createAllWindowsDuelFoe = Scene_Battle.prototype.createAllWindows;
+Scene_Battle.prototype.createAllWindows = function() {
+    _createAllWindowsDuelFoe.call(this);
+    var w = this._duelFoeWindow = new Window_DuelFoe();
+    w.setHandler('ok', this.onDuelFoeOk.bind(this));
+    w.setHandler('cancel', this.onDuelFoeCancel.bind(this));
+    this.addWindow(w);
+};
+
+// An input window: the battle does not go on to the next input under it
+// (Scene_Battle.updateBattleProcess), and the clock waits as for the others.
+var _isAnyInputWindowActiveDuelFoe = Scene_Battle.prototype.isAnyInputWindowActive;
+Scene_Battle.prototype.isAnyInputWindowActive = function() {
+    return _isAnyInputWindowActiveDuelFoe.call(this) || !!(this._duelFoeWindow && this._duelFoeWindow.active);
+};
+
+var _onSelectActionDuelFoe = Scene_Battle.prototype.onSelectAction;
+Scene_Battle.prototype.onSelectAction = function() {
+    var action = BattleManager.inputtingAction();
+    var pb = $.pvpBattle;
+    if (pb && $.duelPicksFoe(action)) {
+        var live = $.duelLiveFoes(pb);
+        if (live.length > 1 && this._duelFoeWindow) {
+            this.startDuelFoeSelection(action);
+            return;
+        }
+        if (live[0]) {
+            action._fhDuelFoe = live[0].foeId;
+            pb.pickRec = live[0];
+        }
+    }
+    _onSelectActionDuelFoe.call(this);
+};
+
+Scene_Battle.prototype.startDuelFoeSelection = function(action, foeId) {
+    var w = this._duelFoeWindow, pb = $.pvpBattle;
+    if (pb) pb.pickRec = null;
+    w.refresh();
+    var want = foeId || (action && action._fhDuelFoe) || (pb && pb.lastPick);
+    var at = want ? w.findExt(want) : -1;
+    w.select(at >= 0 ? at : 0);
+    w.show();
+    w.open();
+    w.activate();
+};
+
+Scene_Battle.prototype.closeDuelFoeWindow = function() {
+    var w = this._duelFoeWindow;
+    if (!w) return;
+    w.deactivate();
+    w.close();
+    w.hide();
+};
+
+Scene_Battle.prototype.onDuelFoeOk = function() {
+    var w = this._duelFoeWindow, pb = $.pvpBattle;
+    var action = BattleManager.inputtingAction();
+    var rec = pb ? $.duelRecById(pb, w.currentExt()) : null;
+    this.closeDuelFoeWindow();
+    if (!pb || !action || !rec || rec.out || rec.foeDown) {
+        if (pb && action) this.startDuelFoeSelection(action);
+        return;
+    }
+    action._fhDuelFoe = rec.foeId;
+    pb.pickRec = rec;
+    pb.lastPick = rec.foeId;
+    _onSelectActionDuelFoe.call(this);
+};
+
+// Back to the command, skill or item window (as from the part window).
+Scene_Battle.prototype.onDuelFoeCancel = function() {
+    var pb = $.pvpBattle;
+    this.closeDuelFoeWindow();
+    if (pb) pb.pickRec = null;
+    this._fhDuelFoeBack = true;
+    try {
+        this.onEnemyCancel();
+    } finally {
+        this._fhDuelFoeBack = false;
+    }
+};
+
+// Back from the part window: whom again.
+var _onEnemyCancelDuelFoe = Scene_Battle.prototype.onEnemyCancel;
+Scene_Battle.prototype.onEnemyCancel = function() {
+    var pb = $.pvpBattle, action = BattleManager.inputtingAction();
+    if (!this._fhDuelFoeBack && pb && pb.pickRec && this._duelFoeWindow && $.duelPicksFoe(action) &&
+            $.duelLiveFoes(pb).length > 1) {
+        var foeId = pb.pickRec.foeId;
+        this._enemyWindow.deactivate();
+        this._enemyWindow.hide();
+        this.startDuelFoeSelection(action, foeId);
+        return;
+    }
+    _onEnemyCancelDuelFoe.call(this);
+};
+
+// The pick is for this input only.
+['selectNextCommand', 'startActorCommandSelection', 'endCommandSelection'].forEach(function(name) {
+    var base = Scene_Battle.prototype[name];
+    Scene_Battle.prototype[name] = function() {
+        if (name !== 'startActorCommandSelection' && this._duelFoeWindow && this._duelFoeWindow.active) {
+            this.closeDuelFoeWindow();
+        }
+        if ($.pvpBattle) $.pvpBattle.pickRec = null;
+        return base.apply(this, arguments);
+    };
+});
+
+// The part window: that one's parts only.
+var _allowedTargetsDuelFoe = Window_BattleEnemy.prototype.allowedTargets;
+Window_BattleEnemy.prototype.allowedTargets = function() {
+    var list = _allowedTargetsDuelFoe ? _allowedTargetsDuelFoe.call(this) : $gameTroop.aliveMembers();
+    var pb = $.pvpBattle, rec = pb && pb.pickRec;
+    if (!rec || !$.isMelee(pb)) return list;
+    return list.filter(function(e) { return e._fhPvpFoe && $.duelRecOf(e) === rec; });
+};
+
+// One taken out while its name or its parts are up: the window follows.
+$.refreshDuelFoeWindow = function() {
+    var scene = SceneManager._scene, pb = $.pvpBattle;
+    if (!(scene instanceof Scene_Battle) || !pb) return;
+    var w = scene._duelFoeWindow;
+    if (w && w.active) {
+        if ($.duelLiveFoes(pb).length) {
+            var keep = w.currentExt();
+            w.refresh();
+            var at = w.findExt(keep);
+            w.select(at >= 0 ? at : 0);
+        } else {
+            scene.onDuelFoeCancel();
+        }
+    }
+    var rec = pb.pickRec;
+    if (rec && (rec.out || rec.foeDown) && scene._enemyWindow && scene._enemyWindow.active) scene.onEnemyCancel();
+};
+
+// FH_ATB: a turn that cuts in closes the name window too, and the windows come
+// back with the same foe (and the same part) picked.
+if (Scene_Battle.prototype.captureFHAtbInput) {
+    var _captureDuelFoe = Scene_Battle.prototype.captureFHAtbInput;
+    Scene_Battle.prototype.captureFHAtbInput = function(actor) {
+        var w = this._duelFoeWindow, cmd = this._actorCommandWindow;
+        if (w && w.active && actor && cmd && cmd.index() >= 0) {
+            var symbol = cmd.currentSymbol();
+            var list = symbol === 'skill' ? this._skillWindow : symbol === 'item' ? this._itemWindow : null;
+            var action = actor.inputtingAction();
+            return { actor: actor, symbol: symbol, ext: cmd.currentExt(), layer: 'target',
+                item: action ? action.item() : null, target: null, duelFoe: w.currentExt(),
+                listIndex: list ? list.index() : -1 };
+        }
+        var mem = _captureDuelFoe.call(this, actor);
+        if (mem && mem.target && mem.target._fhDuelRec) mem.duelFoe = mem.target._fhDuelRec.foeId;
+        return mem;
+    };
+}
+if (Scene_Battle.prototype.suspendFHAtbInput) {
+    var _suspendDuelFoe = Scene_Battle.prototype.suspendFHAtbInput;
+    Scene_Battle.prototype.suspendFHAtbInput = function() {
+        _suspendDuelFoe.call(this);
+        if (this._duelFoeWindow) this.closeDuelFoeWindow();
+        if ($.pvpBattle) $.pvpBattle.pickRec = null;
+    };
+}
+if (Scene_Battle.prototype.restoreFHAtbTarget) {
+    var _restoreTargetDuelFoe = Scene_Battle.prototype.restoreFHAtbTarget;
+    Scene_Battle.prototype.restoreFHAtbTarget = function(mem) {
+        var w = this._duelFoeWindow;
+        if (w && w.active && mem && mem.duelFoe) {
+            var at = w.findExt(mem.duelFoe);
+            if (at < 0) return;
+            w.select(at);
+            if (!mem.target) return;
+            this.onDuelFoeOk();
+        }
+        _restoreTargetDuelFoe.call(this, mem);
+    };
+}
+
+//-----------------------------------------------------------------------------
+// Free-for-all: the gasoline canister (user 2026-11-09)
+//-----------------------------------------------------------------------------
+// One against one it stands on the PC of the one who set it down (above). In
+// a free-for-all there is one, in the middle, and everyone sees it: whoever
+// blows it up first is the only one it spares (the blast is the canister's
+// own skill on its whole side: on that PC every other player's parts). Set
+// down or gone on one PC: 'bDuelCan' to the others (a second one blown up at
+// the same moment elsewhere still goes off there).
+
+$.meleeCanister = function() {
+    if (!$.isMelee()) return null;
+    return $gameTroop.members().filter(function(e) {
+        return e.enemyId() === $.CANISTER_ENEMY && !e._fhPvpFoe;
+    })[0] || null;
+};
+
+$.canEcho = false; // a change from another PC: not sent on
+
+$.sendMeleeCanister = function(on) {
+    var pb = $.pvpBattle;
+    if (!pb || $.canEcho) return;
+    $.duelLiveFoes(pb).forEach(function(rec) {
+        $.bSend(rec.foeId, { t: 'bDuelCan', bid: pb.bid, on: on ? 1 : 0 });
+    });
+    $.dlog('duel: the canister', on ? 'is set down' : 'is gone', '- told the others');
+};
+
+var _appearMeleeCanister = Game_Enemy.prototype.appear;
+Game_Enemy.prototype.appear = function() {
+    var was = this.isHidden();
+    _appearMeleeCanister.call(this);
+    if (was && !this.isHidden() && this === $.meleeCanister() && $gameParty.inBattle() && !$.puppet) {
+        $.sendMeleeCanister(true);
+    }
+};
+
+var _dieMeleeCanister = Game_BattlerBase.prototype.die;
+Game_BattlerBase.prototype.die = function() {
+    var can = this instanceof Game_Enemy && this === $.meleeCanister() && $gameParty.inBattle() && !$.puppet;
+    _dieMeleeCanister.call(this);
+    if (can) $.sendMeleeCanister(false);
+};
+
+$.guestHandlers.bDuelCan = function(msg) {
+    var pb = $.pvpBattle;
+    if (!pb || !msg || msg.bid !== pb.bid || !$gameParty.inBattle()) return;
+    var rec = $.duelRecById(pb, msg.from || 'host');
+    var can = $.meleeCanister();
+    if (!rec || !can) return;
+    $.canEcho = true;
+    $.fxEcho = true; // (no "set down!" line again: the sender's own came)
+    try {
+        if (msg.on) {
+            if (can.isDead()) can.removeState(can.deathStateId());
+            can.setHp(can.mhp);
+            if (can.isHidden()) _appearCanister.call(can);
+        } else if (can.isAlive() && !can.isHidden()) {
+            can.addState(can.deathStateId());
+            can.performCollapse();
+        }
+    } finally {
+        $.canEcho = false;
+        $.fxEcho = false;
+    }
+    if ($.refreshBattleStatus) $.refreshBattleStatus();
 };
 
 })(FH.Coop);

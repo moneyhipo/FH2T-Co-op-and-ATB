@@ -1,5 +1,5 @@
-Status: BETA. Bugs or unexpected behavior may occur. Back up your saves before playing.
-3-4 player sessions are supported but untested (only 2-player games have been played so far).
+Status: 1.0.0. Bugs may remain. Back up your saves before playing.
+Sessions of 2 to 4 players are supported and have been played.
 
 Before you play:
 - Host and guests need the exact same mod version.
@@ -8,7 +8,7 @@ Before you play:
 - fh_steam_helper/FHSteamHelper.exe (Steam invites) is not code-signed; SmartScreen or an
   antivirus may warn about it. IP play works without it.
 - Every player needs a different name (Steam name; Windows user name for IP play).
-- F8 (beta convenience): save screen anywhere on the map. In co-op only the host saves.
+- F8 / F9 (beta convenience): save / load screen anywhere on the map. In co-op only the host saves and loads. They can be turned off in Mod Settings (in co-op by the host).
 
 Co-op rules:
 - Up to 4 players. The host's PC runs the world; if the host quits, the session ends.
@@ -49,7 +49,7 @@ Known bugs:
 - IP 접속: 호스트는 TCP 포트 27600을 열어야 합니다(공유기 포트포워딩, 방화벽에서 Game.exe 허용). Steam 초대(F7)는 필요 없습니다.
 - fh_steam_helper/FHSteamHelper.exe(Steam 초대용)는 코드 서명이 없어 백신이 경고할 수 있습니다. 없어도 IP 접속은 됩니다.
 - 플레이어마다 이름이 달라야 합니다(Steam 이름, IP 접속은 Windows 사용자 이름).
-- F8(베타 편의 기능): 맵 어디서나 저장 화면. 코옵에서는 호스트만 저장합니다.
+- F8 / F9(베타 편의 기능): 맵 어디서나 저장 / 불러오기 화면. 코옵에서는 호스트만 저장·불러오기하고, 호스트가 코옵 설정에서 끌 수 있습니다.
 
 코옵 규칙:
 - 최대 4명. 호스트 PC가 세계를 돌리고, 호스트가 나가면 세션이 끝납니다.

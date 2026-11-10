@@ -44,6 +44,6 @@ Bug reports: please attach `<game folder>/fhcoop_logs/` from every player.
 
 ## Status
 
-Beta. Back up your saves before playing. Only 2-player games have been played so far.
+1.0.0. Bugs may remain. Back up your saves before playing. Sessions of 2 to 4 players are supported and have been played.
 
 This mod was made with AI assistance (Claude).
