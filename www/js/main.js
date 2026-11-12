@@ -1,18 +1,18 @@
 //=============================================================================
-// main.js (FH2 Co-op 1.0.0)
+// main.js (FH2 Co-op 1.0.1)
 //=============================================================================
 // Adds the co-op mod plugins to the game's plugin list. plugins.js is not
 // changed, so translation patches keep working. To remove the mod, put back
 // main.js.original (or let Steam verify the game files).
 
-var FH_COOP_VERSION = "1.0.0"; // shown when host and guest differ
+var FH_COOP_VERSION = "1.0.1"; // shown when host and guest differ
 
 (function() {
     var mod = [
         {
             "name": "FH_ATB",
             "status": true,
-            "description": "v1.0.0 Gauge-based ATB battles for Fear & Hunger 2: Termina.",
+            "description": "v1.0.1 Gauge-based ATB battles for Fear & Hunger 2: Termina.",
             "parameters": {
                 "Enabled": "true",
                 "Actor Average Seconds": "4.5",
@@ -36,7 +36,7 @@ var FH_COOP_VERSION = "1.0.0"; // shown when host and guest differ
         {
             "name": "FH_Coop",
             "status": true,
-            "description": "v1.0.0 Co-op core: session (IP, F6), guest join, snapshots, shared map view with player avatars.",
+            "description": "v1.0.1 Co-op core: session (IP, F6), guest join, snapshots, shared map view with player avatars.",
             "parameters": {
                 "Port": "27600",
                 "Guest Actor ID": "3",
@@ -46,13 +46,13 @@ var FH_COOP_VERSION = "1.0.0"; // shown when host and guest differ
         {
             "name": "FH_CoopWorld",
             "status": true,
-            "description": "v1.0.0 Co-op field play: guests run events, own inventories, trading.",
+            "description": "v1.0.1 Co-op field play: guests run events, own inventories, trading.",
             "parameters": {}
         },
         {
             "name": "FH_CoopBattle",
             "status": true,
-            "description": "v1.0.0 Co-op battles: battles run on the PC of whoever started them, joining, downs, ghosts, the betrayal tournament.",
+            "description": "v1.0.1 Co-op battles: battles run on the PC of whoever started them, joining, downs, ghosts, the betrayal tournament.",
             "parameters": {
                 "Down Seconds": "300",
                 "Revive HP Rate": "0.25"
@@ -61,13 +61,13 @@ var FH_COOP_VERSION = "1.0.0"; // shown when host and guest differ
         {
             "name": "FH_CoopRoam",
             "status": true,
-            "description": "v1.0.0 Co-op: every player explores on their own; sub-hosts, sleeping together, Eye of Rher.",
+            "description": "v1.0.1 Co-op: every player explores on their own; sub-hosts, sleeping together, Eye of Rher.",
             "parameters": {}
         },
         {
             "name": "FH_CoopSteam",
             "status": true,
-            "description": "v1.0.0 Co-op over Steam (FHSteamHelper), snapshot compression.",
+            "description": "v1.0.1 Co-op over Steam (FHSteamHelper), snapshot compression.",
             "parameters": {
                 "Helper Path": "fh_steam_helper/FHSteamHelper.exe",
                 "Control Port": "27610",

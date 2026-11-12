@@ -2,7 +2,7 @@
 // FH_CoopWorld.js
 //=============================================================================
 /*:
- * @plugindesc v1.0.0 Co-op field play: guests run events, own inventories,
+ * @plugindesc v1.0.1 Co-op field play: guests run events, own inventories,
  * trading, time votes, host-only saves, guns, chasing enemies. Below FH_Coop.
  * @author FH2 Co-op Mod
  *
@@ -293,7 +293,7 @@ $.meData = function(conn) {
     return {
         t: 'me',
         actorId: conn.actorId,
-        actor: actor ? ($.actorJson ? $.actorJson(actor) : JsonEx.stringify(actor)) : null,
+        actor: actor ? ($.actorJson ? $.actorJson(actor) : $.jsonEx(actor)) : null,
         inv: $.inventoryOf(conn),
         syn: $.synOf(conn)
     };
@@ -548,7 +548,7 @@ $.sendSyncMe = function() {
     $.conn.send({
         t: 'syncMe',
         actorId: $.myActorId,
-        actor: actor ? JsonEx.stringify(actor) : null,
+        actor: actor ? $.jsonEx(actor) : null,
         inv: { i: $gameParty._items, w: $gameParty._weapons, a: $gameParty._armors, g: $gameParty._gold }
     });
 };
@@ -3416,7 +3416,7 @@ Game_Interpreter.prototype.command121 = function() {
 // autorun page runs as that player's ("Autorun pages a guest turned on").
 $.YM_DANCE_SWITCH = 3772;
 $.YM_HURT_SWITCH = 3775;
-$.ymTarget = null; // host: guestId | 'host' - who the dance is on
+$.ymTarget = null; // host / sub-host: guestId | 'host' - who the dance is on
 
 var _swSetYellowMage = Game_Switches.prototype.setValue;
 Game_Switches.prototype.setValue = function(id, value) {
@@ -3437,10 +3437,11 @@ Game_Switches.prototype.setValue = function(id, value) {
 
 // The one it sees is down, dead or gone from this map (or runs it on its own
 // PC): the dance stops - nobody else takes its Hurting. (The original: losing
-// to it is a game over, so nobody lay in its sight.)
+// to it is a game over, so nobody lay in its sight.) A sub-host checks its own
+// map the same way ('host' is its own player there; isDown/isDead use pstateOf).
 $.ymCheckTarget = function() {
     var id = $.ymTarget;
-    if (!id || !$.isHost() || !$gameSwitches._data[$.YM_DANCE_SWITCH]) return;
+    if (!id || !$.runsWorld() || !$gameSwitches._data[$.YM_DANCE_SWITCH]) return;
     var why = '';
     if ($.isDown && $.isDown(id)) why = 'down';
     else if ($.isDead && $.isDead(id)) why = 'dead';
@@ -4320,6 +4321,12 @@ $.fieldSkillFor = function(item) {
         (item.occasion === 0 || item.occasion === 2);
 };
 
+// This PC's own player's character in the map code (a sub-host's SELECT
+// switches are not the host's: never $.hostActorId() there).
+$.fieldOwnActorId = function() {
+    return $.isHost() ? $.realHostActorId() : $.myActorId;
+};
+
 // A guest on the host's map the host can apply a skill to now.
 $.fieldGuestFree = function(c) {
     return !!c && !!c.actorId && !!c.inGame && !c.solo && !c.roam && !c.roamPending && !c.subOf &&
@@ -4444,21 +4451,24 @@ $.fieldTouched = function(c, text) {
     if (text) c.send({ t: 'toast', text: 'Co-op: ' + text });
 };
 
-$.worldExtras.push(function() {
-    if (!$.isHost() || Graphics.frameCount % 30 !== 0) return;
+$.fieldPushTick = function() {
     var now = $.clockMs();
     $.clients.forEach(function(c) {
         if (!c._fieldPushUntil) return;
         if (now > c._fieldPushUntil) c._fieldPushUntil = 0;
         else $.pushMe(c);
     });
+};
+
+$.worldExtras.push(function() {
+    if ($.runsWorld() && Graphics.frameCount % 30 === 0) $.fieldPushTick();
 });
 
 // This PC's player's skills it can use on the player it talks to now (the
 // player OK box: next to it, on its map). Not from a guest running its own
-// map (no one else's character there).
+// map alone (no one else's character there).
 $.talkFieldSkills = function() {
-    if (!$.isHost() && !$.isThin()) return [];
+    if (!$.isHost() && !$.isThin() && !($.subHosting && $.subHosting())) return [];
     var actor = $gameActors.actor($.isHost() ? $.hostActorId() : $.myActorId);
     if (!actor) return [];
     return actor.skills().filter(function(s) { return $.fieldSkillFor(s) && actor.canUse(s); });
@@ -4469,12 +4479,12 @@ $.talkFieldSkills = function() {
 $.useFieldSkillOn = function(toId, skillId) {
     var skill = $dataSkills[skillId];
     if (!skill) return;
-    if ($.isGuest()) {
+    if ($.isGuest() && !($.subHosting && $.subHosting())) {
         if ($.conn) $.conn.send({ t: 'fieldUse', skill: skill.id, to: toId, talk: 1 });
         $.dlog('field skill', skill.id, 'on', toId, '(talking) - asked the host');
         return;
     }
-    var c = $.clientById(toId), caster = $gameActors.actor($.hostActorId());
+    var c = $.clientById(toId), caster = $gameActors.actor($.fieldOwnActorId());
     var target = c && c.actorId && $gameActors.actor(c.actorId);
     var why = '';
     if (!caster || !caster.canUse(skill)) why = 'you cannot use ' + skill.name + ' now';
@@ -4500,7 +4510,7 @@ $.useFieldSkillOn = function(toId, skillId) {
 $.hostHandlers.fieldUse = function(conn, msg) {
     var skill = $dataSkills[Number(msg.skill)], caster = conn.actorId && $gameActors.actor(conn.actorId);
     var to = String(msg.to || ''), tc = to === 'host' ? null : $.clientById(to);
-    var target = to === 'host' ? $gameActors.actor($.hostActorId()) : tc && tc.actorId && $gameActors.actor(tc.actorId);
+    var target = to === 'host' ? $gameActors.actor($.fieldOwnActorId()) : tc && tc.actorId && $gameActors.actor(tc.actorId);
     var why = '';
     if (!skill || !caster || !caster.isLearnedSkill(skill.id) || !$.fieldSkillFor(skill)) why = 'that skill cannot be used on others';
     else if (!$.guestOnMap(conn) || conn.roam || conn.subOf) why = 'you are not on the same map';
@@ -4580,9 +4590,9 @@ var _command313Field = Game_Interpreter.prototype.command313;
 Game_Interpreter.prototype.command313 = function() {
     var done = _command313Field.call(this);
     var p = this._params;
-    if ($.isHost() && $.sessionActive() && p[0] === 0 && p[1] === 0 && p[2] === 1 && $.fieldMarkStates()[p[3]]) {
+    if ($.runsWorld() && $.sessionActive() && p[0] === 0 && p[1] === 0 && p[2] === 1 && $.fieldMarkStates()[p[3]]) {
         // (in a guest's context $.hostActorId() is that guest's)
-        [$.realHostActorId()].concat($.clients.map(function(c) { return c.actorId; })).forEach(function(id) {
+        [$.fieldOwnActorId()].concat($.clients.map(function(c) { return c.actorId; })).forEach(function(id) {
             var actor = id && $gameActors.actor(id);
             if (actor && actor.isStateAffected(p[3])) actor.removeState(p[3]);
         });

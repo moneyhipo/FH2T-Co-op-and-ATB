@@ -2,7 +2,7 @@
 // FH_ATB.js
 //=============================================================================
 /*:
- * @plugindesc v1.0.0 Gauge-based ATB battles for Fear & Hunger 2: Termina.
+ * @plugindesc v1.0.1 Gauge-based ATB battles for Fear & Hunger 2: Termina.
  * Place at the very bottom of the plugin list. Turn Galv_ExAgiTurn OFF.
  * @author FH2 Co-op Mod
  *

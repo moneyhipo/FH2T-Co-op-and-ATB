@@ -2,7 +2,7 @@
 // FH_CoopSteam.js
 //=============================================================================
 /*:
- * @plugindesc v1.0.0 Co-op over Steam: F7 invites friends through the
+ * @plugindesc v1.0.1 Co-op over Steam: F7 invites friends through the
  * FHSteamHelper program, snapshots are compressed. Below FH_CoopBattle.
  * @author FH2 Co-op Mod
  *
@@ -265,7 +265,9 @@ $.connectHelper = function(tries) {
             h.buffer = h.buffer.slice(idx + 1);
             if (!line) continue;
             try {
+                var t0 = $.frameLogClock(); // (the frame-time log; helper events carry no peer message)
                 $.onHelperEvent(JSON.parse(line));
+                $.frameLogMsg('helper', $.frameLogClock() - t0);
             } catch (e) {
                 $.dlog('bad helper line', line);
             }

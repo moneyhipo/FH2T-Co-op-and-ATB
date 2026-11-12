@@ -2,7 +2,7 @@
 // FH_Coop.js
 //=============================================================================
 /*:
- * @plugindesc v1.0.0 Co-op core: session (IP, F6), guest join, snapshots,
+ * @plugindesc v1.0.1 Co-op core: session (IP, F6), guest join, snapshots,
  * shared map view with player avatars. Place below FH_ATB.
  * @author FH2 Co-op Mod
  *
@@ -189,6 +189,130 @@ $.rotateLog = function() {
         require('path').basename(old) + ') ---\n');
     $.logBytes = fs.statSync($.logFile).size;
 };
+
+// Frame-time log (2026-11-12 walking-lag report) ------------------------------
+// Walking alone stuttered in the real game (4 players, Map098's sewer) while
+// the tests (no rendering, no sockets, no long session) never showed a long
+// frame. Each long frame on the map or in battle goes to the log with how its
+// time split: game update, render, received messages by type; a minute with
+// slow frames gets a summary line. Nothing changes in play. Runs every frame
+// on every PC: the common path makes no objects and builds no strings.
+$.frameLogClock = (typeof performance !== 'undefined' && performance.now) ?
+    function() { return performance.now(); } : Date.now;
+$.FRAME_LOG_LONG_MS = 100;      // a frame longer than this is written
+$.FRAME_LOG_LINE_GAP_MS = 1000; // at most one such line a second
+$.FRAME_LOG_TYPES = 12;         // message types told apart in a frame (the rest: 'other')
+$.frameLog = {
+    last: 0, upd: 0, rnd: 0, msg: 0, msgT: [], msgC: [], msgK: 0,
+    minute: { ms: 0, frames: 0, over33: 0, over50: 0, over100: 0, worst: 0 },
+    lastLine: 0, quiet: 0, on: false, okPrev: false, hooked: false,
+};
+
+$.frameLogMsg = function(type, ms) {
+    var fl = $.frameLog, k = fl.msgK, i;
+    if (typeof type !== 'string') type = 'other';
+    fl.msg += ms;
+    for (i = 0; i < k; i++) {
+        if (fl.msgT[i] === type) { fl.msgC[i]++; return; }
+    }
+    if (k >= $.FRAME_LOG_TYPES - 1 && type !== 'other') { // (the last slot is kept for 'other')
+        type = 'other';
+        for (i = 0; i < k; i++) {
+            if (fl.msgT[i] === type) { fl.msgC[i]++; return; }
+        }
+    }
+    fl.msgT[k] = type;
+    fl.msgC[k] = 1;
+    fl.msgK = k + 1;
+};
+
+$.frameLogReset = function(fl) {
+    fl.upd = 0;
+    fl.rnd = 0;
+    fl.msg = 0;
+    fl.msgK = 0;
+};
+
+// Wrapped at the first frame, not here: by then every plugin has wrapped
+// updateScene / renderScene, and their work counts too.
+$.frameLogHook = function() {
+    var fl = $.frameLog;
+    fl.hooked = true;
+    var updateScene = SceneManager.updateScene, renderScene = SceneManager.renderScene;
+    SceneManager.updateScene = function() {
+        if (!fl.on) return updateScene.call(this);
+        var t = $.frameLogClock();
+        updateScene.call(this);
+        fl.upd += $.frameLogClock() - t;
+    };
+    SceneManager.renderScene = function() {
+        if (!fl.on) return renderScene.call(this);
+        var t = $.frameLogClock();
+        renderScene.call(this);
+        fl.rnd += $.frameLogClock() - t;
+    };
+};
+
+$.frameLogRound = function(ms) { return Math.round(ms * 10) / 10; };
+
+// gap: from the previous frame's start to this one's; the buckets hold what
+// was gathered in between (that frame's update and render, the messages after).
+$.frameLogCount = function(fl, gap, now) {
+    var m = fl.minute, r = $.frameLogRound;
+    m.ms += gap;
+    m.frames++;
+    if (gap > 33.4) m.over33++;
+    if (gap > 50) m.over50++;
+    if (gap > 100) m.over100++;
+    if (gap > m.worst) m.worst = gap;
+    if (gap > $.FRAME_LOG_LONG_MS) {
+        if (now - fl.lastLine >= $.FRAME_LOG_LINE_GAP_MS) {
+            var types = '';
+            for (var i = 0; i < fl.msgK; i++) types += (i ? ' ' : ' (') + fl.msgT[i] + 'x' + fl.msgC[i];
+            if (types) types += ')';
+            $.dlog('long frame ' + r(gap) + 'ms: update ' + r(fl.upd) + ' render ' + r(fl.rnd) +
+                ' msgs ' + r(fl.msg) + types + ' map ' + ($gameMap ? $gameMap.mapId() : 0) +
+                ' players ' + (Object.keys($.remotes || {}).length + 1) +
+                (fl.quiet ? ' (+' + fl.quiet + ' more)' : ''));
+            fl.lastLine = now;
+            fl.quiet = 0;
+        } else {
+            fl.quiet++;
+        }
+    }
+    if (m.ms >= 60000) {
+        if (m.over33 > 0) {
+            $.dlog('frames 60s: ' + m.frames + ', >33ms ' + m.over33 + ', >50ms ' + m.over50 +
+                ', >100ms ' + m.over100 + ', worst ' + r(m.worst) + 'ms');
+        }
+        m.ms = 0; m.frames = 0; m.over33 = 0; m.over50 = 0; m.over100 = 0; m.worst = 0;
+    }
+};
+
+var _updateMainFrameLog = SceneManager.updateMain;
+SceneManager.updateMain = function() {
+    var fl = $.frameLog, now = $.frameLogClock();
+    if (!fl.hooked) $.frameLogHook();
+    var on = !!$.role && !($.sessionActive && !$.sessionActive());
+    // (minimised or paused, a loading or changing scene, a menu: not counted,
+    // nor the frame right after one - it holds the new scene's start)
+    var ok = false;
+    if (on) {
+        var scene = SceneManager._scene;
+        ok = !(typeof document !== 'undefined' && document.hidden) && !SceneManager.isSceneChanging() &&
+            SceneManager.isCurrentSceneStarted() && (scene instanceof Scene_Map || scene instanceof Scene_Battle);
+        if (ok && fl.okPrev && fl.last) {
+            var gap = now - fl.last;
+            if (gap <= 3000) $.frameLogCount(fl, gap, now);
+        }
+    }
+    fl.okPrev = ok;
+    fl.on = on;
+    $.frameLogReset(fl);
+    fl.last = now;
+    _updateMainFrameLog.call(this);
+};
+
 window.addEventListener('error', function(e) {
     $.dlog('ERROR', String(e.message), e.filename + ':' + e.lineno, e.error && e.error.stack);
 });
@@ -322,7 +446,7 @@ function Connection(socket, onMessage, onClose) {
             var line = this.buffer.slice(0, idx);
             this.buffer = this.buffer.slice(idx + 1);
             if (!line) continue;
-            var msg;
+            var msg, t0 = $.frameLogClock(); // (the frame-time log: parse and handling)
             try {
                 msg = JSON.parse(line);
             } catch (e) {
@@ -330,6 +454,7 @@ function Connection(socket, onMessage, onClose) {
                 continue;
             }
             onMessage(this, msg);
+            $.frameLogMsg(msg && msg.t, $.frameLogClock() - t0);
         }
     }.bind(this));
     var close = function() {
@@ -494,7 +619,7 @@ $.startHost = function() {
 // Host and guest must run the same mod code: the release label (main.js of
 // a release sets FH_COOP_VERSION; install.bat copies are '<MOD_RELEASE> dev')
 // and a hash of the mod plugin files, which is what is compared.
-$.MOD_RELEASE = '1.0.0';
+$.MOD_RELEASE = '1.0.1';
 $.modVersion = (typeof FH_COOP_VERSION !== 'undefined' && FH_COOP_VERSION) || $.MOD_RELEASE + ' dev';
 $.modHash = (function() {
     try {
@@ -543,6 +668,9 @@ $.onHostMessage = function(conn, msg) {
     case 'pick':
         $.dlog('guest pick', conn.name, msg.id);
         $.onGuestPick(conn, msg.id);
+        break;
+    case 'actorName':
+        $.onGuestName(conn, msg);
         break;
     case 'soloDone':
         $.onSoloDone(conn, msg);
@@ -703,6 +831,150 @@ $.snapshotTargets = function(conn) {
     });
 };
 
+//=============================================================================
+// JsonEx.stringify's text, made without touching the objects
+//=============================================================================
+// Every snapshot and roam start is the whole save as JsonEx text, built on the
+// host (or a sub-host) in one frame: each guest that takes a door, comes back
+// or joins stops that PC's game for it (1.0.0 review: with 4 players on Map058
+// a door cost the host a 49 ms frame, half of it JsonEx.stringify). The
+// engine's own writes '@c' / '@' into every object and array of the save,
+// wraps the arrays, makes the text, then walks everything twice more to take
+// its marks out again. This makes the same text, character for character, in
+// one walk that changes nothing: ids in the order the engine gives them, a
+// second reference as {"@r":id}, an array as {"@c":id,"@a":[...]}, '@c' and
+// '@' last in an object. A shape it does not do (a toJSON, an object that
+// cannot take a new field, a field named '@' or '@c', an array with named
+// fields or from another window, something too deep) leaves the whole text to
+// the engine's own. The first texts of a session are made both ways and
+// compared: a difference goes to the log and the engine's own is used from
+// then on (the tests compare every one: FH_JSONEX_VERIFY=1, tools/test/harness.js).
+$.FAST_JSONEX = true;
+$.jsonExChecks = 2;       // whole saves still made both ways (check: true)
+$.jsonExCheckAll = false; // (tests) every text
+$.jsonExMismatch = null;  // (tests) fn(fast text, the engine's)
+
+var jxBail = { bail: true };
+var jxKeys = Object.create(null), jxKeyN = 0;
+var jxToString = Object.prototype.toString;
+var jxAt = /^@./;
+// (the globals once: these run for every value of a save)
+var jxText = JSON.stringify, jxIsArray = Array.isArray, jxArrayOf = Array, jxKeysOf = Object.keys, jxStr = String;
+var jxFinite = isFinite, jxOpen = Object.isExtensible, jxIsView = ArrayBuffer.isView;
+
+function jxKey(k) {
+    var s = jxKeys[k];
+    if (s) return s;
+    s = jxText(k) + ':';
+    if (jxKeyN < 20000) {
+        jxKeys[k] = s;
+        jxKeyN++;
+    }
+    return s;
+}
+
+// The text of one value (undefined: JSON leaves it out of an object, null in an array).
+function jxAny(v, level, st) {
+    switch (typeof v) {
+    case 'string': return jxText(v);
+    case 'number': return jxFinite(v) ? jxStr(v) : 'null';
+    case 'boolean': return v ? 'true' : 'false';
+    case 'undefined': case 'function': case 'symbol': return undefined;
+    case 'object': break;
+    default: throw jxBail;
+    }
+    if (v === null) return 'null';
+    var id = st.seen.get(v);
+    if (id !== undefined) return '{"@r":' + id + '}';
+    if (jxIsArray(v)) {
+        if (!(v instanceof jxArrayOf)) throw jxBail;
+        id = st.id;
+        return '{"@c":' + id + ',"@a":' + jxArray(v, level, st) + '}';
+    }
+    if (jxToString.call(v) !== '[object Object]') {
+        // (a Map, a typed array: the engine does not walk those, JSON writes them as they are)
+        if (typeof v.toJSON === 'function' || (!jxIsView(v) && jxKeysOf(v).length)) throw jxBail;
+        return jxText(v);
+    }
+    return jxObject(v, level, st);
+}
+
+function jxArray(v, level, st) {
+    if (2 * level + 3 >= JsonEx.maxDepth || typeof v.toJSON === 'function' || !jxOpen(v)) throw jxBail;
+    st.seen.set(v, st.id++);
+    var n = v.length, keys = jxKeysOf(v), i;
+    if (keys.length !== n || (n && keys[n - 1] !== jxStr(n - 1))) {
+        // holes are fine (null, as JSON writes them); a named field is not
+        for (i = 0; i < keys.length; i++) {
+            var x = keys[i] >>> 0;
+            if (jxStr(x) !== keys[i] || x >= n) throw jxBail;
+        }
+    }
+    if (!n) return '[]';
+    var parts = new jxArrayOf(n);
+    for (i = 0; i < n; i++) {
+        var s = jxAny(v[i], level + 1, st);
+        parts[i] = s === undefined ? 'null' : s;
+    }
+    return '[' + parts.join(',') + ']';
+}
+
+function jxObject(v, level, st) {
+    if (2 * level + 3 >= JsonEx.maxDepth || typeof v.toJSON === 'function' || !jxOpen(v)) throw jxBail;
+    var id = st.id++;
+    st.seen.set(v, id);
+    var ctor = JsonEx._getConstructorName(v);
+    var keys = jxKeysOf(v), out = '';
+    for (var i = 0; i < keys.length; i++) {
+        var k = keys[i], val = v[k];
+        // ('@x' fields: the engine leaves their values as they are - plain values only here)
+        if (k.charCodeAt(0) === 64 && (k === '@' || k === '@c' || !jxAt.test(k) || (val && typeof val === 'object'))) throw jxBail;
+        var s = jxAny(val, level + 1, st);
+        if (s !== undefined) out += (out ? ',' : '') + jxKey(k) + s;
+    }
+    out += (out ? ',' : '') + '"@c":' + id;
+    if (ctor !== 'Object' && ctor !== 'Array') {
+        if (typeof ctor !== 'string') throw jxBail;
+        out += ',"@":' + jxText(ctor);
+    }
+    return '{' + out + '}';
+}
+
+// Throws for a shape it does not do (and where the engine's own throws).
+$.jsonExFast = function(object) {
+    var st = { id: 1, seen: new Map() };
+    if (jxIsArray(object)) {
+        if (!(object instanceof jxArrayOf)) throw jxBail;
+        return jxArray(object, 0, st);
+    }
+    if (jxToString.call(object) !== '[object Object]') throw jxBail;
+    return jxObject(object, 0, st);
+};
+
+// JsonEx.stringify(object). check: one of the session's first whole saves
+// (made both ways, compared).
+$.jsonEx = function(object, check) {
+    if (!$.FAST_JSONEX || !object || typeof object !== 'object') return JsonEx.stringify(object);
+    var text;
+    try {
+        text = $.jsonExFast(object);
+    } catch (e) {
+        return JsonEx.stringify(object); // (a real error: the engine's own throws it as before)
+    }
+    if ($.jsonExCheckAll || (check && $.jsonExChecks > 0)) {
+        if (check) $.jsonExChecks--;
+        var own = JsonEx.stringify(object);
+        if (own !== text) {
+            $.FAST_JSONEX = false;
+            $.dlog('ERROR jsonEx: not the engine\'s text (' + text.length + ' / ' + own.length +
+                ' characters) - the engine\'s own from here');
+            if ($.jsonExMismatch) $.jsonExMismatch(text, own);
+            return own;
+        }
+    }
+    return text;
+};
+
 // Map events are most of a snapshot (hundreds of KB). Both PCs have the map
 // data, so an event goes as the fields that differ from the same event built
 // fresh from that data (in the snapshot's world, so the guest builds the same
@@ -721,17 +993,22 @@ $.sameValue = function(a, b) {
 
 // { field: value } for plain values, { field: { '@fhJ': JsonEx text } } for
 // objects, { field: { '@fhDel': 1 } } for a field the event does not have.
+// (plain loops: this runs for every field of every event of the map, in the
+// frame that builds the snapshot)
 $.eventDiff = function(ev, mapId, id) {
     var fresh = new Game_Event(mapId, id);
-    var diff = null;
-    Object.keys(ev).forEach(function(k) {
-        var v = ev[k];
-        if (v === undefined || $.sameValue(v, fresh[k])) return;
-        (diff = diff || {})[k] = v && typeof v === 'object' ? { '@fhJ': JsonEx.stringify(v) } : v;
-    });
-    Object.keys(fresh).forEach(function(k) {
+    var diff = null, keys = Object.keys(ev), i, k, v;
+    for (i = 0; i < keys.length; i++) {
+        k = keys[i];
+        v = ev[k];
+        if (v === undefined || $.sameValue(v, fresh[k])) continue;
+        (diff = diff || {})[k] = v && typeof v === 'object' ? { '@fhJ': $.jsonEx(v) } : v;
+    }
+    keys = Object.keys(fresh);
+    for (i = 0; i < keys.length; i++) {
+        k = keys[i];
         if (fresh[k] !== undefined && (!(k in ev) || ev[k] === undefined)) (diff = diff || {})[k] = { '@fhDel': 1 };
-    });
+    }
     return diff;
 };
 
@@ -741,7 +1018,7 @@ $.compactEvents = function(map) {
     map._events.forEach(function(ev, id) {
         if (!ev) return;
         if (ev.constructor !== Game_Event || ev._eventId !== id || ev._mapId !== mapId || !$dataMap.events[id]) {
-            out.f[id] = JsonEx.stringify(ev);
+            out.f[id] = $.jsonEx(ev);
             return;
         }
         out.p.push(id);
@@ -754,14 +1031,46 @@ $.compactEvents = function(map) {
 $.snapshotData = function() {
     var contents = DataManager.makeSaveContents();
     return $.withCeListIds(function() {
-        if ($.COMPACT_EVENTS && $dataMap && contents.map === $gameMap) {
-            var map = Object.assign(Object.create(Game_Map.prototype), $gameMap);
-            map._events = [];
-            map._fhEv = $.compactEvents($gameMap);
-            contents.map = map;
+        if ($.COMPACT_EVENTS && contents.map === $gameMap) {
+            // (null: this PC does not hold that map's data now - the events go whole)
+            var compact = $.withMapData($gameMap.mapId(), function() { return $.compactEvents($gameMap); });
+            if (compact) {
+                var map = Object.assign(Object.create(Game_Map.prototype), $gameMap);
+                map._events = [];
+                map._fhEv = compact;
+                contents.map = map;
+            }
         }
-        return JsonEx.stringify(contents);
+        return $.jsonEx(contents, true);
     });
+};
+
+// fn() with $dataMap the data of map mapId; null when this PC does not have
+// it. A host that takes a door hands the map it leaves to the guests standing
+// there from Game_Player.performTransfer (FH_CoopRoam $.leaveGuestsBehind):
+// by then $dataMap is the NEXT map's (Scene_Map.create loads it, onMapLoaded
+// performs the transfer) while $gameMap is still the old one. The events were
+// compared with events built from the wrong map's data: an event whose id the
+// next map does not have went whole, the others as their changes from an
+// event of another map - a field that happened to be alike was left out and
+// the guest's own fresh event (the right map's) kept its starting value there
+// (1.0.0 review: the host leaving Map058 for Map005 sent each of the three
+// guests left there 1.88 MB instead of 0.3 MB, a 100 ms frame on each of
+// their PCs; events 1-201 could come out facing or standing as at the start).
+// The data of the map before is kept ($.keptMapData) and stands in here.
+$.withMapData = function(mapId, fn) {
+    if ($dataMap && (!$.dataMapId || $.dataMapId === mapId)) return fn();
+    var kept = $.keptMapData;
+    if (!kept || kept.id !== mapId || !kept.data) return null;
+    var data = $dataMap, id = $.dataMapId;
+    window.$dataMap = kept.data;
+    $.dataMapId = mapId;
+    try {
+        return fn();
+    } finally {
+        window.$dataMap = data;
+        $.dataMapId = id;
+    }
 };
 
 // What is left is mostly common event lists: a running common event's
@@ -909,9 +1218,16 @@ $.parseSnapshot = function(text) {
 
 // Which map $dataMap holds (it has no id of its own).
 $.dataMapId = 0;
+$.keptMapData = null; // { id, data }: the map data before this one ($.withMapData)
+// (a function of its own: the test harness reads map data its own way - a test
+// that follows a transfer calls this as the game does)
+$.noteMapDataLoad = function(mapId) {
+    if ($dataMap && $.dataMapId) $.keptMapData = { id: $.dataMapId, data: $dataMap };
+    $.dataMapId = mapId;
+};
 var _DataManager_loadMapData = DataManager.loadMapData;
 DataManager.loadMapData = function(mapId) {
-    $.dataMapId = mapId;
+    $.noteMapDataLoad(mapId);
     _DataManager_loadMapData.call(this, mapId);
 };
 
@@ -1723,6 +2039,27 @@ $.onGuestPick = function(conn, actorId) {
     $.toast('Co-op: ' + conn.name + ' chose ' + $dataActors[actorId].name);
 };
 
+// A guest named its character (the original's name entry after its pick,
+// or one an event opened on its PC). Player input: no escape codes (\ starts
+// one in message text), no control characters, at most Map155's 14.
+$.NAME_MAX = 14;
+$.cleanActorName = function(text) {
+    var name = String(text || '').replace(/[\u0000-\u001f\u007f-\u009f\\]/g, '').trim();
+    return Array.from(name).slice(0, $.NAME_MAX).join('').trim(); // (by characters: no half of a pair)
+};
+$.onGuestName = function(conn, msg) {
+    var actor = conn.actorId && $gameActors.actor(conn.actorId);
+    var name = $.cleanActorName(msg.name);
+    if (!actor || !name) return;
+    actor.setName(name);
+    conn._lastMeKey = null;
+    if ($.pushMe) $.pushMe(conn);
+    $.clients.forEach(function(c) {
+        if (c !== conn) c.send({ t: 'actorName', a: conn.actorId, name: name });
+    });
+    $.dlog('guest name', conn.name, conn.actorId, name);
+};
+
 // A guest picking after the tutorial skipped the character history: its
 // character is still the companion NPC of the host's world. Give it what the
 // history's "Skip?" -> Yes branch gives (map 19 event 224, the page of that
@@ -2077,16 +2414,22 @@ $.allEventInfo = function() {
     return out;
 };
 
+// The players of a state: this PC's own, then each connection's last word.
+$.statePlayers = function() {
+    var players = [$.playerInfo('host')];
+    $.clients.forEach(function(c) {
+        if (c.lastPos) players.push(c.lastPos);
+    });
+    return players;
+};
+
 $.hostSync = function() {
     if ($.clients.length === 0) return;
     $.updatePicking();
     var events = $.syncEvents(true); // (and the taken characters' NPCs hidden)
     var pres = $.presentationDelta();
     var said = $.messageInfo(), saidKey = said ? JSON.stringify(said) : '';
-    var players = [$.playerInfo('host')];
-    $.clients.forEach(function(c) {
-        if (c.lastPos) players.push(c.lastPos);
-    });
+    var players = $.statePlayers();
     var full = null;
     $.clients.forEach(function(c) {
         var msg = {
@@ -2319,11 +2662,15 @@ $.onGuestMessage = function(conn, msg) {
     case 'assign':
         $.dlog('assigned actor', msg.id, 'solo', msg.solo);
         $.myActorId = msg.id;
+        if (msg.id !== $.namePending) $.namePending = 0; // (a re-join or a saved character: no entry)
         $.picking = false;
         $.hostWaitingAtExit = !!msg.hostAtExit;
         if (msg.solo) $.startSolo(msg.inv);
         if ($gamePlayer) $gamePlayer.refresh();
         $.toast('Co-op: you play ' + $dataActors[msg.id].name);
+        break;
+    case 'actorName': // (a roaming PC's copy, a sub-host's copy, a thin guest's party window)
+        if (msg.a && $gameActors && $gameActors.actor(msg.a)) $gameActors.actor(msg.a).setName(String(msg.name));
         break;
     case 'lobby':
         $.remotes = {};
@@ -2332,6 +2679,7 @@ $.onGuestMessage = function(conn, msg) {
         $.myActorId = 0;
         $.solo = null;
         $.picking = false;
+        $.namePending = 0;
         if ($.dropTutorialSeatLocal) $.dropTutorialSeatLocal();
         if (!(SceneManager._scene instanceof Scene_Title)) SceneManager.goto(Scene_Title);
         $.toast('Co-op: waiting for the host');
@@ -3087,6 +3435,7 @@ Scene_Map.prototype.update = function() {
     Object.keys($.remotes).forEach(function(id) { $.remotes[id].update(); });
     if ($.isGuest()) $.processPendingSnapshot();
     if ($.isGuest()) this.updateFHCoopPick();
+    if ($.isGuest()) this.updateFHCoopName();
     if ($.isGuest()) this.updateFHCoopSolo();
     if ($.isHost()) $.updateChoiceVote();
     if (this._fhSnapshotDue && $.isHost()) {
@@ -3115,7 +3464,31 @@ Scene_Map.prototype.onFHCoopPick = function() {
     var id = this._fhPickWindow.currentExt();
     $.picking = false;
     this.closeFHCoopPick();
+    $.namePending = id; // (its own pick: the name entry follows the host's 'assign')
     if ($.conn) $.conn.send({ t: 'pick', id: id });
+};
+
+// The original's name entry after the pick (Map155 EV1: 303 [actor, 14]),
+// once the map is idle. The host keeps the name ('actorName').
+$.namePending = 0;
+Scene_Map.prototype.updateFHCoopName = function() {
+    var id = $.namePending;
+    if (!id || $.myActorId !== id || !this.isActive() || SceneManager.isSceneChanging() ||
+            $gameMessage.isBusy() || $.pendingSnapshot || $gamePlayer.isTransferring()) return;
+    $.namePending = 0;
+    $.dlog('name entry for', id);
+    if ($.isThin()) $.returningFromSubScene = true; // (as the menu / shop; a solo guest runs its own world)
+    SceneManager.push(Scene_Name);
+    SceneManager.prepareNextScene(id, $.NAME_MAX);
+};
+
+var _Scene_Name_onInputOk = Scene_Name.prototype.onInputOk;
+Scene_Name.prototype.onInputOk = function() {
+    _Scene_Name_onInputOk.call(this);
+    if ($.isGuest() && this._actorId === $.myActorId && $.conn) {
+        var actor = $gameActors.actor(this._actorId);
+        if (actor) $.conn.send({ t: 'actorName', name: actor.name() });
+    }
 };
 
 Scene_Map.prototype.closeFHCoopPick = function() {
@@ -3224,7 +3597,8 @@ Game_Map.prototype.isEventRunning = function() {
 
 var _Game_Event_update = Game_Event.prototype.update;
 Game_Event.prototype.update = function() {
-    if ($.isThin()) {
+    // (a ghost PC's mirror, FH_CoopRoam: an event shown from the living's PC moves as a thin guest's)
+    if ($.isThin() || ((this._fhMirrorDrive || $.mirror) && $.mirrorDrives(this))) {
         if (this.event()) Game_Character.prototype.update.call(this);
         return;
     }
@@ -3234,7 +3608,7 @@ Game_Event.prototype.update = function() {
 
 var _Game_Event_updateStop = Game_Event.prototype.updateStop;
 Game_Event.prototype.updateStop = function() {
-    if ($.isThin()) {
+    if ($.isThin() || this._fhMirrorDrive) {
         Game_CharacterBase.prototype.updateStop.call(this);
         return;
     }
@@ -3253,7 +3627,10 @@ var _Game_Event_refresh = Game_Event.prototype.refresh;
 Game_Event.prototype.refresh = function() {
     // After a world swap the old map runs one more frame with new events.
     if (($.isThin() && !$.buildingEvents) || !this.event()) return;
+    var page = this._pageIndex;
     _Game_Event_refresh.call(this);
+    // a ghost PC's own copy turned this event's page: the copy's look until the source says it again (the mirror)
+    if ($.mirror && this._pageIndex !== page) $.mirrorPageTurned(this);
 };
 
 var _Game_Player_startMapEvent = Game_Player.prototype.startMapEvent;
@@ -3674,7 +4051,7 @@ $.SELECT_OF_ACTOR = {};
 Object.keys($.SELECT_ACTOR).forEach(function(sw) { $.SELECT_OF_ACTOR[$.SELECT_ACTOR[sw]] = Number(sw); });
 
 $.saveLocal = function() {
-    return JsonEx.stringify(DataManager.makeSaveContents());
+    return $.jsonEx(DataManager.makeSaveContents());
 };
 
 $.startSolo = function(inv) {
@@ -3731,7 +4108,7 @@ $.finishSolo = function(waitAtExit) {
     if ($.conn) {
         $.conn.send({
             t: 'soloDone',
-            actor: actor ? JsonEx.stringify(actor) : null,
+            actor: actor ? $.jsonEx(actor) : null,
             inv: { i: $gameParty._items, w: $gameParty._weapons, a: $gameParty._armors }
         });
     }

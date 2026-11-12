@@ -1,4 +1,4 @@
-Status: 1.0.0. Bugs may remain. Back up your saves before playing.
+Status: 1.0.1. Bugs may remain. Back up your saves before playing.
 Sessions of 2 to 4 players are supported and have been played.
 
 Before you play:

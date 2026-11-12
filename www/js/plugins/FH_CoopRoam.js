@@ -2,7 +2,7 @@
 // FH_CoopRoam.js
 //=============================================================================
 /*:
- * @plugindesc v1.0.0 Co-op: every player explores on their own. A guest on a
+ * @plugindesc v1.0.1 Co-op: every player explores on their own. A guest on a
  * map without the host runs that map on its own PC. Below FH_CoopBattle.
  * @author FH2 Co-op Mod
  *
@@ -53,6 +53,91 @@ $.backToHost = null;  // guest: transfer onto the host's map waiting to be sent
 
 $.isRoaming = function() {
     return !!$.roam && !$.roam.leaving;
+};
+
+// A ghost PC (user decision 2026-11-11): a dead guest runs its map on its own
+// PC with the host's world and sends nothing of it back. Not while it still
+// runs the map for a guest (a sub-host that died: until it gave them back).
+$.ghostWorld = false; // this PC's world copy is a ghost's: never sent, until a fresh world comes
+$.ghostPrivate = function() {
+    return $.role === 'guest' && $.myState === 'dead' && $.isRoaming() && !($.clients && $.clients.length);
+};
+
+// The mirror (user answer 2026-11-11, design-ghost.md A7): what a ghost sees
+// matches the living. When a living PC runs a ghost PC's map (the host's PC:
+// always), the ghost PC takes every event's position and look from it (as a
+// thin guest does) and those events do not move by themselves here; the
+// events of its own door stay its own while they run. Sources: the host's
+// state (its map), a guest PC running the map (gMirror, task-16).
+$.mirror = null;   // { from: 'host' | a runner's id, m, evs: the $gameMap._events it is for, keys: { id: info } }
+$.mirrorPl = null; // the host's last player list (who stands on which map)
+// Is that source still on map m? (the host: where its PC is, dead or alive)
+$.mirrorHere = function(from, m) {
+    if (from === 'host') return $.hostMapId === m;
+    if ($.pstateOf[from] === 'dead') return false;
+    var pl = $.mirrorPl || [];
+    for (var i = 0; i < pl.length; i++) {
+        if (pl[i] && pl[i].id === from) return (pl[i].m || $.hostMapId) === m;
+    }
+    return false;
+};
+$.mirrorOn = function() {
+    var mi = $.mirror;
+    return !!mi && !!$gameMap && mi.evs === $gameMap._events && $.ghostPrivate() && $.mirrorHere(mi.from, mi.m);
+};
+// An event of this ghost's own door (or moved by its interpreter): its own.
+$.mirrorOwn = function(ev) {
+    if (ev._starting || ev._locked || ev._fhGhostDoor || ev.isMoveRouteForcing()) return true;
+    var it = $gameMap._interpreter;
+    if (it && it.isRunning() && it._mapId === $gameMap.mapId() && it.eventId() === ev.eventId()) return true;
+    return ev._trigger === 3 && !!$.ghostWayOn && $.ghostWayOn(ev);
+};
+// Event info from the source. 'ask': not usable without a whole state first.
+$.mirrorTake = function(from, m, list, full) {
+    if (!$.ghostPrivate() || !$gameMap || m !== $gameMap.mapId()) return false;
+    var mi = $.mirror;
+    if (!mi || mi.evs !== $gameMap._events || mi.from !== from) {
+        // one source at a time: the host on its map, else the runner it has while that one is here
+        if (from !== 'host' && ($.hostMapId === m || $.mirrorOn())) return false;
+        if (!full) return 'ask';
+        mi = $.mirror = { from: from, m: m, evs: $gameMap._events, keys: {} };
+        $.dlog('ghost: mirror from', from, 'on map', m);
+    }
+    (list || []).forEach(function(info) {
+        mi.keys[info[0]] = info;
+        var ev = $gameMap.event(info[0]);
+        if (!ev) return; // (an event this copy does not have)
+        if ($.mirrorOwn(ev)) ev._fhMirrorOwn = true; // (shown once its door is over: $.mirrorDrives)
+        else $.applyEvent(info);
+    });
+    return true;
+};
+// Called by FH_Coop's Game_Event.prototype.update for every event: true =
+// this event shows the source's info (no page logic, no movement of its own).
+$.mirrorDrives = function(ev) {
+    var on = $.mirrorOn() && !!ev.event();
+    var own = on && $.mirrorOwn(ev);
+    if (on && !own && ev._fhMirrorOwn) {
+        var k = $.mirror.keys[ev.eventId()];
+        if (k) $.applyEvent(k); // its door is over: the living's look again
+    }
+    ev._fhMirrorOwn = own;
+    ev._fhMirrorDrive = on && !own;
+    return ev._fhMirrorDrive;
+};
+// This PC's copy turned an event's page (its own door's write, a world change
+// that came before the source's word): the copy's look for that event until
+// the source says it again - a gate a ghost opened stays open for it (answer 3 (a)).
+$.mirrorPageTurned = function(ev) {
+    var mi = $.mirror;
+    if (mi && $gameMap && mi.evs === $gameMap._events) delete mi.keys[ev.eventId()];
+};
+$.mirrorAskedAt = 0;
+$.mirrorAskHost = function() {
+    var now = $.nowMs();
+    if (!$.conn || ($.mirrorAskedAt && now - $.mirrorAskedAt < $.RESYNC_MIN_MS)) return;
+    $.mirrorAskedAt = now;
+    $.conn.send({ t: 'resync', why: 'ghost mirror' });
 };
 
 // A roaming guest runs everything itself; while it leaves it waits like a
@@ -165,7 +250,7 @@ $.noSyncWrite = 0;    // > 0: Control Variables from game data (positions etc.)
 $.worldDirty = null;  // { sw: {}, v: {}, ss: {}, el: {} } changes not sent yet
 
 $.trackingWorld = function() {
-    if ($.isGuest()) return $.isRoaming();
+    if ($.isGuest()) return $.isRoaming() && !$.ghostWorld && !$.ghostPrivate();
     return $.isHost() && $.clients.some(function(c) { return c.roam; });
 };
 
@@ -515,11 +600,10 @@ $.sendSnapshot = function(conn) {
     if (conn) {
         conn.roam = false;
         conn.roamPending = null;
-        conn._ghostStay = false;
         return _sendSnapshot(conn);
     }
     var all = $.clients.filter(function(c) { return !c.solo; });
-    var some = all.filter(function(c) { return !c.roam && !c.roamPending && !c._ghostStay; });
+    var some = all.filter(function(c) { return !c.roam && !c.roamPending; });
     if (some.length === all.length) return _sendSnapshot();
     if (some.length) _sendSnapshot(some); // one save build for all of them
 };
@@ -565,7 +649,7 @@ var _command201 = Game_Interpreter.prototype.command201;
 Game_Interpreter.prototype.command201 = function() {
     if ($.runsWorld() && this._fhOwner && !$gameParty.inBattle()) return this.fhGuestTransfer();
     // (not into a dream: each player has its own, see "Sleeping together")
-    if ($.isRoaming() && !$gameParty.inBattle() && $.hostMapId && !$.DREAM_MAPS[$.hostMapId] &&
+    if ($.isRoaming() && !$.ghostWorld && !$.ghostPrivate() && !$gameParty.inBattle() && $.hostMapId && !$.DREAM_MAPS[$.hostMapId] &&
             $.transferTarget(this) === $.hostMapId) {
         return this.fhBackToHost();
     }
@@ -690,7 +774,7 @@ $.updateOwned = function() {
         var entry = $.owned[id];
         var conn = $.clientById(id);
         if (!entry || !conn) return;
-        var json = JsonEx.stringify(entry.interp);
+        var json = $.jsonEx(entry.interp);
         // an autorun page that goes on there must not start here again
         if (entry.ev && entry.ev._trigger === 3) {
             entry.ev._fhHandedPage = entry.ev._pageIndex;
@@ -738,55 +822,28 @@ $.leaveGuestsBehind = function(newMapId) {
 };
 
 // A ghost stays where it is (user 2026-11-07: "the dead guest's ghost keeps
-// following me, and it lags"). A dead guest on the host's map used to follow
-// the host through every door (0.3.x spectating): a whole world sent to it at
-// each one, every fight of the host watched by it. Now the map it is on stays
-// on its PC as a still copy ($.spec, as when it walks through a door itself)
-// and the snapshots of the host's new maps leave it out (_ghostStay); a door
-// it takes to the host's map asks for the world again (needSnap), and the
-// host coming onto its map takes it back in where it stands.
+// following me, and it lags"). A dead guest left behind on a map the host
+// leaves (one the keeper had not handed over yet, $.ghostKeep) gets that map
+// to run on its own PC, like a living guest left behind (user decision
+// 2026-11-11: a dead player's PC runs its game itself, the host's world comes
+// to it as changes). No world is sent to it at the host's later doors.
 // Into an ending (the host won: the tower, ending A) it still follows the host
 // and watches it, as before (2026-11-06: "the ghosts watch the winner's ending").
 $.ghostLeftBehind = function(c, here, newMapId) {
     if ($.ENDING_MAPS && $.ENDING_MAPS[newMapId]) {
-        c._ghostStay = false;
         if (c.lastPos) delete c.lastPos.m; // it follows the host
         return;
     }
+    if ($.tourney) return; // (the duels: as they are until it ends)
+    // left behind as anyone, as a ghost: its PC runs that map itself (2026-11-11)
+    // (the map its last 'pos' names)
     var at = c.lastPos && c.lastPos.m ? c.lastPos.m : here;
-    if (at === newMapId) { // the host comes onto its map: back in the world
-        c._ghostStay = false;
+    if ($.roamHeld(c)) {
+        c.roamPending = { m: at }; // after its menu / event, as a living guest ($.hostSync); no snapshot of the host's next map meanwhile
         return;
     }
-    if (at === here) {
-        c.lastPos = Object.assign({}, c.lastPos || {}, { m: here });
-        if (!c._ghostStay) c.send({ t: 'ghostStay', m: here });
-    }
-    c._ghostStay = true;
-    delete $.remotes[c.guestId];
-    $.dlog('ghost', c.name, 'stays on map', at, '- the host goes to', newMapId);
-};
-
-$.guestHandlers.ghostStay = function(msg) {
-    if (!$.isGhostMe() || $.spec || !$gameMap || $gameMap.mapId() !== msg.m) return;
-    var hide = $.playerInfo($.myId);
-    hide.tr = 1;
-    if ($.conn) $.conn.send({ t: 'pos', p: hide });
-    $.spec = { m: msg.m };
-    $.dlog('ghost: the host left, this map stays as a still copy', msg.m);
-};
-
-// Taken back in on the map it stood on: it stays where it stands.
-var _processPendingSnapshotGhostStay = $.processPendingSnapshot;
-$.processPendingSnapshot = function() {
-    var snap = $.pendingSnapshot, p = typeof $gamePlayer !== 'undefined' ? $gamePlayer : null;
-    var keep = snap && $.spec && p && !$.ghostArrive && snap.mapId === $.spec.m ?
-        { m: snap.mapId, x: p.x, y: p.y, d: p.direction() } : null;
-    _processPendingSnapshotGhostStay();
-    if (keep && $gameMap && $gameMap.mapId() === keep.m && $gamePlayer) {
-        $gamePlayer.locate(keep.x, keep.y);
-        $gamePlayer.setDirection(keep.d);
-    }
+    $.dlog('ghost', c.name, 'left on map', at, '- runs it on its own PC; the host goes to', newMapId);
+    $.sendRoam(c, { pos: Object.assign({}, c.lastPos || {}, { m: at }) });
 };
 
 // Not left to its own map yet: busy, or its menu is open. The host's copy
@@ -1132,6 +1189,8 @@ $.canStartRoam = function() {
 };
 
 $.startRoam = function(msg) {
+    $.ghostWorld = false;
+    $.mirror = null;
     var mine = $gameActors.actor($.myActorId);
     var actorJson = mine ? $.actorJson(mine) : null;
     var inv = { i: $gameParty._items, w: $gameParty._weapons, a: $gameParty._armors, g: $gameParty._gold };
@@ -1222,6 +1281,9 @@ $.startRoam = function(msg) {
         p.reserveTransfer(msg.pos.m, msg.pos.x, msg.pos.y, msg.pos.d || 2, 2);
     }
     p.refresh();
+    // a ghost from the first frame of its new world (the look, $.updateGhostLook, comes
+    // after that frame's input: a Z or a step into an event started it as a living player's)
+    if ($.isGhostMe && $.isGhostMe()) p._fhGhost = true;
     $.remotes = {};
     $.pm = null;
     $.pmQueue = [];
@@ -1339,6 +1401,7 @@ $.roamIdle = function() {
 };
 
 $.sendRoamMe = function(force) {
+    if ($.ghostWorld || $.ghostPrivate()) return;
     var actor = $gameActors.actor($.myActorId);
     var msg = { t: 'roamMe', actor: $.actorJson(actor),
         inv: { i: $gameParty._items, w: $gameParty._weapons, a: $gameParty._armors, g: $gameParty._gold } };
@@ -1381,10 +1444,18 @@ $.guestExtras.push(function() {
         return;
     }
     if (!$.isRoaming() || !$.conn) return;
+    if ($.myState === 'dead' && $.subHosting()) $.ghostReleaseSubs();
+    if ($.ghostPrivate()) {
+        if (!$.ghostWorld) $.dlog('ghost: this PC runs its own map from here, nothing of it is sent');
+        $.ghostWorld = true;
+        $.worldDirty = null;
+        $.backToHost = null;
+    }
+    if ($.ghostWorld) return; // (no bag report, no world flush, no way back to the host)
     if ($.backToHost && !$.subsBusy()) {
         var back = $.backToHost;
         $.backToHost = null;
-        $.sendUnroam(back.spot, back.event ? JsonEx.stringify($gameMap._interpreter) : null);
+        $.sendUnroam(back.spot, back.event ? $.jsonEx($gameMap._interpreter) : null);
         return;
     }
     if ($.roamAsk && $.clockMs() > $.roamAsk.until) $.roamAsk = null;
@@ -1409,6 +1480,16 @@ $.applyState = function(msg) {
     if (msg && msg.mapId) $.hostMapId = msg.hm || msg.mapId;
     if ($.roam || $.pendingRoam) {
         if ($gameMap && msg && !$.pendingSnapshot) $.applyPlayers(msg.pl, msg.mapId);
+        if (msg && !msg.hm) $.mirrorPl = msg.pl; // (who stands on which map: "The mirror")
+        // a ghost PC on the host's map: the host's events (the mirror)
+        if ($.ghostPrivate() && $gameMap && msg && !msg.hm && !$.pendingSnapshot) {
+            if ($.mirror && $.mirror.evs !== $gameMap._events) $.mirror = null; // (the map copy it was for is gone)
+            if (msg.mapId === $gameMap.mapId()) {
+                if ($.mirrorTake('host', msg.mapId, msg.ev, !!msg.full) === 'ask') $.mirrorAskHost();
+            } else if ($.mirror && $.mirror.from === 'host') {
+                $.mirror = null;
+            }
+        }
         // the host's world is on its way (back from a dream): its screen
         // after that snapshot is the one to show (FH_Coop "Resync")
         if ($.pendingSnapshot) $.keepDroppedScr(msg, true);
@@ -1436,6 +1517,8 @@ $.processPendingSnapshot = function() {
         $.backToHost = null;
         $.roamAsk = null;
         $.worldDirty = null;
+        $.ghostWorld = false;
+        $.mirror = null;
     }
     _processPendingSnapshot();
     if (ownPc && $gameSwitches && $.CTX_OWN_SWITCHES) {
@@ -1451,6 +1534,8 @@ $.leaveAsGuest = function(message) {
     $.backToHost = null;
     $.roamAsk = null;
     $.worldDirty = null;
+    $.ghostWorld = false;
+    $.mirror = null;
     _leaveAsGuest(message);
 };
 
@@ -1511,6 +1596,10 @@ $.tradePartners = function() {
 var _handleGameOver = $.handleGameOver;
 $.handleGameOver = function() {
     if ($.isGuest() && $.isRoaming() && !$.localBattle && !$.puppet) {
+        // a ghost PC (a dead guest running its map, $.ghostKeep): its character is
+        // the host's dead copy - the engine's "all dead" is no second defeat (it
+        // made the ghost 'down', so it sent its world and went back to the host)
+        if ($.myState === 'dead') return true;
         $.roamDefeated();
         return true;
     }
@@ -1770,7 +1859,7 @@ $.dropOldWorld = function() {
 
 $.SUB_FORWARD = { act: 1, pmsgDone: 1, syncMe: 1, menuOpen: 1, ce: 1, battleEnd: 1, shoot: 1,
     needSnap: 1, pos: 1, bConsume: 1, bGain: 1, bLeft: 1, trade: 1, tradeAck: 1, resync: 1,
-    sleepCancel: 1, keys: 1 };
+    sleepCancel: 1, keys: 1, fieldUse: 1 };
 $.SUB_ASK_MS = 60000; // a join request nobody answered is asked again (real time, $.clockMs)
 
 // Host -----------------------------------------------------------------------
@@ -1778,6 +1867,56 @@ $.SUB_ASK_MS = 60000; // a join request nobody answered is asked again (real tim
 $.subsOf = function(conn) {
     return $.clients.filter(function(c) { return c.subOf === conn.guestId; });
 };
+
+// A ghost's PC (user decision 2026-11-11): a dead guest runs its map itself and
+// the host takes nothing of it. (A sub-host that died: once its guests are gone.)
+$.isGhostConn = function(c) {
+    return !!c && !!c.roam && !c.subOf && !!c.guestId && $.isDead(c.guestId) && !$.subsOf(c).length;
+};
+// (the last five - R4: its Hexen board, a companion, its own switches on the way back)
+$.GHOST_DROP = { wDelta: 1, roamMe: 1, unroam: 1, roamDown: 1, consentReq: 1, betrayAsk: 1,
+    hxMe: 1, minionSync: 1, minionSet: 1, ownSw: 1, pcSw: 1 };
+
+// Host: where the dead guests are. Outside an ending each runs its map on its
+// own PC; in an ending (ending A, the host on an ending map) they watch the host's scene.
+$.ghostViewing = function() {
+    return !!$.endingA || !!($.ENDING_MAPS && $.ENDING_MAPS[$gameMap.mapId()]);
+};
+$.ghostKeep = function() {
+    if (!$.isHost() || !$.hostInGame || !$.tutorialOver() || $.tourney) return; // (the duels: as they are until it ends)
+    // a load, the host's next map: the snapshot that is due says where everyone is first
+    // (a saved spot, $.pushMe) - the Load screen fades out with the world running behind it
+    if ($.snapshotQueued) return;
+    var p = $.realPlayer || $gamePlayer;
+    if (!p || p.isTransferring()) return;
+    var viewing = $.ghostViewing();
+    $.clients.forEach(function(c) {
+        if (!c.inGame || !c.actorId || c.solo || c._watchOf || !$.isDead(c.guestId)) return;
+        if (viewing) {
+            if (!$.isGhostConn(c) || c.roamBusy) return;
+            c._placeAt = { m: $gameMap.mapId(), x: p.x, y: p.y, d: p.direction() };
+            c.lastPos = Object.assign({}, c.lastPos || {}, c._placeAt, { id: c.guestId });
+            $.dlog('ghost', c.name, 'comes to watch the host\'s ending');
+            $.sendSnapshot(c);
+            return;
+        }
+        if (c.subOf) { // a ghost is nobody's guest: off its sub-host (its last bag report still counts)
+            if ($.roamHeld(c)) return;
+            $.detachSub(c);
+        } else if (!c.roam && c.lastPos && c.lastPos.m && c.lastPos.m !== $gameMap.mapId()) {
+            // in the host's game its PC is on the host's map: a 'pos' that names another map is from
+            // before the snapshot that brought it (a load, a re-join) - its PC is not there yet
+            return;
+        }
+        if (c.roam || c.roamPending || $.roamHeld(c)) return;
+        var pos = Object.assign({}, c.lastPos || {});
+        if (!pos.m) pos.m = $gameMap.mapId();
+        if (typeof pos.x !== 'number') { pos.x = p.x; pos.y = p.y; }
+        $.dlog('ghost', c.name, 'runs map', pos.m, 'on its own PC from here');
+        $.sendRoam(c, { pos: pos });
+    });
+};
+$.worldExtras.push(function() { if (Graphics.frameCount % 30 === 0) $.ghostKeep(); });
 
 var _guestOnMapSub = $.guestOnMap;
 $.guestOnMap = function(conn) {
@@ -1787,6 +1926,15 @@ $.guestOnMap = function(conn) {
 
 var _onHostMessageSub = $.onHostMessage;
 $.onHostMessage = function(conn, msg) {
+    if (msg && $.GHOST_DROP[msg.t] && $.isGhostConn(conn)) {
+        // an 'unroam' it sent before it knew it died: its PC waits for the host
+        // ($.roam.leaving) - it runs that map itself again, with the host's world
+        if (msg.t === 'unroam') {
+            conn.subAsked = null;
+            $.sendRoam(conn, { pos: { m: msg.m, x: msg.x, y: msg.y, d: msg.d || 2 } });
+        }
+        return;
+    }
     if (msg && msg.t === 'pos' && msg.p && conn.guestId) {
         // (a re-join's first word: on that map from now, whatever spot the host gave it)
         if (!conn.lastPos || conn.lastPos.m !== msg.p.m || conn._fhNoPos) {
@@ -1806,17 +1954,114 @@ $.onHostMessage = function(conn, msg) {
     _onHostMessageSub(conn, msg);
 };
 
+// A guest PC running its map (a sub-host, a roaming guest alone): its events
+// to the ghost PCs on it, through the host. Whole first, then what changed;
+// an empty beat now and then (a ghost with no whole state for its map copy
+// asks for one when it hears this PC).
+$.MIRROR_BEAT = 30;
+$.mirrorOut = null; // { evs: $gameMap._events, keys: { id: info }, sent: { ghost id: frame of the last word } }
+$.mirrorGhostsHere = function() {
+    var here = $gameMap.mapId(), pl = $.mirrorPl || [], out = [];
+    for (var i = 0; i < pl.length; i++) {
+        var p = pl[i];
+        if (!p || p.id === $.myId || (p.m || $.hostMapId) !== here || $.pstateOf[p.id] !== 'dead') continue;
+        if ($.clientById(p.id)) continue; // (a guest of this PC that died, a watcher: its thin guest, no ghost PC)
+        out.push(p.id);
+    }
+    return out;
+};
+$.mirrorSend = function() {
+    var ghosts = $.isGuest() && $.conn && $gameMap && $.trackingWorld() && $gameMap.mapId() !== $.hostMapId ?
+        $.mirrorGhostsHere() : [];
+    if (!ghosts.length) {
+        $.mirrorOut = null;
+        return;
+    }
+    var o = $.mirrorOut;
+    if (!o || o.evs !== $gameMap._events) o = $.mirrorOut = { evs: $gameMap._events, keys: {}, sent: {} };
+    var list = $.eventsOf($gameMap._events), changed = [];
+    for (var i = 0; i < list.length; i++) {
+        var k = o.keys[list[i].eventId()];
+        if (k && $.eventInfoSame(k, list[i])) continue;
+        k = $.eventInfo(list[i]);
+        o.keys[k[0]] = k;
+        changed.push(k);
+    }
+    Object.keys(o.sent).forEach(function(id) { if (ghosts.indexOf(id) < 0) delete o.sent[id]; });
+    var now = Graphics.frameCount, all = null, m = $gameMap.mapId();
+    ghosts.forEach(function(id) {
+        if (!(id in o.sent)) {
+            all = all || Object.keys(o.keys).map(function(n) { return o.keys[n]; });
+            $.conn.send({ t: 'gMirror', to: id, m: m, ev: all, full: 1 });
+        } else if (changed.length || now - o.sent[id] >= $.MIRROR_BEAT) {
+            $.conn.send({ t: 'gMirror', to: id, m: m, ev: changed });
+        } else {
+            return;
+        }
+        o.sent[id] = now;
+    });
+};
+// (the map scene of any guest PC; a sub-host's other scenes too: its map runs on for its guests)
+$.mirrorFrame = 0;
+$.mirrorTickAt = -1;
+$.mirrorTick = function() {
+    if ($.mirrorTickAt === Graphics.frameCount || !$.isGuest()) return;
+    $.mirrorTickAt = Graphics.frameCount;
+    if (++$.mirrorFrame % $.syncInterval === 0) $.mirrorSend();
+};
+$.guestExtras.push($.mirrorTick);
+$.worldExtras.push($.mirrorTick);
+// the ghost asked for a whole one (its map was set up again)
+$.guestHandlers.gMirrorAsk = function(msg) {
+    if ($.mirrorOut && msg) delete $.mirrorOut.sent[msg.from];
+};
+// Ghost PC: a runner's events.
+$.mirrorAskedRunnerAt = 0;
+$.guestHandlers.gMirror = function(msg) {
+    if (!msg || $.mirrorTake(msg.by, msg.m, msg.ev, !!msg.full) !== 'ask') return;
+    var now = $.nowMs();
+    if (!$.conn || ($.mirrorAskedRunnerAt && now - $.mirrorAskedRunnerAt < $.RESYNC_MIN_MS)) return;
+    $.mirrorAskedRunnerAt = now;
+    $.conn.send({ t: 'gMirrorAsk', to: msg.by, m: msg.m });
+};
+// Host: passes them on - from a living PC running its map to a ghost connection, and the ask back.
+$.hostHandlers.gMirror = function(conn, msg) {
+    var to = msg && $.clientById(msg.to);
+    if (!conn.roam || conn.subOf || $.isGhostConn(conn) || !to || !$.isGhostConn(to)) return;
+    msg.by = conn.guestId;
+    to.send(msg);
+};
+$.hostHandlers.gMirrorAsk = function(conn, msg) {
+    var to = msg && $.clientById(msg.to);
+    if (!$.isGhostConn(conn) || !to || !to.roam || to.subOf || $.isGhostConn(to)) return;
+    to.send({ t: 'gMirrorAsk', from: conn.guestId, m: msg.m });
+};
+
 // A guest of a sub-host gets its world from the sub-host only.
 var _hostSyncSub = $.hostSync;
 $.hostSync = function() {
     var all = $.clients;
     if (all.some(function(c) { return c.subOf; })) $.clients = all.filter(function(c) { return !c.subOf; });
+    $.subSyncAll = all;
     try {
         _hostSyncSub();
     } finally {
         $.clients = all;
+        $.subSyncAll = null;
     }
     $.settleSubs();
+};
+
+// ... but the host's player list names them (their 'pos' reaches the host): a PC that draws
+// their map from the host's list - a ghost PC there, a guest that just came - sees them.
+$.subSyncAll = null; // host: every connection, while $.hostSync runs without the sub guests
+var _statePlayersSub = $.statePlayers;
+$.statePlayers = function() {
+    var players = _statePlayersSub();
+    ($.isHost() && $.subSyncAll || []).forEach(function(c) {
+        if (c.subOf && c.inGame && c.actorId && c.lastPos && c.lastPos.m) players.push(c.lastPos);
+    });
+    return players;
 };
 
 var _sendSnapshotSub = $.sendSnapshot;
@@ -1858,7 +2103,7 @@ $.settleSubs = function() {
     if ($.tourney) return; // no sub-hosting while the duels last (FH_CoopBattle)
     $.clients.forEach(function(c) {
         if (c.subAsked && $.clockMs() - (c.subAskedAt || 0) > $.SUB_ASK_MS) c.subAsked = null;
-        if (!c.roam || c.subAsked || c.roamPending || !c.lastPos || $.subsOf(c).length) return;
+        if (!c.roam || c.subAsked || c.roamPending || !c.lastPos || $.subsOf(c).length || $.isDead(c.guestId)) return;
         if ($.DREAM_MAPS[c.lastPos.m]) return; // each dreams alone ("Sleeping together")
         // one whose PC has not said where it is since it (re)joined (still at its
         // title) neither joins nor takes guests yet: it refused every guest sent
@@ -1866,7 +2111,7 @@ $.settleSubs = function() {
         if (c._fhNoPos) return;
         var first = null;
         $.clients.forEach(function(o) {
-            if (o === c || !o.roam || o.subOf || o.subAsked || !o.lastPos || o.lastPos.m !== c.lastPos.m) return;
+            if (o === c || !o.roam || o.subOf || o.subAsked || !o.lastPos || o.lastPos.m !== c.lastPos.m || $.isDead(o.guestId)) return;
             if (o._fhNoPos) return;
             if ($.cameFirst(o, c) && (!first || $.cameFirst(o, first))) first = o;
         });
@@ -1881,7 +2126,7 @@ var _unroamSub = $.hostHandlers.unroam;
 $.hostHandlers.unroam = function(conn, msg) {
     var owner = conn.subAsked && $.clientById(conn.subAsked);
     conn.subAsked = null;
-    if (conn.roam && owner && owner.roam && !owner.subOf && owner.lastPos && owner.lastPos.m === msg.m &&
+    if (conn.roam && owner && owner.roam && !owner.subOf && !$.isDead(owner.guestId) && owner.lastPos && owner.lastPos.m === msg.m &&
             msg.m !== $gameMap.mapId()) {
         $.storeBelongings(conn, msg);
         conn.roam = false;
@@ -2132,13 +2377,13 @@ $.runsWorld = function() {
     return $.isHost() || $.subHosting();
 };
 
-// A guest down on the map it runs alone: its events see nobody, as on the
+// A guest down or dead on the map it runs alone: its events see nobody, as on the
 // host's map with nobody standing (FH_CoopWorld $.eventTargets). They chased
 // the body and stood round it (play test 2026-11-02, Map055 Fecal hounds).
 var _eventTargetsDown = $.eventTargets;
 $.eventTargets = function() {
     if ($.frameTargets === undefined && $.isGuest() && $.isRoaming() && !$.subHosting() &&
-            $.myState === 'down' && $.sessionActive()) {
+            ($.myState === 'down' || $.myState === 'dead') && $.sessionActive()) {
         return [];
     }
     return _eventTargetsDown();
@@ -2159,7 +2404,8 @@ $.inventoryOf = function(conn) {
 };
 
 $.guestHandlers.subAdd = function(msg) {
-    if (!$.isRoaming() || !msg.pos || msg.pos.m !== $gameMap.mapId() || $.roam.joinSub) {
+    // (a ghost PC runs a map for nobody: its world copy is its own)
+    if (!$.isRoaming() || !msg.pos || msg.pos.m !== $gameMap.mapId() || $.roam.joinSub || $.ghostWorld || $.ghostPrivate()) {
         if ($.conn) $.conn.send({ t: 'subRefuse', id: msg.id });
         return;
     }
@@ -2205,6 +2451,7 @@ $.guestHandlers.subMsg = function(msg) {
         return;
     }
     if (m.t === 'trade' && m.to === $.myId) m.to = 'host'; // 'host' = this PC in the map code
+    if (m.t === 'fieldUse' && m.to === $.myId) m.to = 'host';
     if (m.t === 'bConsume' || m.t === 'bGain') {
         var bag = m.jid === $.myId ? null : $.clientById(m.jid);
         if (m.jid === $.myId) {
@@ -2253,6 +2500,12 @@ $.removeSub = function(v) {
     if ($.owned[v.guestId]) $.finishOwned(v.guestId);
     if ($.onGuestClosedBattle) $.onGuestClosedBattle(v);
     $.clients = $.clients.filter(function(c) { return c !== v; });
+    // the yellow mage's dance was on it (FH_CoopWorld $.ymCheckTarget, which
+    // no longer runs here once the last guest is gone): nobody else takes its Hurting
+    if ($.ymTarget === v.guestId) {
+        $.ymTarget = null;
+        if ($gameSwitches && $gameSwitches._data[$.YM_DANCE_SWITCH]) $gameSwitches.setValue($.YM_DANCE_SWITCH, false);
+    }
     if (!$.clients.length) $.worldDirty = $.worldDirty; // nothing else to clean
 };
 
@@ -2319,6 +2572,13 @@ $.subHostSync = function() {
     var pres = $.presentationDelta();
     var players = [$.playerInfo($.myId)];
     $.clients.forEach(function(c) { if (c.lastPos) players.push(c.lastPos); });
+    // the ghost PCs on this map (the host's list, $.mirrorPl): this PC's guests see them too
+    var ghosts = $.mirrorGhostsHere(), here = $gameMap.mapId();
+    if (ghosts.length) {
+        ($.mirrorPl || []).forEach(function(p) {
+            if (p && ghosts.indexOf(p.id) >= 0) players.push(p.m === here ? p : Object.assign({}, p, { m: here }));
+        });
+    }
     var full = null;
     $.clients.forEach(function(c) {
         var msg = {
@@ -2400,6 +2660,23 @@ $.roamIdle = function() {
     return _roamIdleSub() && !$.subsBusy();
 };
 
+// A sub-host that died (user decision 2026-11-11: a ghost runs a map for
+// nobody) gives its guests back as each is idle; they run the map themselves
+// and the host joins the living up again.
+$.ghostReleaseSubs = function() {
+    var flushed = false;
+    $.clients.slice().forEach(function(v) {
+        if (!v._sub || v.roamPending || $.isBusy(v) || $.subMenuHolds(v)) return;
+        // what this map's events wrote for the living goes to the host first:
+        // once the last guest is gone this PC is a ghost's, its unsent writes are
+        // dropped (the roaming tick) and the host takes nothing from it any more
+        if (!flushed) $.flushWorldGuest();
+        flushed = true;
+        $.dlog('ghost: gives', v.name, 'back - a ghost runs a map for nobody');
+        $.sendRoam(v, {});
+    });
+};
+
 // Leaving to the host's game: the guests here run the map themselves.
 var _sendUnroamSub = $.sendUnroam;
 $.sendUnroam = function(spot, interpJson) {
@@ -2419,6 +2696,12 @@ $.onPlayerDefeated = function(id) {
         if (id === 'host' || id === $.myId) {
             if ($.isRoaming()) $.conn.send({ t: 'roamDown', doom: $.doomOf($gameActors.actor($.myActorId)) });
         } else if ($.clientById(id)) {
+            // the game over flow (CE47 / CE359) this PC ran for its guest ends in
+            // a down: undone here, as the host does for its own guests
+            // (FH_CoopBattle $.onPlayerDefeated) - its SW202 / SW410 stayed on
+            if ($.undoDeathFlow) $.undoDeathFlow(id, 'down');
+            // (its lying image stays until the host's pstate is here: $.fixSubLyingImages)
+            $.clientById(id)._subDownAt = Graphics.frameCount;
             $.conn.send({ t: 'subDown', id: id, doom: $.doomOf($.actorOfPlayer(id)) });
         }
         return;
@@ -2544,6 +2827,11 @@ Game_Player.prototype.triggerButtonAction = function() {
 // Guest -----------------------------------------------------------------------
 
 $.guestHandlers.subJoin = function() {
+    // a ghost PC joins nobody (the way there sends its character and its bag)
+    if ($.ghostWorld || $.ghostPrivate()) {
+        if ($.conn) $.conn.send({ t: 'subJoinNo' });
+        return;
+    }
     if ($.isRoaming() && !$.subHosting()) {
         $.roam.joinSub = $gameMap.mapId();
     } else if ($.pendingRoam) {
@@ -2567,6 +2855,12 @@ $.hostHandlers.subJoinNo = function(conn) {
 
 $.guestExtras.push(function() {
     if ($.isRoaming() && $.roam.joinSub && $.roam.joinSub !== $gameMap.mapId()) $.roam.joinSub = 0;
+    // asked while it lived, a ghost before it went: it stays on its own PC
+    if ($.isRoaming() && $.roam.joinSub && ($.ghostWorld || $.ghostPrivate())) {
+        $.roam.joinSub = false;
+        if ($.conn) $.conn.send({ t: 'subJoinNo' });
+        return;
+    }
     if ($.isRoaming() && $.roam.joinSub && !$.subHosting() && $.roamIdle()) {
         $.roam.joinSub = false;
         $.sendUnroam({ m: $gameMap.mapId(), x: $gamePlayer.x, y: $gamePlayer.y, d: $gamePlayer.direction() });
@@ -3265,9 +3559,29 @@ $.guestHandlers.pstate = function(msg) {
         if ($.restoreDownStates) $.restoreDownStates(actor);
         if ($.standUpImages) $.standUpImages(actor);
     }
+    // (a flow that ran after the down, e.g. CE359 on the map: undone now, as the host's $.revive)
+    if ($.undoDeathFlow) $.undoDeathFlow(v.guestId, 'revive');
     v._lastMeKey = null;
     $.pushMe(v);
 };
+
+// CE47's Change Actor Images lays every protagonist down, the characters of
+// this PC's guests too. The standing ones get theirs back, as the host's
+// $.fixLyingImages does for its guests (host only: it reads $.downs; this
+// PC's own character: FH_CoopBattle's guest extra).
+$.SUB_DOWN_WAIT = 300; // frames a subDown waits for the host's pstate
+$.fixSubLyingImages = function() {
+    if ($.isHost() || !$.subHosting()) return;
+    if ($gameParty.inBattle() || $gameMap.isEventRunning() || $.puppet) return;
+    $.clients.forEach(function(c) {
+        if (!c._sub || !c.actorId || $.pstateOf[c.guestId] === 'down') return;
+        if (c._subDownAt != null && Graphics.frameCount - c._subDownAt < $.SUB_DOWN_WAIT) return;
+        if ($.fixLyingImage(c.actorId)) $.pushMe(c);
+    });
+};
+$.worldExtras.push(function() {
+    if (Graphics.frameCount % 30 === 0) $.fixSubLyingImages();
+});
 
 // This PC's player: OK on a down player, a fight's enemy or the fighting one.
 var _triggerButtonOwn = Game_Player.prototype.triggerButtonAction;
@@ -3387,7 +3701,7 @@ $.hostSync = function() {
             c._placeAt = null;
             c.lastPos = Object.assign({}, c.lastPos || {}, p, { id: c.guestId });
             var entry = $.owned[c.guestId];
-            var json = entry ? JsonEx.stringify(entry.interp) : null;
+            var json = entry ? $.jsonEx(entry.interp) : null;
             if (entry) $.finishOwned(c.guestId);
             if (c.inBattle) c.roamPending = { m: p.m };
             else $.sendRoam(c, { pos: p, interp: json });
@@ -9790,7 +10104,7 @@ $.rherEligible = function() {
     if (!$.tutorialOver() || $gameVariables.value($.RHER_ACTIVE_VAR) !== 1) return false;
     if ($.isGuest() && !$.myActorId) return false;
     if ($.isGhostMe && $.isGhostMe()) return false;
-    return !$.spec;
+    return true;
 };
 
 $.rherPaused = function() {
@@ -12816,7 +13130,6 @@ $.endingAStart = function() {
     if ($.endingABegun()) return;
     $gameSelfSwitches.setValue($.endingAMarkKey(), true);
     $.endingAReviveAll();
-    $.endingABringGhosts();
 };
 
 // The ones down (in the Logic fight a joiner won): up again, no line. Their
@@ -12833,16 +13146,6 @@ $.endingAReviveAll = function() {
         $.broadcastToast = toast;
     }
     $.dlog('ending A: up again (no line)', ids.join(', '));
-};
-
-// The dead on the host's map may walk a still copy of another map ($.spec,
-// the host does not know): a snapshot brings each to the Map140 scene.
-$.endingABringGhosts = function() {
-    $.clients.forEach(function(c) {
-        if (!c.inGame || !c.actorId || c.solo || c.roam || c.roamPending || c.subOf || !$.isDead(c.guestId)) return;
-        $.dlog('ending A: brings the dead', c.name, 'to the host\'s scene');
-        $.sendSnapshot(c);
-    });
 };
 
 // The fight of this run was won: true when the script must wait here (it
@@ -12865,8 +13168,8 @@ $.fxFightGoesOn = function(interp, fx) {
     // a guest's own map (or its sub-host's guest's run): to the host
     $.flushWorldGuest();
     var p = interp._fhOwner && $.remotes[interp._fhOwner] ? $.remotes[interp._fhOwner] : $gamePlayer;
-    var copy = $.cleanInterp(JsonEx.parse(JsonEx.stringify(interp)));
-    $.conn.send({ t: 'endingA', json: JsonEx.stringify(copy), m: $gameMap.mapId(), x: p.x, y: p.y, d: p.direction() });
+    var copy = $.cleanInterp(JsonEx.parse($.jsonEx(interp)));
+    $.conn.send({ t: 'endingA', json: $.jsonEx(copy), m: $gameMap.mapId(), x: p.x, y: p.y, d: p.direction() });
     $.dlog('ending A: the script goes to the host');
     return true;
 };
@@ -13131,7 +13434,7 @@ $.endingWinnerConn = function() {
 };
 
 $.hostHandlers.endingWatch = function(conn) {
-    if (!conn.inGame || conn.solo || conn.roam || conn.roamPending || conn.subOf || !$.isDead(conn.guestId)) return;
+    if (!conn.inGame || conn.solo || (conn.roam && !$.isGhostConn(conn)) || conn.roamPending || conn.subOf || !$.isDead(conn.guestId)) return;
     var w = $.endingWinnerConn();
     if (!w) return conn.send({ t: 'gab', text: $.TOWER_GHOST_TEXT });
     if (w.inBattle) return conn.send({ t: 'gab', text: $.playerLabel(w.guestId) + $.ENDING_WATCH_FIGHT_TEXT });
@@ -13141,6 +13444,7 @@ $.hostHandlers.endingWatch = function(conn) {
         actor: $.actorJson($gameActors.actor(conn.actorId)), inv: $.inventoryOf(conn), hx: $.boardOf(conn),
         pos: { m: p.m, x: p.x, y: p.y, d: p.d || 2 }, interp: null, watch: 1
     };
+    conn.roam = false; // (a ghost's PC: the winner's from here)
     conn.subOf = w.guestId;
     conn._watchOf = w.guestId;
     delete $.remotes[conn.guestId];
@@ -14714,6 +15018,7 @@ $.sendSyncMe = function() {
 var _sendRoamMeMinion = $.sendRoamMe;
 $.sendRoamMe = function(force) {
     _sendRoamMeMinion(force);
+    if ($.ghostWorld || $.ghostPrivate()) return; // (a ghost PC: nothing of its character, its companion neither)
     var actor = $.myMinion ? $gameActors.actor($.myMinion) : null;
     var key = actor ? $.actorJson(actor) : '';
     if (actor && (force || key !== $.lastMinionKey)) {
@@ -15872,11 +16177,17 @@ $.startRoam = function(msg) {
 // roam starts as soon as the map scene is up.
 var _roamAfterTitle = $.guestHandlers.roam;
 $.guestHandlers.roam = function(msg) {
-    if ($.pendingSnapshot && SceneManager._scene instanceof Scene_Title) {
-        $.pendingSnapshot._fhThenRoam = msg;
+    var snap = $.pendingSnapshot, title = SceneManager._scene instanceof Scene_Title;
+    // on a map too: a roam "here" (in place, this PC keeps its spot) for the map of a snapshot that is
+    // still to be applied, while this PC is on another map - or is a dead player's (the host hands a
+    // dead guest its map right behind the snapshot of a load: its saved spot comes with that snapshot)
+    var elsewhere = !title && !!snap && !!msg && !!msg.here && !!msg.pos && snap.mapId === msg.pos.m &&
+        !!$gameMap && ($gameMap.mapId() !== msg.pos.m || $.myState === 'dead');
+    if (snap && (title || elsewhere)) {
+        snap._fhThenRoam = msg;
         $.roamDeltas = [];
         $.waitingSnap = false;
-        $.dlog('roam to map', msg && msg.pos ? msg.pos.m : '?', 'waits for the snapshot (at the title)');
+        $.dlog('roam to map', msg && msg.pos ? msg.pos.m : '?', 'waits for the snapshot', title ? '(at the title)' : '(it brings this PC there)');
         return;
     }
     _roamAfterTitle(msg);
@@ -16428,7 +16739,7 @@ $.stalkMapsHeld = function() {
     var maps = {};
     maps[$gameMap.mapId()] = true;
     $.clients.forEach(function(c) {
-        if (c.inGame && c.lastPos && c.lastPos.m) maps[c.lastPos.m] = true;
+        if (c.inGame && c.lastPos && c.lastPos.m && !$.isDead(c.guestId)) maps[c.lastPos.m] = true;
     });
     return maps;
 };
@@ -16787,6 +17098,27 @@ $.priestTick = function() {
             $.priestQueue.push(id);
         }
     });
+};
+
+// The host leaving the map of one it holds (nobody free staying there): let
+// go first, as priestTick would after the door. The 'roam' that leaves that
+// guest behind carries the host's copy of its character - still knocked out
+// by the hold, and a roaming guest gets no 'me' after it - so its PC went
+// down at once (game over check) and the down stopped its scene (flows Z-18).
+var _leaveGuestsBehindPriest = $.leaveGuestsBehind;
+$.leaveGuestsBehind = function(newMapId) {
+    if ($.isHost()) {
+        var here = $gameMap.mapId();
+        Object.keys($.priestHolds).forEach(function(id) {
+            var h = $.priestHolds[id];
+            if (id === 'host' || h.map !== here || !$.clientById(id)) return;
+            var stay = $.priestOthersHere(id, here).filter(function(other) { return other !== 'host'; });
+            if (stay.length) return;
+            $.priestLetGo(id, false);
+            $.priestQueue.push(id);
+        });
+    }
+    return _leaveGuestsBehindPriest(newMapId);
 };
 
 // The map's page that takes the legs (V2459), as the loser's: SW3264 is not
@@ -17793,135 +18125,6 @@ $.mmDrawPlayers = function(win) {
         b.fillRect(qx - 1, qy - 1, pm + 2, pm + 2, '#000000');
         b.fillRect(qx, qy, pm, pm, $.MM_PLAYER_COLOR);
     });
-};
-
-//=============================================================================
-// A ghost guest's door on the host's map (user decision 2026-11-05)
-//=============================================================================
-// A ghost uses every move-related interaction as anyone (FH_CoopBattle
-// $.ghostMovePage: a lock, a choice, a ladder, an elevator, a door that opens
-// in steps). That ran on the PC running the map: the dead host's, a roaming
-// ghost's. A ghost guest on the host's map is a thin client and runs no
-// events: Z there did nothing but on simple doors. Now the host runs that
-// event for it as it runs a living guest's ($.runOwned), with the ghost's
-// rules: an answer with a fight greyed out, the autorun pages its door turns
-// on are its own too (a living guest's go through startEventFor, which turns
-// a dead one down - those pages moved the host), and its move to another map
-// is a ghost's (a still copy, $.ghostGo), not a map of its own to run.
-
-$.ghostRunFor = function(conn, ev, triggers, normal) {
-    if (!conn || !conn.actorId || !$.isDead(conn.guestId) || !$.guestOnMap(conn) ||
-            conn.roam || conn.roamPending || conn.subOf || $.isBusy(conn)) {
-        return false;
-    }
-    if (ev._erased || ev._fhOwner || ev._locked || ev._starting || $.hostRunHolds(ev) || $.ghostDoorBarred(ev)) {
-        return false;
-    }
-    var found = $.guestPage(conn, ev);
-    if (!found) return false;
-    var page = found.page;
-    if (triggers && triggers.indexOf(page.trigger) < 0) return false;
-    if (normal !== undefined && normal !== null && (page.priorityType === 1) !== normal) return false;
-    // (not a sleep, not a fight outside a choice's answers: $.ghostMovePage)
-    if (!$.ghostMovePage(ev, page) || $.pageNeedsConsent(page.list)) return false;
-    $.runOwned(conn, page.list, ev);
-    $.dlog('ghost door of', conn.name, ': the host runs ev' + ev.eventId(), 'p' + found.index);
-    return true;
-};
-
-// Its 'act' (FH_CoopBattle $.ghostAskHost): the event it pressed or stepped on.
-$.ghostActFor = function(conn, msg) {
-    var id = Number(msg.g);
-    $gameMap.eventsXy(msg.x, msg.y).some(function(ev) {
-        return ev.eventId() === id && $.ghostRunFor(conn, ev, msg.tr, msg.n);
-    });
-};
-
-// An autorun page its door turned on (the next step of a gate, an elevator's
-// ride): its own, as its door was. (The newest write decides, as in
-// FH_CoopWorld "Autorun pages a guest turned on"; outside every context.)
-var _gameEventStartGhostGuest = Game_Event.prototype.start;
-Game_Event.prototype.start = function() {
-    if ($.isHost() && this._trigger === 3 && !this._fhOwner && !$.ctx && !$gamePlayer._fhRemoteId &&
-            this._fhHandedPage !== this._pageIndex) {
-        var slot = $gameMap._events[this.eventId()];
-        var cause = !slot || slot === this ? $.pageCause(this) : null;
-        var conn = cause && cause.id !== 'host' ? $.clientById(cause.id) : null;
-        if (conn && $.isDead(conn.guestId) && $.guestOnMap(conn) && $.ghostMovePage(this, this.page())) {
-            // its door is still finishing: this page waits for it
-            if ($.isBusy(conn) || $.hostRunHolds(this)) {
-                cause.at = $.clockMs();
-                cause.n = ++$.causeSeq;
-                return;
-            }
-            if ($.ghostRunFor(conn, this, [3])) return;
-        }
-    }
-    _gameEventStartGhostGuest.call(this);
-};
-
-// Its move to another map: a ghost's way there (its PC shows that map as a
-// still copy and runs no events). The rest of the event is the map's it
-// left: it ends here. On the host's map (a ladder, a door within the map)
-// it moves as any guest does.
-$.ghostGone = {}; // host: guest id -> its spot { m, x, y, d, f }
-var _fhGuestTransferGhost = Game_Interpreter.prototype.fhGuestTransfer;
-Game_Interpreter.prototype.fhGuestTransfer = function() {
-    var id = this._fhOwner;
-    if (!id || !$.isDead(id) || !$.clientById(id) || $gameMessage.isBusy()) return _fhGuestTransferGhost.call(this);
-    var spot = $.transferSpot(this);
-    if (spot.m === $gameMap.mapId() || ($.DREAM_MAPS && $.DREAM_MAPS[spot.m])) return _fhGuestTransferGhost.call(this);
-    spot.f = this._params[5] || 0;
-    $.ghostGone[id] = spot;
-    this.setWaitMode('fhHanded'); // (until it is let go below)
-    return false;
-};
-
-// Let go as a hand-off is (FH_CoopRoam "A guest's transfer to another map"):
-// an autorun page that took it stays its own until someone presses it again
-// (the Kaiser room door: the next one through goes too), the door's steps go
-// off.
-var _updateOwnedGhost = $.updateOwned;
-$.updateOwned = function() {
-    _updateOwnedGhost();
-    Object.keys($.ghostGone).forEach(function(id) {
-        var spot = $.ghostGone[id];
-        delete $.ghostGone[id];
-        var entry = $.owned[id];
-        var conn = $.clientById(id);
-        if (!entry || !conn) return;
-        if (entry.ev && entry.ev._trigger === 3) {
-            entry.ev._fhHandedPage = entry.ev._pageIndex;
-            $.awaitOthersTransfer(entry.ev);
-        }
-        if (!$gameMap._interpreter.isRunning()) {
-            $.clearDoorSteps();
-            $gameMap.requestRefresh();
-        }
-        $.finishOwned(id);
-        conn.send({ t: 'ghostGo', m: spot.m, x: spot.x, y: spot.y, d: spot.d, f: spot.f });
-        $.dlog('ghost door of', conn.name, ': to map', spot.m, spot.x, spot.y);
-    });
-};
-
-// Its choice: an answer with a fight greyed out, as on the dead host's own
-// map (FH_CoopBattle $.fightAnswers; that one greys them in setupChoices,
-// which a guest's event never calls - its choices go to its screen).
-var _fhRemoteMessageGhost = Game_Interpreter.prototype.fhRemoteMessage;
-Game_Interpreter.prototype.fhRemoteMessage = function(withText) {
-    if (this._fhOwner && $.ctx && this._list && $.isDead(this._fhOwner)) {
-        var at = this._index;
-        if (withText) {
-            at++;
-            while (this._list[at] && this._list[at].code === 401) at++;
-        }
-        var cmd = this._list[at];
-        if (cmd && cmd.code === 102) {
-            var mods = $.choiceModsOf();
-            $.fightAnswers(this._list, at).forEach(function(n) { mods.dis[n] = true; });
-        }
-    }
-    return _fhRemoteMessageGhost.call(this, withText);
 };
 
 //=============================================================================
@@ -19106,7 +19309,9 @@ $.magnaRevive = function(n, byId) {
         return false;
     }
     var name = $.nameOfActor(rec.a), id = $.idOfName(name);
+    var gc = id && id !== 'host' ? $.clientById(id) : null, wasGhost = $.isGhostConn(gc);
     delete $.coopDead()[name];
+    if (wasGhost) { gc.roam = false; gc._fhGhostBack = true; }
     var sw = $.DEATH_SWITCH[rec.a];
     if (sw && $gameSwitches.value(sw)) {
         $gameSwitches.setValue(sw, false);
@@ -19126,6 +19331,9 @@ $.magnaRevive = function(n, byId) {
     $.clients.forEach(function(c) { c.send({ t: 'corpses', list: list, stamp: stamp }); });
     $.bodyDropGone();
     $.dlog('Magna-medicinal:', name, 'is up again at', rec.m, rec.x + ',' + rec.y, 'by', $.playerLabel(byId));
+    // a ghost's PC: "alive again" before its new world - a tick as 'dead' after
+    // the roam would mark that fresh copy a ghost's again ($.ghostWorld) for good
+    if (wasGhost) $.broadcastState(id);
     $.magnaPlace(id, rec);
     $.broadcastState(id);
     $.magnaTell(true);
@@ -19145,6 +19353,16 @@ $.magnaPlace = function(id, rec) {
     if (!conn) return;
     var spot = { m: rec.m, x: rec.x, y: rec.y, d: 2 };
     conn._lastMeKey = null;
+    // a ghost's PC ran its own copy: a fresh world with the host's copy of its
+    // character - a snapshot on this map, a roam elsewhere (conn.roam is off: 'me' goes along)
+    var back = conn._fhGhostBack;
+    conn._fhGhostBack = false;
+    if (back && rec.m === $gameMap.mapId()) {
+        conn._placeAt = spot;
+        conn.lastPos = Object.assign({}, conn.lastPos || {}, spot);
+        $.sendSnapshot(conn);
+        return;
+    }
     if (!conn.roam && !conn.subOf && rec.m === $gameMap.mapId()) {
         $.pushMe(conn);
         conn.send({ t: 'place', x: rec.x, y: rec.y, d: 2 });
@@ -19730,7 +19948,6 @@ $.freshGameState = function(why) {
     if ($.hostWatch) $.hostWatchStop('a new game or a load');
     $.ewWant = false;
     $.towerReadyNow = false;
-    ($.clients || []).forEach(function(c) { c._ghostStay = false; }); // (a new world: everyone in it)
     $.dlog("this PC's state of the game before dropped (" + why + ')');
 };
 

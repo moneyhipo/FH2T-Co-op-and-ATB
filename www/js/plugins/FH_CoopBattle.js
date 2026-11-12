@@ -2,7 +2,7 @@
 // FH_CoopBattle.js
 //=============================================================================
 /*:
- * @plugindesc v1.0.0 Co-op battles: battles run on the PC of whoever started
+ * @plugindesc v1.0.1 Co-op battles: battles run on the PC of whoever started
  * them, other players can join, downed players, betrayal duel. Below
  * FH_CoopWorld.
  * @author FH2 Co-op Mod
@@ -140,7 +140,7 @@ $.actorJson = function(actor) {
             delete actor[k];
         }
     });
-    var json = JsonEx.stringify(actor);
+    var json = $.jsonEx(actor);
     Object.keys(saved).forEach(function(k) { actor[k] = saved[k]; });
     return json;
 };
@@ -350,9 +350,7 @@ $.killPlayer = function(id, why) {
     var actor = $.actorOfPlayer(id);
     if (actor) actor.addState($.KNOCKOUT);
     $.dlog('player dead', conn.name, why);
-    // the dead watch the host: back into the host's game, on the host's map
-    if (conn.lastPos) delete conn.lastPos.m;
-    if (conn.roam || conn.roamPending) $.sendSnapshot(conn);
+    // (it stays where it died: its PC runs that map as a ghost - FH_CoopRoam $.ghostKeep)
     $.broadcastState(id);
     if (!$.quietDeath) $.broadcastToast($.playerLabel(id) + ' ' + (why || 'died') + '.');
     $.checkEveryoneDown();
@@ -1231,7 +1229,7 @@ $.battleHandOff = null; // host: { conn, json, eventId }
 
 $.handBattleToGuest = function(conn, interp) {
     var root = $gameMap._interpreter;
-    $.battleHandOff = { conn: conn, json: JsonEx.stringify(root), eventId: root.eventId() };
+    $.battleHandOff = { conn: conn, json: $.jsonEx(root), eventId: root.eventId() };
     interp.setWaitMode('fhHanded');
     $.dlog('battle goes to', conn.name, 'ev' + root.eventId());
 };
@@ -6853,7 +6851,7 @@ $.sendHandoff = function() {
     var sw = $gameSwitches._data, v = $gameVariables._data, ss = $gameSelfSwitches._data;
     var msg = {
         t: 'bHandoff', bid: h.bid, to: h.to, cand: h.cand, troopId: ab.troopId,
-        troop: JsonEx.stringify($gameTroop),
+        troop: $.jsonEx($gameTroop),
         actors: $gameParty.battleMembers().map(function(a) {
             return { id: a.actorId(), json: $.actorJson(a), j: a._fhJoiner || '', aw: !!a._fhAwait, rd: !!a._fhRemoteReady };
         }),
@@ -7143,7 +7141,7 @@ $.moveBattleInterp = function(b, from, to) {
             $.dlog('battle event stays with the host');
             return;
         }
-        var json = JsonEx.stringify(root);
+        var json = $.jsonEx(root);
         var eventId = root.eventId();
         $.setDialogueOwner(root, false);
         if (eventId > 0) $gameMap.unlockEvent(eventId);
@@ -7461,7 +7459,7 @@ $.guestHandlers.bRescue = function(msg) {
     var actors = $gameParty.battleMembers().filter(function(a) { return gone.indexOf(a) < 0; });
     var take = {
         t: 'bTakeOver', bid: msg.bid, from: msg.gone, troopId: msg.troopId,
-        troop: JsonEx.stringify($gameTroop),
+        troop: $.jsonEx($gameTroop),
         actors: actors.map(function(a) {
             return { id: a.actorId(), json: $.actorJson(a), j: owners[a.actorId()] || '', aw: false, rd: false };
         }),
@@ -9459,17 +9457,17 @@ $.guestHandlers.pvpOut = function(msg) {
 // trade or revive; enemies neither see nor chase it, and it does not vote.
 // Doors are the exception. A simple unconditional transfer is taken directly
 // without running its page. A door with choices, locks or an opening sequence
-// runs its original event on a live map, so the original interaction works
-// (a dead guest on the host's map: the host runs it for it, FH_CoopRoam
-// $.ghostRunFor). A dead guest on a still copy still takes only simple
-// transfers.
+// runs its original event on the ghost's own PC: the dead host's (the world's
+// PC), a dead guest's once it runs its map itself (FH_CoopRoam $.ghostPrivate,
+// user decision 2026-11-11: nothing of it reaches the world). A dead guest not
+// handed its map yet (thin) takes only simple transfers.
 // The fog circle (GALV_VisibilityRange) and the player light (Terrax) are
 // drawn around the player: they follow the ghost by themselves.
 // No jumping to players (user decision 2026-10-19: removed; ghosts walk).
 // A door to another map: a dead host's world goes there (as when a living
-// host walks there). A dead guest's PC shows that map as a still copy ($.spec:
-// a thin client runs no events, so nothing in the world changes); a door back
-// to the host's map asks for the host's world.
+// host walks there). A dead guest's PC runs its map itself (FH_CoopRoam
+// $.ghostPrivate) and goes there as in a single player game; one not handed
+// its map yet (thin: the duels, an ending) stays on the map it is shown.
 // Z: a short line to the nearest living player (Q / W: which line).
 // Standing near a living player who fights: that fight opens as a view
 // without commands until it ends.
@@ -9481,7 +9479,6 @@ $.WATCH_FIGHT_ASK_FRAMES = 90; // ask about a nearby fight
 $.WATCH_PING_FRAMES = 120;
 $.WATCH_LINES = ['is watching you', 'Look out!', 'Over here!', 'Run!', 'Good luck!'];
 $.watchLine = 0;
-$.spec = null; // dead guest: { m } while it walks a copy of another map
 
 $.isGhostMe = function() {
     if (!$.role) return false;
@@ -9572,7 +9569,6 @@ Game_Player.prototype.canEncounter = function() {
 // A simple door page transfers directly, without running its other commands.
 // A door whose move is a choice's answer runs its original event on the live
 // map; a lock or an opening sequence takes the ghost straight to its move.
-// Still copies only allow simple transfers.
 $.GHOST_DOOR_BAD = {};
 [101, 102, 103, 104, 105, 125, 126, 127, 128, 129, 301, 302, 303, 311, 312, 313, 314, 315, 316, 317, 318,
     319, 320, 321, 322, 324, 325, 326, 353, 354].forEach(function(code) { $.GHOST_DOOR_BAD[code] = true; });
@@ -9856,16 +9852,15 @@ $.ghostTryDoor = function(x, y, triggers, normal) {
         var page = ev.page();
         if (!page || triggers.indexOf(page.trigger) < 0) return false;
         var t = $.ghostDoorTransfer(page);
-        // (as anyone: its choices, its checks, its opening, its own move)
-        if (!t && !$.spec && $.ghostMovePage(ev, page) && !$gameMap.isEventRunning() &&
+        // a thin ghost (not handed its map yet: the duels, the moment after its death; a viewer of an
+        // ending) runs no event - its PC runs none, and no PC runs one for a ghost (user decision
+        // 2026-11-11). A plain door still moves it (below).
+        if (!t && $.isThin()) return false;
+        // (as anyone: its choices, its checks, its opening, its own move;
+        // a page that needs everyone's consent, a bed, is no ghost PC's)
+        var consent = !!($.ghostPrivate && $.ghostPrivate() && $.pageNeedsConsent && $.pageNeedsConsent(page.list));
+        if (!t && !consent && $.ghostMovePage(ev, page) && !$gameMap.isEventRunning() &&
                 (normal === undefined || ev.isNormalPriority() === normal)) {
-            // a guest on the host's map runs no events (thin): the host runs
-            // it for this ghost (FH_CoopRoam $.ghostRunFor)
-            if ($.isThin()) {
-                used = true;
-                $.ghostAskHost(ev, x, y, triggers, normal);
-                return true;
-            }
             ev._fhGhostDoor = true;
             ev.start();
             if (ev._starting) {
@@ -9906,76 +9901,32 @@ $.ghostTryDoor = function(x, y, triggers, normal) {
     return used;
 };
 
-// A ghost guest on the host's map asks the host to run a door's original
-// event for it (user decision 2026-11-05: before, Z there did nothing - its
-// own PC set the event starting and never ran it). As a living thin guest's
-// 'act', with the event: the host takes it from a ghost for that door only.
-$.ghostActFrame = -1;
-$.ghostAskHost = function(ev, x, y, triggers, normal) {
-    $.ghostActFrame = Graphics.frameCount; // (no ping on this Z)
-    if (!$.conn || !$.myActorId || $.pm || $.myEventRunning) return;
-    var key = [x, y, triggers.join(), normal, 'ghost'].join(',');
-    if (key === $.lastActKey && Graphics.frameCount - $.lastActFrame <= 20) return;
-    $.lastActKey = key;
-    $.lastActFrame = Graphics.frameCount;
-    $.conn.send({ t: 'act', m: $gameMap.mapId(), x: x, y: y, tr: triggers, n: normal, g: ev.eventId() });
-    $.dlog('ghost door: the host runs it', 'map', $gameMap.mapId(), 'ev' + ev.eventId(), 'p' + ev._pageIndex);
-};
-
-// The host ran this ghost's door up to its move to another map
-// (FH_CoopRoam $.ghostRunFor): there as by any door of its own. A screen its
-// event faded out comes back on the next map (the rest of the event, its
-// fade in, is the map's it left).
-$.ghostFadeBack = false;
-$.guestHandlers.ghostGo = function(msg) {
-    if (!msg || !$.isGhostMe() || !$gamePlayer || $gamePlayer.isTransferring()) return;
-    var black = $gameScreen.brightness() < 255;
-    $.ghostGo({ m: msg.m, x: msg.x, y: msg.y, d: msg.d, f: black ? 0 : msg.f || 0, door: true }, 'door the host ran');
-    if (black && $gamePlayer.isTransferring()) $.ghostFadeBack = true;
-};
-
-var _performTransferGhostFade = Game_Player.prototype.performTransfer;
-Game_Player.prototype.performTransfer = function() {
-    var back = this === $gamePlayer && $.ghostFadeBack && this.isTransferring();
-    _performTransferGhostFade.call(this);
-    if (back) {
-        $.ghostFadeBack = false;
-        $gameScreen.clearFade();
-    }
-};
-
 // The ghost goes to a spot (a door's, a player's).
 $.ghostGo = function(spot, why) {
     var p = $gamePlayer;
     if (!spot || !spot.m || p.isTransferring()) return;
     $.dlog('ghost to map', spot.m, spot.x, spot.y, '(' + why + ')');
     var fade = spot.f === undefined ? 0 : spot.f;
-    if ($.isHost()) {
+    // a dead host, or a ghost PC (FH_CoopRoam $.ghostPrivate: a dead guest
+    // running its map alone): a plain move on this PC
+    if ($.isHost() || ($.ghostPrivate && $.ghostPrivate())) {
         // (a door to another spot of the same map fades too, as for anyone -
         // play test 2026-10-31: Map021 EV44 / 49 cut with no black screen)
         if (spot.m === $gameMap.mapId() && !spot.door) p.locate(spot.x, spot.y);
         else p.reserveTransfer(spot.m, spot.x, spot.y, spot.d || 0, fade);
         return;
     }
-    var hostMap = $.hostMapId || $gameMap.mapId();
+    // a dead guest not handed its map yet (thin: the duels, an ending, the moment after
+    // its death): within the map it is shown only - its PC runs no map of its own
     if (spot.m === $gameMap.mapId()) {
         p.locate(spot.x, spot.y);
         return;
     }
-    if (spot.m === hostMap) {
-        // back to the host's world: there at that spot
-        $.ghostArrive = { m: spot.m, x: spot.x, y: spot.y, d: spot.d || 2 };
-        if ($.conn) $.conn.send({ t: 'needSnap' });
-        return;
+    var key = $gameMap.mapId() + '>' + spot.m + '/thin';
+    if (!$.ghostLogged[key]) {
+        $.ghostLogged[key] = true;
+        $.dlog('ghost: not to map', spot.m, '- this PC does not run its map yet');
     }
-    // another map: a still copy on this PC; the host no longer draws it
-    if (!$.spec && $.conn) {
-        var hide = $.playerInfo($.myId);
-        hide.tr = 1;
-        $.conn.send({ t: 'pos', p: hide });
-    }
-    $.spec = { m: spot.m };
-    p.reserveTransfer(spot.m, spot.x, spot.y, spot.d || 0, fade);
 };
 
 var _startMapEventGhost = Game_Player.prototype.startMapEvent;
@@ -10002,6 +9953,9 @@ Game_Event.prototype.update = function() {
 
 var _gameEventStartGhost = Game_Event.prototype.start;
 Game_Event.prototype.start = function() {
+    // a ghost PC (FH_CoopRoam $.ghostPrivate): as the dead host alone on its map -
+    // no map scene starts for it but the way on of its own door
+    if (this._trigger === 3 && $.ghostPrivate && $.ghostPrivate() && !$gamePlayer._fhRemoteId && !$.ghostWayOn(this)) return;
     if ($.isHost() && this._trigger === 3 && $.isDead('host') && $.sessionActive() && !$gamePlayer._fhRemoteId &&
             !$.endingA && !$.ghostWayOn(this) && !$.activeGuests().some(function(c) { return $.guestOnMap(c) && !$.isDead(c.guestId); })) {
         return;
@@ -10041,7 +9995,6 @@ var _triggerButtonActionGhost = Game_Player.prototype.triggerButtonAction;
 Game_Player.prototype.triggerButtonAction = function() {
     var used = _triggerButtonActionGhost.call(this);
     if (used || !this._fhGhost || !Input.isTriggered('ok') || this.isTransferring()) return used;
-    if ($.ghostActFrame === Graphics.frameCount) return true; // (a door it asked the host to run)
     $.sendGhostPing();
     return true;
 };
@@ -10055,52 +10008,6 @@ $.sendGhostPing = function() {
     if ($.isHost()) $.deliverWatchPing('host', to, $.watchLine);
     else if ($.conn) $.conn.send({ t: 'watchPing', to: to, k: $.watchLine });
     $.toast('Co-op: to ' + $.watchLabel(to) + ' - ' + $.WATCH_LINES[$.watchLine]);
-};
-
-// Dead guest: another map as a still copy ------------------------------------
-
-var _applyStateSpec = $.applyState;
-$.applyState = function(msg) {
-    if ($.spec && msg) {
-        if (msg.mapId) $.hostMapId = msg.hm || msg.mapId;
-        if ($gameMap && !$.pendingSnapshot && !SceneManager.isSceneChanging()) $.applyPlayers(msg.pl, msg.mapId);
-        return;
-    }
-    _applyStateSpec(msg);
-};
-
-var _guestSyncSpec = $.guestSync;
-$.guestSync = function() {
-    if ($.spec) return; // not on the host's map
-    _guestSyncSpec();
-};
-
-var _gameMapSetupSpec = Game_Map.prototype.setup;
-Game_Map.prototype.setup = function(mapId) {
-    if (!$.spec || !$.isThin()) return _gameMapSetupSpec.call(this, mapId);
-    var was = $.buildingEvents;
-    $.buildingEvents = true; // the events as the world has them
-    try {
-        _gameMapSetupSpec.call(this, mapId);
-    } finally {
-        $.buildingEvents = was;
-    }
-};
-
-$.ghostArrive = null; // dead guest: where it goes once the host's world is here
-var _processPendingSnapshotSpec = $.processPendingSnapshot;
-$.processPendingSnapshot = function() {
-    var had = !!$.pendingSnapshot;
-    if (had) $.spec = null; // back on the host's map
-    _processPendingSnapshotSpec();
-    var a = $.ghostArrive;
-    if (had && a) {
-        $.ghostArrive = null;
-        if ($gameMap && $gameMap.mapId() === a.m && $gamePlayer) {
-            $gamePlayer.locate(a.x, a.y);
-            if (a.d) $gamePlayer.setDirection(a.d);
-        }
-    }
 };
 
 // Fights ---------------------------------------------------------------------
@@ -10302,7 +10209,7 @@ $.askWatchFight = function() {
     var id = $.nearestLiving($.GHOST_FIGHT_RANGE);
     if (!id) return;
     if ($.isHost()) $.requestWatchFight('host', id);
-    else if ($.conn && !$.spec) $.conn.send({ t: 'watchFight', id: id });
+    else if ($.conn) $.conn.send({ t: 'watchFight', id: id });
 };
 
 $.worldExtras.push(function() { if ($.isHost()) $.askWatchFight(); });
@@ -10328,12 +10235,10 @@ $.hostHandlers.watchPing = function(conn, msg) {
     $.deliverWatchPing(conn.guestId, msg.to, msg.k);
 };
 
-// Guests' interactions on the host: never from a ghost, but a move-related
-// door it asks for (FH_CoopRoam $.ghostActFor).
+// Guests' interactions on the host: never from a ghost (its doors are its own
+// PC's, FH_CoopRoam $.ghostPrivate; no PC runs an event for a ghost).
 $.actHooks.unshift(function(conn, msg) {
-    if (!$.isDead(conn.guestId)) return false;
-    if (msg && msg.g && $.ghostActFor) $.ghostActFor(conn, msg);
-    return true;
+    return $.isDead(conn.guestId);
 });
 
 // The hint (always on while a ghost) -----------------------------------------
@@ -10848,6 +10753,53 @@ $.doomActorFor = function(interp) {
         return $gameActors.actor($.snapRun);
     }
     return $.ownActor();
+};
+
+// CE192's other death: a character whose SELECT is off in that run gets
+// "\N[n] died because of ... infected wound." and Knockout (313) in place of
+// CE47 - O'saa (actor 6) always, the data has no CE47 branch for him. In
+// co-op that knockout was nothing for a guest whose room change the host (or
+// a sub-host) ran for it (nobody looks at its character), and a down for the
+// host and for a roaming guest (the engine's "all dead" game over); up again
+// the count went past 7 and the infection never killed (player report
+// 2026-11-12: "even with an infection, you never die"). A death now, like
+// CE47's: marked here; a guest's run is reported at once, the host's and a
+// roaming guest's own go through that game over as a marked death.
+var _command313Infection = Game_Interpreter.prototype.command313;
+Game_Interpreter.prototype.command313 = function() {
+    var result = _command313Infection.call(this);
+    var p = this._params, inf = $.role ? $dataCommonEvents[$.INFECTION_CE] : null;
+    if (inf && p[0] === 0 && p[2] === 0 && !$gameParty.inBattle() &&
+            (this._list === inf.list || $.sameListShape(inf.list, this._list))) {
+        var actor = $gameActors.actor(p[1]), mine = $.doomActorFor(this);
+        if (actor && actor === mine && p[3] === actor.deathStateId() && $.doomCounts(actor)) {
+            $.markDoom(actor, 'infection');
+            if (this._fhOwner && $.runsWorld()) $.onPlayerDefeated(this._fhOwner);
+        }
+    }
+    return result;
+};
+
+// CE19 HEROIN_EFFECT (CE104, every room change): "actor n has Heroin /
+// Withdrawal" (states 108 / 109) for each character, with no party check -
+// the original's party changes rooms together. Here every character's copy
+// is on this PC: the host's room change counted the guests' copies, a guest's
+// run on the host counted the host's and the other guests', so the heroin
+// and withdrawal steps (3 and 2 rooms, V170 ...) came once per player per
+// room. Only the character of the player whose room change it is.
+$.HEROIN_ROOM_CE = 19; // ($.HEROIN_CE is the injection scene, CE258: FH_CoopRoam)
+var _command111Heroin = Game_Interpreter.prototype.command111;
+Game_Interpreter.prototype.command111 = function() {
+    var p = this._params, ce = $.role ? $dataCommonEvents[$.HEROIN_ROOM_CE] : null;
+    if (ce && p[0] === 4 && p[2] === 6 && (this._list === ce.list || $.sameListShape(ce.list, this._list))) {
+        var mine = $.doomActorFor(this);
+        if (mine && mine.actorId() !== p[1]) {
+            this._branch[this._indent] = false;
+            this.skipBranch();
+            return true;
+        }
+    }
+    return _command111Heroin.call(this);
 };
 
 var _command353Doom = Game_Interpreter.prototype.command353;
